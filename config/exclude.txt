@@ -1,0 +1,4 @@
+# Entradas do catálogo que NÃO são código (dados decodificados como função).
+# Continuam com um corpo, mas ele é um RECOMP_TODO alto em vez de lixo traduzido.
+#
+# VA          motivo

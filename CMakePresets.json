@@ -1,0 +1,49 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 22, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "linux-debug",
+      "displayName": "Linux x64 (debug) — plataforma de desenvolvimento da IA",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-debug",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux x64 (release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-release",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo", "RE5_BUILD_TESTS": "OFF"}
+    },
+    {
+      "name": "android-arm64",
+      "displayName": "Android ARM64 (Fase 5) — precisa de ANDROID_NDK_HOME",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/android-arm64",
+      "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-29",
+        "RE5_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64 (Fase 4, opcional)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-x64",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "linux-debug", "configurePreset": "linux-debug"},
+    {"name": "linux-release", "configurePreset": "linux-release"},
+    {"name": "android-arm64", "configurePreset": "android-arm64"},
+    {"name": "windows-x64", "configurePreset": "windows-x64"}
+  ],
+  "testPresets": [
+    {"name": "linux-debug", "configurePreset": "linux-debug", "output": {"outputOnFailure": true}}
+  ]
+}

@@ -1,0 +1,4 @@
+# Catalog entries that are not code. Excluded entries still get a body, but it
+# is a loud RECOMP_UNIMPL instead of lifted garbage.
+# VA        reason
+0x006D5610  data decoded as code: sldt/daa/das/aaa/bound/arpl/insb/lcall in one body

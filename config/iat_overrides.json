@@ -1,0 +1,12 @@
+{
+  "_comment": [
+    "Política por import do re5dx9.exe limpo. Preenchido na etapa 1.3 a partir do censo",
+    "(`re5 --census --missing --exe bin_input/re5dx9.clean.exe`) e mantido na Fase 3.",
+    "policy: 'hle' = implementação real em runtime/src/win32/<dll>.c;",
+    "        'const' = retornar 'returns' é o comportamento correto (justificar em 'reason');",
+    "        'bridge' = objeto COM/host traduzido (d3d9, xaudio2, dinput8, wmvcore...).",
+    "Nunca usar 'const' para esconder uma função que o jogo precisa: o padrão para",
+    "import ausente é abortar com o nome (runtime/src/core/imports.c)."
+  ],
+  "imports": {}
+}

@@ -1,0 +1,114 @@
+# runtime/win32hle — an implemented Win32, for running lifted PE code off Windows
+
+`native32/` runs a lifted 32-bit Windows program by forwarding its imports to
+the **real** Win32 API, so it only runs on Windows. `win32hle/` *answers those
+imports itself*, on libc / POSIX / SDL2, so the same lifted program runs on
+Linux (or anywhere SDL2 builds). It is the Win32 counterpart of `nextstep/`,
+which already hosts recomp32 code on a non-Windows libsys HLE.
+
+This is the portable path the OS-agnostic effort is built on; see
+`../../../LINUX_PORT_PLAN.md` (out of tree).
+
+## Why it needs no inline asm
+
+It reuses native32's **shim ABI**, which runs entirely inside the lifted model:
+
+> An import is a `recomp_func_t` (`void(void)`). When it is entered, `g_esp`
+> points at `[ret][arg0][arg1]…`. The shim reads its stdcall arguments with
+> `A32`/`APTR`/`ASTR`, does the work, returns with `RET`/`RETP`, and that macro
+> pops `ret + argc*4` (stdcall, callee-cleans).
+
+Because every import is our own C, a native → guest call (a `WndProc`, a thread
+start) is made **explicitly** with `hle_call_guest()` — there is no
+non-executable `.text` and no exec-fault trampoline. That is the single thing
+that makes this portable where native32 is not: no inline asm, no OS exception
+handler.
+
+## Guest memory: flat or based
+
+The guest is 32-bit; the host need not be. On a 32-bit host (Linux `-m32`,
+`RECOMP_FLAT_MEMORY`) a guest address *is* a host address. On a 64-bit host
+(macOS on Apple silicon or Intel, Linux x86-64 or arm64) the guest's 4 GB is
+one mapping at `g_mem_base`, the lift's `ADDR(va)` adds it, and nothing outside
+that mapping has a guest address. Built with `RECOMP_MEM_BASE` (a host address,
+`0x100000000000ull` on a Mac) the mapping goes exactly there and `ADDR` adds
+that constant, not a global the compiler reloads after every store. The layer
+is written for all of these:
+
+- `hle_ptr(va)` and `hle_va(p)` convert (guest NULL is host NULL); `APTR`,
+  `ASTR` and `RETP` use them. Based, `hle_va` of a pointer outside guest memory
+  stops the run, naming it, rather than truncating it.
+- anything the guest is handed an address of lives in guest memory: heap
+  blocks and host objects behind a COM object (`hle_alloc`), pages
+  (`hle_vm_reserve`), and structures passed for one call, a CREATESTRUCT or an
+  out pointer (`hle_scratch`, per thread, released to a mark);
+- a guest's varargs are formatted from guest memory (`hle_guest_format`): a
+  `va_list` cannot be made from them off i386.
+
+## Layout
+
+| File | What |
+|---|---|
+| `win32hle.h` | the shim ABI (`A32`/`RET`/…), the registry, `hle_call_guest`, and every module's host-facing API |
+| `guest_mem.c` | the memory the guest sees: page reservations, the heap (size classes, based), per-thread scratch, `hle_guest_format` |
+| `host_lite.c` | the spine: register file, the machine lock (taken and given back with the registers saved: `hle_block_begin`/`_end`, `hle_yield`; every import and every loop back-edge is a hand-over point when another thread waits), per-thread simulated TIB (`g_fs_base`), dispatch lookups, shim registry, kernel object handles |
+| `host.c` | the full host: `recomp_host_init`/`_boot`/`_run`/`_main` — register the shim modules, map+bind a PE, call its lifted entry |
+| `pe_format.h`, `pe_loader.c` | the 32-bit PE structures; map an image at its base (or a DLL anywhere, relocated), bind its IAT by name or ordinal (`dll#N`) |
+| `hle_path.c` | Windows paths on a POSIX disk: drive letters to host directories, either slash, components matched without case |
+| `module.c` | modules and resources: `LoadLibraryA` (resource DLLs mapped, system DLLs as pseudo-modules), `GetProcAddress`, `FindResourceA`/`LoadResource`/`LoadStringA`, the current directory |
+| `kernel32.c` | process, heap (sized blocks), virtual memory, time, critical sections, events, mutexes, waits, TLS, the console/serial calls a game links |
+| `kernel32_ext.c` | files on descriptors, `FindFirstFileA`, attributes, file times, disks, `.ini` profiles |
+| `kernel32_crt.c` | what an MSVC CRT asks on its way to `WinMain`: std handles, codepage 1252, locale (the wide calls answer `ERROR_CALL_NOT_IMPLEMENTED`, as on Windows 95), environment, threads |
+| `user32.c` | a window manager without a display: windows, classes, the message queue with `WM_PAINT`/`WM_TIMER` generated, focus/capture/activation, dialogs from templates (modal and not), and the standard controls (button, static, edit, list and combo boxes with owner-draw, trackbar, progress, hotkey) |
+| `gdi32.c`, `gdidc.c` | DIBs and `StretchDIBits` into a framebuffer; device contexts, fonts (TrueType through SDL2_ttf, Liberation for Arial/MS Sans Serif, a game's own through `AddFontResourceA`, smoothed as the font's `gasp` table says, synthetic bold and italic) and `TextOutA` into a surface; DIB sections selected into DCs and blitted between depths, clip rectangles, and the *window surface* a GDI game's window DCs draw into (`hle_gdi_window_surface`) |
+| `ddraw.c` | DirectDraw in software: `IDirectDraw`/`2`, surfaces 1–3 (lock, blit with colour fill, colour key and stretch, flip), palettes, clippers, a virtual display mode |
+| `dsound.c` | DirectSound on SDL2 audio: buffers mixed in software at their rate, volume and pan, with play cursors in real time |
+| `bink.c` | `binkw32.dll` on ffmpeg (`HLE_WITH_FFMPEG`): `BinkOpen` on a name or on the game's open file, frames decoded and converted into the game's surface, the soundtrack into a `dsound.c` stream; `BinkBuffer*` for a GDI game, onto the window surface |
+| `mss.c` | the part of Miles (`mss32.dll`) a game's own audio DLL calls: file and memory helpers, and the RIB lookup that hands out an ASI codec, MP3 on ffmpeg |
+| `screen.c` | the SDL2 window for a DirectDraw game, or a GDI game's window surface: the picture scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give |
+| `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI |
+| `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; IPX as IPXEmu carries it on UDP |
+| `ole32.c` | COM: class factories a host serves and ones the guest registers itself, GUID strings, BSTRs |
+| `storage.c` | structured storage on compound files in Windows' format (`StgCreateDocfile`, `IStorage`, `IStream`, `OleSaveToStream`) |
+| `advapi32.c` | an in-memory registry (seeded by the host, optionally saved to a file); COMCTL32, VERSION, SHELL32 |
+| `present.c` | the plain SDL2 layer for a GDI game: the gdi32 framebuffer in a window |
+| `*_selftest.c` | synthetic lifted guests driving the spine, the loader, the host, the pump and present, headless, and the GDI and mmio shims called as a guest calls them; `build_selftests.sh` builds and runs them |
+
+## State (what's real, what's next)
+
+Four titles run on it: Fury³ (its CRT and `WinMain`, the first census);
+Tiberian Sun, which boots, plays its movies and music, runs its menus (the
+game's own and the Win32 dialogs behind them) and plays a skirmish on Linux,
+with no Windows and no Wine (tiberiansun-recomp, `src/linux`); and Red Alert
+2 and Yuri's Revenge, with their Bink movies (redalert2-recomp, `src/linux`);
+and Civilization III: Conquests, a GDI game whose renderer and audio DLLs are
+lifted with it, with its movies and MP3 music (civ3, `src/linux`).
+
+What a title still brings:
+
+- its own **lift** (the generated C — per game, never in this repo);
+- the **breadth** of the API it happens to call, filled in as it hits a gap:
+  a permissive bind (`recomp_host_boot_permissive`, or `recomp_pe_bind` with
+  `hle_resolve_or_stub`) turns each unanswered import into a stub that names
+  itself when called;
+- its own answers where Windows would have found a DLL's code (Tiberian Sun's
+  Blowfish cipher, a COM server in the game folder), registered ahead of
+  these with `win32hle_register` or `hle_com_register_class`.
+
+Not here: guest SEH and C++ exceptions (`RaiseException` ends the run),
+DirectX past DirectDraw 2 and DirectSound 1, and drawing anything through
+GDI but text.
+
+## Building the selftests
+
+```
+runtime/win32hle/build_selftests.sh
+```
+
+builds every `*_selftest.c` with the whole layer and runs it (SDL's dummy
+drivers: no display or sound card needed): on Linux under gcc `-m32` (flat),
+on a Mac 64-bit (based), and `HLE_BASED=1` builds a 64-bit Linux host the
+same way; `HLE_MEM_BASE=0x100000000000ull` with either puts the guest's memory
+at that fixed address. Prereqs on Debian/Ubuntu: `dpkg --add-architecture i386; apt
+install gcc-multilib libsdl2-dev:i386 libsdl2-ttf-dev:i386` (`libsdl2-dev
+libsdl2-ttf-dev` for `HLE_BASED=1`); on a Mac, `brew install sdl2 sdl2_ttf`.

@@ -1,0 +1,9 @@
+# Instruções onde o host assume antes do código gerado (RECOMP_HOOK).
+# Para correções de comportamento sem patch no x86: widescreen, resolução do
+# Android, pular checagens. Cada site precisa estar dentro de um bloco, nunca
+# num alvo de salto (conferir contra work/catalog.json).
+#
+# AINDA NÃO LIDO: o lift32_cpu não emite RECOMP_HOOK. O suporte entra na etapa 2.1
+# (docs/PLANO_DO_PROJETO.md), junto com a leitura deste arquivo no run_lift.py.
+#
+# VA          propósito

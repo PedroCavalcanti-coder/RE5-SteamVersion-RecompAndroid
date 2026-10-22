@@ -1,0 +1,63 @@
+# re5-recompiled — configuração central do pipeline.
+#
+# Lido por scripts/re5common.py (load_config). Caminhos relativos são
+# relativos à raiz do repositório. Valores medidos do binário NÃO ficam aqui:
+# eles são gerados em work/recon.json pelo scripts/recon.py e resumidos em
+# docs/RECON_RE5.md. Aqui ficam apenas decisões e parâmetros.
+
+[project]
+name = "re5-recompiled"
+game = "Resident Evil 5: Gold Edition (Steam, app 21690)"
+
+[input]
+# Executável original da Steam (SteamStub + Enigma Protector).
+original = "bin_input/re5dx9.exe"
+# Executável protegido (só para o recon recusar).
+steamless = "bin_input/re5dx9.exe.unpacked.exe"
+# Executável com o código limpo (sem nenhuma camada de proteção). É a ÚNICA
+# entrada aceita pelo lifter. Ver docs/PLANO_DO_PROJETO.md, Fase 1, etapa 1.1.
+clean = "bin_input/re5dx9.clean.exe"
+
+[image]
+# O executável não tem diretório de relocações (IMAGE_FILE_RELOCS_STRIPPED):
+# a imagem do guest precisa ser mapeada exatamente nesta base.
+base = 0x00400000
+relocatable = false
+
+[lift]
+# lift32_cpu: estado da CPU explícito (CPU *c), reentrante -> uma CPU por
+# thread do guest. Ver docs/ARQUITETURA.md, decisão D1.
+lifter = "lift32_cpu"
+# Funções por unidade de tradução (.c). Menor = compilação paralela melhor e
+# menos RAM por processo do compilador.
+functions_per_file = 400
+# Janela de endereços por unidade de tradução: 64 KiB de código x86 viram um
+# .c (~180 arquivos para o .text do RE5). Com janela, mudar o catálogo só
+# recompila os arquivos das janelas afetadas. 0 = usar functions_per_file.
+bytes_per_file = 0x10000
+# call/jmp com alvo constante já gerado vira chamada direta (RE5_CALL) em vez de
+# dispatch(c, va): sem a busca na tabela a cada chamada. false = tudo pelo
+# dispatch, com a trilha de diagnóstico completa nas falhas.
+direct_calls = true
+out_dir = "generated/src"
+catalog = "work/catalog.json"
+seeds = "work/seeds_all.json"
+
+[runtime]
+# "global": um lock único serializa as threads do guest (correção primeiro).
+# "hle": o código do guest roda em paralelo e o lock protege só os handlers do
+# HLE (docs/ARQUITETURA.md, D5). O runtime lê RE5_GUEST_LOCK; sem ela, hle em
+# host x86-64 (TSO no hardware) e global no ARM64 (memória fraca, etapa 6.2).
+guest_lock = "hle"
+# Pilha da thread principal do guest, em MiB, alocada dentro do espaço de 4 GiB.
+main_stack_mib = 64
+worker_stack_mib = 4
+log_level = "info"
+
+[game]
+# Valores do registro que o instalador da Steam cria (bin_input/BH5AE_install.vdf).
+# O runtime HLE os serve a partir de um registro em memória.
+registry_hklm = 'Software\CAPCOM\RESIDENT EVIL 5'
+registry_hkcu = 'Software\CAPCOM\RESIDENT EVIL 5'
+language = "English"
+language_lcid = "1033"

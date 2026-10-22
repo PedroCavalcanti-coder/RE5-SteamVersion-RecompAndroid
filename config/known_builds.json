@@ -1,0 +1,35 @@
+{
+  "_comment": "Builds conhecidos do re5dx9.exe. scripts/recon.py compara o SHA-256 da entrada com esta lista. 'layers' = camadas de proteção detectadas; o lifter só aceita builds com layers vazia.",
+  "builds": [
+    {
+      "name": "steam-2023-02-13-original",
+      "file": "re5dx9.exe",
+      "sha256": "751726f0ec8bd01c00b037af8ae64cdf0bc5cc5b9025f3f4d782ef6f66e04e26",
+      "size": 8195416,
+      "pe_timestamp": "2023-02-13T05:43:28Z",
+      "layers": ["steamstub", "enigma"],
+      "liftable": false,
+      "note": "Build atual da Steam. SteamStub (.bind) por cima do Enigma Protector."
+    },
+    {
+      "name": "steam-2023-02-13-steamless",
+      "file": "re5dx9.exe.unpacked.exe",
+      "sha256": "a30b52b96b31d87b8357c99567732750d46644771a865b8ef5f98b382275f0a8",
+      "size": 8025216,
+      "pe_timestamp": "2023-02-13T05:43:28Z",
+      "layers": ["enigma"],
+      "liftable": false,
+      "note": "Executável protegido: recusado pelo recon."
+    },
+    {
+      "name": "steam-2023-02-13-oep-dump-reconstructed",
+      "file": "re5dx9.clean.exe",
+      "sha256": "4534003fe7949750c8c2bffd337f9d735eb9d27498a66e77e77cf1a87dfa4036",
+      "size": 16257024,
+      "pe_timestamp": "2023-02-13T05:43:28Z",
+      "layers": [],
+      "liftable": true,
+      "note": "Binário de entrada fornecido pelo dono do jogo (fora do git)."
+    }
+  ]
+}

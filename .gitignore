@@ -1,0 +1,56 @@
+# Build
+build/
+out/
+.cache/
+compile_commands.json
+
+# Derivados do binário do jogo (D7, docs/ARQUITETURA.md): regenerados a cada sessão
+work/
+generated/src/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Android (Fase 5)
+android/.gradle/
+android/app/build/
+android/local.properties
+*.apk
+
+# Editores
+.vscode/
+.idea/
+*.swp
+
+# bin_input/ É versionado (Git LFS) de propósito: o repositório é privado e as
+# sessões na nuvem precisam do executável. Antes de tornar público, remova-o do
+# histórico (tools/pcrecomp/tools/audit_repo.py ajuda a conferir).
+
+# Ferramentas locais: saída de build e binários de terceiros baixados
+tools/re5_logger/build/
+tools/re5_logger/*.dll
+tools/dxvk_vulkan/
+
+# Testes/rascunhos de execução
+Testing/
+*.log
+
+# cache de pipelines da DXVK (gerado ao rodar o re5)
+*.dxvk-cache
+
+# Dados do jogo: nunca vai para o git
+bin_input/game/
+
+# Arquivos do jogo: nunca no git (D7). Só o .gitkeep da pasta.
+bin_input/*
+!bin_input/.gitkeep
+
+# Fora do repositório: ferramentas de remoção/contorno de proteção (ficam só no disco)
+tools/Steamless/
+tools/re5_logger/
+tools/pcrecomp/tools/drm/
+scripts/pe_reconstruct.py
+tests/python/test_pe_reconstruct.py
