@@ -9,6 +9,7 @@
  * tempo sem nenhuma thread rodando. No POSIX o nanosleep já é preciso.
  */
 #include "kernel32_internal.h"
+#include "re5/runtime.h"
 
 #if defined(RE5_HOST_WINDOWS)
 #include <windows.h>
@@ -22,7 +23,7 @@
 #define TIMERR_NOCANDO 97u
 #endif
 
-static void w_timeGetTime(CPU *c) { c->eax = k32_tick_ms(); }
+static void w_timeGetTime(CPU *c) { c->eax = re5_det_is_enabled() ? re5_det_tick() : k32_tick_ms(); }
 
 static void w_timeBeginPeriod(CPU *c)
 {

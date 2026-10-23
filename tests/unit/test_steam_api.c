@@ -132,5 +132,31 @@ int main(int argc, char **argv)
         CHECK_EQ_U32(vcall(remote, 3, 1, &file) & 0xFF, 1);    /* FileDelete */
         CHECK_EQ_U32(vcall(remote, 10, 1, &file) & 0xFF, 0);
     }
+
+    /* ISteamNetworking005 offline: nenhum pacote, nenhuma sessão; a pilha volta certa (thiscall). */
+    {
+        uint32_t net = flat("SteamNetworking", 0, NULL);
+        CHECK(net != 0);
+        uint32_t sz = g_scratch + 0x800, st = g_scratch + 0x810;
+        wr32(sz, 0xDEADBEEFu);
+        uint32_t avail[2] = {sz, 0x389};
+        uint32_t esp0 = T->cpu.esp;
+        T->cpu.ecx = net;
+        push32(&T->cpu, avail[1]);
+        push32(&T->cpu, avail[0]);
+        push32(&T->cpu, RE5_RETURN_TO_HOST);
+        dispatch(&T->cpu, rd32(rd32(net) + 4 * 1));
+        CHECK_EQ_U32(T->cpu.esp, esp0);                 /* o método limpou os 8 bytes */
+        CHECK_EQ_U32(T->cpu.eax & 0xFF, 0);            /* IsP2PPacketAvailable */
+        CHECK_EQ_U32(rd32(sz), 0);
+        for (int i = 0; i < 5; i++) wr32(st + 4 * i, 0xFFFFFFFFu);
+        uint32_t sess[3] = {1, 0x01100001u, st};
+        CHECK_EQ_U32(vcall(net, 6, 3, sess) & 0xFF, 0); /* GetP2PSessionState */
+        CHECK_EQ_U32(rd32(st), 0);
+        CHECK_EQ_U32(rd32(st + 16), 0);
+        uint32_t send[6] = {1, 0x01100001u, g_scratch, 4, 2, 0};
+        CHECK_EQ_U32(vcall(net, 0, 6, send) & 0xFF, 0); /* SendP2PPacket */
+        CHECK_EQ_U32(vcall(net, 9, 5, send), 0);       /* CreateP2PConnectionSocket: inválido */
+    }
     CHECK_DONE();
 }

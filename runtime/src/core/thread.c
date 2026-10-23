@@ -64,6 +64,18 @@ int re5_process_init(uint32_t image_base)
 
 uint32_t re5_process_peb(void) { return g_peb; }
 
+/* MXCSR inicial de uma thread do guest. O Windows dá 0x1F80 (sem FTZ/DAZ), mas
+ * as consultas e o solver do Havok geram subnormais em contatos quase tangentes
+ * (degraus, cantos) e cada operação SSE com subnormal custa ~100 ciclos no host.
+ * FTZ (bit 15) + DAZ (bit 6) os zeram; cpu_ldmxcsr leva os dois ao SSE (ou ao
+ * FPCR.FZ no ARM64) da thread que chama, que é a do guest. RE5_FTZ=0 volta ao
+ * padrão do Windows, para comparar. */
+uint32_t re5_guest_mxcsr_default(void)
+{
+    const char *e = getenv("RE5_FTZ");
+    return e && *e == '0' ? 0x1F80u : 0x9FC0u;
+}
+
 re5_thread *re5_thread_attach(uint32_t stack_bytes)
 {
     ensure_init();
@@ -98,7 +110,7 @@ re5_thread *re5_thread_attach(uint32_t stack_bytes)
     t->cpu.cs = 0x23;
     t->cpu.ds = t->cpu.es = t->cpu.ss = 0x2B;
     t->cpu.fpu_cw = 0x027F;          /* o do Windows numa thread nova: RC = mais próximo, 53 bits */
-    t->cpu.mxcsr = 0x1F80;           /* exceções mascaradas, sem FTZ/DAZ */
+    cpu_ldmxcsr(&t->cpu, re5_guest_mxcsr_default());   /* exceções mascaradas, FTZ/DAZ */
     re5_dispatch_trail_ref(&t->trail_pos, &t->trail);
 #if defined(RE5_HOST_WINDOWS)
     HANDLE h = NULL;
@@ -412,7 +424,8 @@ static void watchdog_main(void *arg)
             for (uint32_t j = 0; j < 8 && j < pos && j < RE5_TRAIL && k < sizeof tail - 48; j++) {
                 uint32_t va = t->trail[(pos - 1 - j) % RE5_TRAIL];
                 const re5_thunk *tk = re5_thunk_get(va);
-                if (tk) k += (size_t)snprintf(tail + k, sizeof tail - k, " %.40s", tk->name);
+                const char *nm = tk ? tk->name : re5_name_lookup(va);
+                if (nm) k += (size_t)snprintf(tail + k, sizeof tail - k, " %.40s", nm);
                 else k += (size_t)snprintf(tail + k, sizeof tail - k, " 0x%08X", va);
             }
             RE5_INFO("watchdog", "tid 0x%X: %s, +%u dispatches, %s%s; trilha:%s", t->tid,
@@ -527,7 +540,9 @@ static void prof_report(uint64_t total, uint64_t gen, uint64_t host, uint64_t ot
         for (uint32_t i = 0; i < g_npf; i++)
             if (g_pf_hits[i] > best) best = g_pf_hits[i], bi = i;
         if (!best) break;
-        RE5_INFO("profile", "  %5.1f%%  0x%08X", 100.0 * best / (double)total, g_pf[bi].va);
+        const char *nm = re5_name_lookup(g_pf[bi].va);
+        RE5_INFO("profile", "  %5.1f%%  0x%08X%s%s", 100.0 * best / (double)total, g_pf[bi].va,
+                 nm ? "  " : "", nm ? nm : "");
         g_pf_hits[bi] = 0;
     }
     for (int k = 0; k < 12; k++) {

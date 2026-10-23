@@ -204,6 +204,18 @@ DIRECT_RE = re.compile(r"dispatch\(c, 0x([0-9A-F]{8})u\)")
 TODO_RE = re.compile(r'RECOMP_TODO\(0x[0-9A-Fa-f]+, "([^" ]+)')
 
 
+def trace_wrapper(va, body):
+    """O corpo lifted vira `L_<VA>_body` (static) e `L_<VA>` o chama entre
+    re5_trace_enter/exit. Os rótulos internos `L_<VA>:` não colidem com o nome da
+    função (rótulos têm espaço de nomes próprio em C)."""
+    name = f"L_{va:08X}"
+    body = body.replace(f"void {name}(CPU *c)", f"static void {name}_body(CPU *c)", 1)
+    return (f"void re5_trace_enter(CPU *c, uint32_t va);\nvoid re5_trace_exit(CPU *c, uint32_t va);\n"
+            f"void {name}(CPU *c);\n{body}\n"
+            f"void {name}(CPU *c) {{ re5_trace_enter(c, 0x{va:08X}u); {name}_body(c); "
+            f"re5_trace_exit(c, 0x{va:08X}u); }}")
+
+
 def write_if_changed(path, text):
     """Grava só se o conteúdo mudou: o build incremental recompila só as unidades
     que o lift alterou (as outras mantêm o mtime). Devolve True se gravou."""
@@ -263,6 +275,9 @@ def cmd_lift(args, cfg):
 
     overrides = read_va_list(os.path.join(rc.CONFIG_DIR, "overrides.txt"))
     excluded = read_va_list(os.path.join(rc.CONFIG_DIR, "exclude.txt"))
+    # Pontos de rastreio (config/tracepoints.txt): a função vira um invólucro que
+    # avisa o runtime na entrada e na saída (RE5_TRACE liga a impressão).
+    traced = read_va_list(os.path.join(rc.CONFIG_DIR, "tracepoints.txt"))
 
     os.makedirs(outdir, exist_ok=True)
     stale = {fn for fn in os.listdir(outdir) if fn.startswith(prefix + "_") and fn.endswith((".c", ".h"))}
@@ -277,8 +292,12 @@ def cmd_lift(args, cfg):
     todo = collections.Counter()
     failures = []
     lifted = []
+    # re5_cov: um byte por endereço de código; a função gerada marca o seu na entrada
+    # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1). Custo: um store por chamada.
     header = ["/* GERADO por scripts/run_lift.py (pcrecomp lift32_cpu) - não edite. */",
-              '#include "cpu.h"', ""]
+              '#include "cpu.h"',
+              "extern unsigned char re5_cov[];",
+              "#define RE5_COV(va) (re5_cov[(va) - 0x401000u] = 1)", ""]
 
     # Cache por arquivo: o C de uma função só depende dos bytes dela, do VA, do
     # tamanho e do lifter. Se nada disso mudou numa janela e o arquivo existe,
@@ -327,7 +346,8 @@ def cmd_lift(args, cfg):
     for idx, fds in groups.items():
         name = f"{prefix}_{idx:04d}.c"
         key = hashlib.sha256(tool_hash.digest() + repr(direct).encode() + repr(
-            [(fd["address"], fd["size"], fd["address"] in overrides, fd["address"] in excluded) for fd in fds]
+            [(fd["address"], fd["size"], fd["address"] in overrides, fd["address"] in excluded,
+              fd["address"] in traced) for fd in fds]
         ).encode()).hexdigest()
         lifted.extend(fd["address"] for fd in fds)
         old = prev_files.get(name)
@@ -357,6 +377,11 @@ def cmd_lift(args, cfg):
                     ffail.append({"address": f"0x{va:08X}", "error": repr(ex)})
                     body = f'void L_{va:08X}(CPU *c) {{ (void)c; RECOMP_TODO(0x{va:08X}, "lift_failed"); }}'
                 ftodo.update(TODO_RE.findall(body))
+                # Cobertura: cada função gerada marca o próprio byte em re5_cov (trace.c).
+                body = body.replace("\n{\n", f"\n{{\n    RE5_COV(0x{va:08X}u);\n", 1)
+                if va in traced:
+                    body = trace_wrapper(va, body)
+                    fcounts["traced"] += 1
                 chunk.append(body)
                 fcounts["lifted"] += 1
             chunk.append("")

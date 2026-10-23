@@ -116,6 +116,19 @@ class LifterGaps(unittest.TestCase):
         self.assertIn("while (c->ecx)", lift(b"\xf3\xa6"))         # repe cmpsb continua laço
         self.assertNotIn("rep_", lift(b"\xab"))                    # stosd sem rep: um elemento
 
+    def test_direction_flag(self):
+        # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
+        # (0x00E64680, std; repne scasb) devolvia NULL e o 0x0072BC80 registrava toda
+        # malha SBC como colisão de personagem (drops sem chão); o memmove para cima
+        # (std; rep movsd) replicava em vez de copiar.
+        self.assertEqual(lift(b"\xfd"), "c->df = 1;")              # std
+        self.assertEqual(lift(b"\xfc"), "c->df = 0;")              # cld
+        for enc in (b"\xae", b"\xac", b"\xa4", b"\xaa", b"\xa6"):  # scasb lodsb movsb stosb cmpsb
+            c = lift(enc)
+            self.assertIn("STR_STEP(c, 1)", c)
+            self.assertNotIn("+= 1;", c)
+        self.assertIn("STR_STEP(c, 1)", lift(b"\xf2\xae"))        # repne scasb (o strrchr)
+
     def test_difftest_findings(self):
         # Achados do scripts/difftest_cpu.py (lift32_cpu contra o Unicorn).
         self.assertIn(".u64[1]", lift(b"\x0f\x17\x17"))        # movhps [edi], xmm2: a metade ALTA

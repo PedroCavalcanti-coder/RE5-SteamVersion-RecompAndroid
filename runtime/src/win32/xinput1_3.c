@@ -130,6 +130,18 @@ static void x_GetState(CPU *c)
         c->eax = XI_ERROR_BAD_ARGUMENTS;
         return;
     }
+    int16_t tasX = 0, tasY = 0;
+    if (re5_det_get_tas_input(user, &tasX, &tasY)) {
+        pad *p = &g_pads[user];
+        p->packet++;
+        wr32(out, p->packet);
+        uint8_t *g = re5_g2h(out + 4);
+        memset(g, 0, 12);
+        wr16le(g + 4, (uint16_t)tasX);
+        wr16le(g + 6, (uint16_t)tasY);
+        c->eax = XI_ERROR_SUCCESS;
+        return;
+    }
     SDL_GameController *gc = pad_of(user);
     if (!gc) {
         c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
@@ -177,7 +189,7 @@ static void x_GetCapabilities(CPU *c)
         c->eax = XI_ERROR_BAD_ARGUMENTS;
         return;
     }
-    if (!pad_of(user)) {
+    if (!re5_det_is_enabled() && !pad_of(user)) {
         c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
         return;
     }

@@ -73,7 +73,8 @@ void re5_dispatch_trail_print(void)
     for (uint32_t i = 0; i < n; i++) {
         uint32_t va = tr->va[(tr->pos - 1 - i) % TRAIL];
         const re5_thunk *t = re5_thunk_get(va);
-        RE5_ERROR("dispatch", "  0x%08X%s%s", va, t ? "  " : "", t ? t->name : "");
+        const char *name = t ? t->name : re5_name_lookup(va);
+        RE5_ERROR("dispatch", "  0x%08X%s%s", va, name ? "  " : "", name ? name : "");
     }
 }
 
@@ -92,8 +93,10 @@ static RE5_NORETURN void unresolved(CPU *c, uint32_t va, const char *how)
             fclose(f);
         }
     }
-    re5_fatal("dispatch", "%s para 0x%08X sem função gerada (esp=0x%08X eax=0x%08X ecx=0x%08X) - %s",
-              how, va, c->esp, c->eax, c->ecx, hint);
+    const char *name = re5_name_lookup(va);
+    re5_fatal("dispatch", "%s para 0x%08X%s%s%s sem função gerada (esp=0x%08X eax=0x%08X ecx=0x%08X) - %s",
+              how, va, name ? " (" : "", name ? name : "", name ? ")" : "",
+              c->esp, c->eax, c->ecx, hint);
 }
 
 static inline void go(CPU *c, uint32_t va, const char *how)

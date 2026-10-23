@@ -61,6 +61,8 @@ typedef struct re5_thread {
 /* Cria o PEB (uma vez por processo). image_base vai para PEB.ImageBaseAddress. */
 int re5_process_init(uint32_t image_base);
 uint32_t re5_process_peb(void);
+/* MXCSR com que toda thread do guest nasce: 0x9FC0 (FTZ+DAZ), ou 0x1F80 com RE5_FTZ=0. */
+uint32_t re5_guest_mxcsr_default(void);
 
 /* Dá à thread do host que chama um contexto de guest: pilha + TEB. */
 re5_thread *re5_thread_attach(uint32_t stack_bytes);

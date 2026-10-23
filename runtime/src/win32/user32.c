@@ -31,6 +31,7 @@
 
 #include <SDL2/SDL.h>
 
+#include "re5/coldebug.h"
 #include "re5/runtime.h"
 #include "re5/user32.h"
 
@@ -1015,7 +1016,10 @@ static void on_window_event(const SDL_WindowEvent *e, window *w)
     if (!w) return;
     int32_t f[4];
     switch (e->event) {
-    case SDL_WINDOWEVENT_CLOSE: send_msg(w, U32_WM_SYSCOMMAND, U32_SC_CLOSE, 0); break;
+    case SDL_WINDOWEVENT_CLOSE:
+        RE5_INFO("user32", "janela 0x%X: o host pediu para fechar (SDL_WINDOWEVENT_CLOSE)", w->hwnd);
+        send_msg(w, U32_WM_SYSCOMMAND, U32_SC_CLOSE, 0);
+        break;
     case SDL_WINDOWEVENT_FOCUS_GAINED: if (g_active != w->hwnd) activate(w, 1); break;
     case SDL_WINDOWEVENT_FOCUS_LOST: if (g_active == w->hwnd) activate(w, 0); break;
     case SDL_WINDOWEVENT_MOVED:
@@ -1042,6 +1046,14 @@ void re5_user32_handle_event(const SDL_Event *e)
     switch (ev.type) {
     case SDL_KEYDOWN:
     case SDL_KEYUP:
+        if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
+            if (ev.key.keysym.scancode == SDL_SCANCODE_F7) re5_det_key(7);
+            if (ev.key.keysym.scancode == SDL_SCANCODE_F8) re5_cov_key(8);
+            if (ev.key.keysym.scancode == SDL_SCANCODE_F9) re5_cov_key(9);
+            if (ev.key.keysym.scancode == SDL_SCANCODE_F10) { re5_dump_key(10); re5_det_key(10); }
+            if (ev.key.keysym.scancode == SDL_SCANCODE_F6) re5_coldebug_key();
+            if (ev.key.keysym.scancode == SDL_SCANCODE_F11) re5_capture_key();
+        }
         on_key(&ev.key, find_sdl(ev.key.windowID));
         break;
     case SDL_TEXTINPUT:
@@ -1330,6 +1342,7 @@ static void u_PostQuitMessage(CPU *c)
 {
     g_quit_pending = 1;
     g_quit_code = re5_arg(c, 0);
+    RE5_INFO("user32", "PostQuitMessage(%u) chamado de 0x%08X", g_quit_code, rd32(c->esp));
 }
 
 static void u_SendMessageA(CPU *c)

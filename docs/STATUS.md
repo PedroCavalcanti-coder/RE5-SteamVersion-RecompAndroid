@@ -15,6 +15,10 @@ sucesso" da versão anterior deste arquivo não tinham evidência e estavam erra
 | Etapa / marco | Estado | Evidência |
 |---|---|---|
 | **Fase 0** fundação | **FEITO** | `ctest` (Windows, MinGW GCC 15): guest_memory, handle_table, dispatch, kernel32 passam; `python_pipeline` passa com o Python 3.11 (17 testes; ver lacunas) |
+| **V0** varredura Ghidra (prep.) | **FEITO** | Projeto oficial `work/ghidra/re5.gpr` salvo em 508 s (26.705 funções, 433 classes C++, 117 thunks); opções reproduzíveis fixadas por `ConfigureAnalysis.java`; driver `ghidra_sweep.py` com testes verdes (`test_ghidra_sweep.py`); `doctor.py` atualizado. Detalhes em `docs/AUDITORIA_GHIDRA.md`. |
+| **V1** exportações Ghidra | **FEITO** | 12 arquivos JSON gerados em `work/ghidra/export/` (26.436 funções, 2.540 switches, 185k ponteiros, 1.681 métodos RTTI); `work/names.json` gerado com 26.442 nomes de símbolos. |
+| **V2** auditoria do catálogo | **FEITO** | `scripts/audit_catalog.py` implementado e testado (`test_audit_catalog.py` com ctest verde); 96,87% de fins idênticos (0 caudas de código perdidas); 50 sementes geradas em `work/seeds_ghidra.txt` (7 funções com chamadores + 43 alvos de switch); catálogo estendido para 72.121 funções (+111 entradas). Pós-semeadura: 0 funções com referência fora do catálogo e 0 alvos de switch pendentes. |
+| **E1** teste de baixo fps no original | **FEITO** | Usuário testou original com RTSS travado em ~20 fps na escada e benchmark; jogo opera normalmente. Causa física/delta-time descartada. |
 | **1.1** binário de entrada | **FEITO** | `bin_input/re5dx9.clean.exe`: entry `0x00E68A06`, 270 imports em 18 DLLs; `recon.py`: `liftable`. O binário de entrada (`bin_input/re5dx9.clean.exe`, um executável x86 sem proteção) é fornecido por quem tem o jogo e nunca vai para o git; este repositório não inclui nem documenta como remover proteções de cópia. |
 | **1.2** reconhecimento | **FEITO** | `docs/RECON_RE5.md` regenerado; imports em `work/imports.json` (14 slots com apelidos de mesmo endereço, ex.: `htons`/`ntohs`). Sem `d3dx9`; `steam_api.dll` com 18 imports. |
 | **2.1** lacunas do lifter (parcial) | **FEITO** p/ `cpuid`, `rdtsc`, `stc`, `clc`, `cmc`, `pushal`, `popal`, `rcpss`, `rsqrtss`, `rcpps`, `rsqrtps`, `fxam`, `xlatb`, `fnstenv`/`fldenv`, `fnsave`/`frstor`, `pmaxsw`/`pminsw`/`pmaxub`/`pminub` (xmm) e o NOP de dica `0F 18 /r` com registrador | `rcp*`/`rsqrt*`: o valor exato, o mesmo modelo do `lift32_sse.py`. `fxam` (3 no binário, CRT em `0x00E71F24`): classe de st(0) em C3/C2/C0 e sinal em C1; com a pilha de `double` (D9) não existem as classes "vazio" e "subnormal" (um subnormal de `double` é normal no formato de 80 bits). `fnstenv`/`fldenv` (CRT `0x00E75AA3`, devolve códigos de condição pelo status word): controle fixo, status com C0-C3 e TOP, que voltam no `fldenv`; `fnsave`/`frstor` (`0x00E66D3D`) somam os 8 registradores em 80 bits e o `fnsave` reinicia a pilha. `0F 18 C9` (em `0x00456094`, no laço de render): NOP reservado desde o P6 que o capstone 5 recusa; a descoberta (`disasm32.decode`) e o lift (`lift32_cpu._disasm`) passam a lê-lo como `0F 1F /0` do mesmo tamanho; antes a função era cortada ali e o laço do `bringup.py` girava 30 voltas na mesma semente. `RECOMP_TODO` 2.820 → 1.390; com o catálogo maior das sementes, 1.497 → 1.496 com o `rcpss` (`lift_stats.json`). `cpuid` = Core 2 com SSE2 e sem SSE3; `rdtsc` = relógio monotônico a 3 GHz (`runtime/src/core/cpu_ext.c`). Teste: `tests/python/test_lifter_gaps.py`, `test_dispatch`, `disasm32.py --selftest`. Os restantes são quase todos dados decodificados como código (`out`, `aaa`, `arpl`…). Faltam `pause`, `cmpxchg8b`, yield em laços. |
@@ -74,6 +78,27 @@ o exato é 11,3321), `fyl2x` de argumento negativo (não desempilha), OF/SF do `
 NaN/inf/-0/subnormais em 25% dos valores: 7.172 iguais ao hardware, os 2 restantes
 eram o `rol` corrigido em seguida.
 
+### Lifter: flag de direção (DF) (2026-10-23)
+
+`std` virava comentário ("DF=1 unsupported; string ops assume forward") e toda operação
+de string andava para frente. O CRT do RE5 usa DF=1 em dois lugares: `strrchr`
+(0x00E64680, `std; repne scasb`) e o caminho para cima do `memmove`/`memcpy`
+(0x00E69D6F, 0x00E6409F..0x00E64156, `std; rep movsd`). Efeito medido: o `strrchr`
+devolvia NULL e o registro das malhas de colisão do estágio (0x0072BC80: sufixo depois do
+último `_` do nome, tabela {"scr" -> 1, "eff" -> 2}) caía no padrão "scr", registrando a
+malha `*_eff` com a máscara de consulta 1 (personagem) em vez de 2 (itens/efeitos).
+No despejo da escada, com `scripts/uc_call.py` (novo: chama uma função do jogo no
+Unicorn sobre uma captura): a checagem de chão do drop (0x007BDDD0 -> 0x0076E520, tipo 2)
+falha em todo ponto; com `elem[eff]+0x1C` = 2 ela acerta o chão real (-133,2; -157,9) e
+o tipo 1 passa a ver só a rampa `scr`. O pedido de drop (0x007C0CA0) descarta o item
+quando essa checagem falha. `strrchr("...s115h_eff", '_')` no Unicorn: "_eff".
+Correção: `CPU.df` (cpu.h, no fim da struct), `std`/`cld` gravam, `eflags_pack/unpack`
+com o bit 10, `STR_STEP` em lods/stos/movs/scas/cmps, `rep_movs`/`rep_stos` em bloco
+para trás (sem replicar quando o memmove não replicaria). `difftest_cpu.py` sorteia e
+compara DF: movs/stos/lods/scas/cmps/std/cld 270/270 iguais ao Unicorn. Testes:
+`test_lifter_gaps.test_direction_flag`, `test_x87` (cópia para trás com sobreposição).
+Falta medir no jogo: drops, escada e câmera com o build novo.
+
 ### Otimização do código gerado: -O2 (2026-10-22)
 
 `scripts/bench_re5.py` roda o benchmark variável sozinho (`RE5_INPUT_SYNC=titlelogo`
@@ -99,6 +124,80 @@ mesmo `.text` do `clean.exe`) passa por tudo. Descartado, com medida:
 Próximo teste: `RE5_GUEST_LOCK=global` (threads do jogo uma por vez). Lacunas do
 catálogo fechadas no caminho: `0x00E69D1C` (benchmark variável) e `0x00C212D0`, mais
 ~1.150 alvos de chamada constantes que estavam fora do catálogo.
+
+2026-10-23:
+- FTZ/DAZ por padrão: toda thread do guest nasce com MXCSR 0x9FC0 e o SSE do host
+  (FPCR.FZ no ARM64) com os dois bits (`re5_guest_mxcsr_default`, `RE5_FTZ=0` volta
+  ao 0x1F80 do Windows; D9 atualizada). Visa a queda de fps por subnormais. Não deve
+  mudar a colisão em si: o jogo original roda sem FTZ e colide certo. Testes:
+  `dispatch` e `x87` verificam o 0x9FC0 e o produto subnormal zerado; ctest 19/19
+  (sem o `difftest_cpu` longo, rodado à parte abaixo).
+- Tracepoints do filtro do Havok (`config/tracepoints.txt`). A vtable do
+  hkpGroupFilter (0x0105BD44) mostra que toda variante de `isCollisionEnabled` chama o
+  núcleo `0x00D99740(hkBool *res, infoA, infoB)`; raio x collidable `0x00D99A40`, raio
+  x subshape (MOPP) `0x00D997F0`, collidable x collidable `0x00D99A10`, mais os
+  callbacks de broadphase dos raycasters (`0x00DA5170`, `0x00DA5A60`, `0x00DA7E20`).
+  A saída do trace agora mostra `*eax` (o hkBool devolvido por ponteiro). O
+  `0x00D36BD0` (nome do RTTI "hkpRayCollidableFilter") é o destrutor, não um filtro.
+  Liftados: 17 funções rastreadas, 1 falha de lift já conhecida (`0x0094818B`, MMX).
+- Auditoria 32->64: `difftest_cpu.py --per-group 3 --seeds 5 --special 0.35` em
+  SSE/x87 (466 codificações, 2.286 casos): SSE sem divergência; 8 casos x87, todos de
+  borda (`fsin`/`fptan` com |x| >= 2^63, que o x87 devolve intacto com C2; `fsubr st(4)`
+  lendo registrador vazio do próprio harness). Nenhum prefixo LOCK no código do
+  catálogo (os Interlocked* vêm do kernel32 HLE); os 57 `xchg` em memória são dados
+  desmontados. O jogo cria o device com `D3DCREATE_FPU_PRESERVE` (flags 0x56), então
+  o x87 de 53 bits do modelo é o mesmo do original.
+- O cenário (chão, escada, paredes) NÃO é Havok: é o detector de colisão estática do
+  MT Framework ("Static Collision Detector", vtable 0x00F59874, construtor 0x0076E1D0,
+  base 0x004B4A20, propriedades em 0x004B5090) sobre malhas SBC1 do estágio. Medido nos
+  despejos em jogo (s115, `guest_10`/`capture_*`):
+  - `snap_diff.py` nas 6 capturas F11 de 2026-10-22 (os dois personagens jogáveis, que
+    usam o movimento 0x00B72FA0, um inimigo 0x009DF110 e o proxy 0x00CFC5E0): 0 bytes
+    diferentes do x86 (Unicorn) em todas; `--funcs` (novo) mostra que a chamada passou
+    pelo detector (0x004A63E0..0x004BF060, 0x0076E2D0..). A consulta está traduzida certa;
+  - `mSlopeDegree` 45 / `mWallDegree` 55, cossenos 0,7071/0,5736: corretos;
+  - SbcNum 2 (`s115h_eff`, 25 partes; `s115h_scr`, 3): as 4 seções de cada uma, iguais
+    byte a byte ao arquivo do `s115.arc` (2,7 MB e 103 KB). Nenhum objeto tem SBC próprio
+    (141 SBC em 70 `.arc`, todos de estágio);
+  - `JobThread=1` no config.ini e `RE5_GUEST_LOCK=global`: corrida entre threads fora.
+  Conclusão: código e dados de colisão certos; o defeito está num estado que o jogo
+  monta em execução (tempo/entrada/ordem de inicialização) e que só uma referência do
+  jogo original mostra. Próximo passo: despejo completo (heap) do original pelo
+  `tools/re5_logger` no mesmo formato `.bin/.map` e diff das estruturas acima.
+- Entradas da consulta (`snap_diff.py --watch` novo, captura 1, personagem `0x185AAD40`
+  descendo a escada do s115): `cUnit::mDeltaTime` (+0x10) 0,6146 (≈49 fps, base 30; os
+  5,9/6,5 dos despejos F10 são o quadro após a pausa do despejo); a entrada do detector
+  `0x0076FB90` recebe a máscara 0x3FFFFF00 (a do construtor); varredura da posição atual
+  (`+0x30`) até o alvo, com subida de ~5,5 (`+0x11D0` vs `+0x1170`) e sonda de descida de
+  15; normais tocadas (0,90; 0,43) (quina) e (0,49; 0,87) (rampa de 29°); pedido 7,3 cm,
+  andou 6,19 (`+0x1400` = deslocamento do quadro); sonda de chão `0x0076E2D0` de +30 a -15.
+  Nada zerado nem absurdo. A tabela MtDTI do personagem (`0x00B59B10` -> `0x00433D70`) não
+  publica altura de degrau, máscara nem posição anterior. Falta o quadro que falha (subindo):
+  `RE5_CAPTURE=00B72FA0` + `RE5_CAPTURE_N=2` (novo) no `executar_recompilado.bat`.
+- Quadro travado na escada (2026-10-23, `work/dump/escada_20261023/capture_1`, personagem
+  `0x188FE1D0`, vt 0x0101DA00, parado em (527,9; -133,2; 227,0), `mDeltaTime` 3,2): 0 bytes
+  diferentes do x86. O pedido de movimento chega SEM componente horizontal: alvo `+0x1170` =
+  posição, varredura do detector só vertical, apoio na rampa (normal 0,49/0,87); o proxy do
+  Havok recebe velocidade (0; -3,135; 0) (só o empurrão para baixo) e termina apoiado
+  (`m_up` (0,1,0), `maxSlopeCosine` = cos 90°). Nenhuma colisão bloqueia: a intenção de
+  andar já vem zerada da lógica do personagem/animação, antes de 0x00B72FA0.
+- Co-op/"Network Selection: LOCAL" parava em `ISteamNetworking005::#1` (D8, chamado de
+  0x00414005, IsP2PPacketAvailable no canal 0x389). ISteamNetworking005 implementado como
+  Steam offline sem pares (métodos 0-21; o jogo usa 0-9); teste `steam_api` estendido.
+- **Sistema de Deterministic Replay & Trace Diff (TAS Lockstep)** implementado:
+  - Formato binário `FrameTracePacket` de 128 bytes (`runtime/include/re5/trace_packet.h` e
+    `tools/re5_logger/include/trace_packet.h`): grava `deltaTime`, `inputStick`, `pos[3]`,
+    `oldPos[3]`, `moveVec[3]`, `collisionFlags`, `filterMask`, `stepHeight`, `slopeCos`,
+    `wallCos` e `playerStructCRC32` na entrada e na saída de `0x00B72FA0`.
+  - Relógio determinístico cravado em 60.0 FPS (`QueryPerformanceCounter`, `timeGetTime`,
+    `GetTickCount` com semente fixa) tanto na DLL proxy `dinput8.dll` do original quanto no
+    runtime HLE do recompilado (`kernel32.c`, `winmm.c`).
+  - Injeção de input TAS (`xinput1_3`): quadros 0..120 neutros, 121..600 com analógico 100%
+    à frente (`wThumbLY = 32767`), ativado pela tecla F7.
+  - Transplante de coordenadas (`snapshot_s115.json`): salva posição inicial ao acionar F7 no
+    original e sincroniza Chris no recomp para a mesmíssima coordenada de partida.
+  - Script diferencial `scripts/trace_diff.py` com diagnóstico automático dos Cenários A, B e C;
+    5 testes unitários em `tests/python/test_trace_diff.py` (52/52 testes Python verdes no ctest).
 
 ### Ponte D3D9 (etapa 4.2, decisão D4)
 

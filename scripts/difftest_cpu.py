@@ -60,7 +60,7 @@ GPR = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"]
 UC_GPR = [X.UC_X86_REG_EAX, X.UC_X86_REG_ECX, X.UC_X86_REG_EDX, X.UC_X86_REG_EBX,
           X.UC_X86_REG_ESP, X.UC_X86_REG_EBP, X.UC_X86_REG_ESI, X.UC_X86_REG_EDI]
 UC_XMM = [getattr(X, f"UC_X86_REG_XMM{i}") for i in range(8)]
-FLAGS = {"cf": 0, "pf": 2, "af": 4, "zf": 6, "sf": 7, "of": 11}
+FLAGS = {"cf": 0, "pf": 2, "af": 4, "zf": 6, "sf": 7, "df": 10, "of": 11}   # df: direção das operações de string
 
 SKIP = {  # controle de fluxo, sistema, segmentos e o que o modelo de propósito não segue (D9)
     "call", "ret", "retf", "jmp", "ljmp", "lcall", "loop", "loope", "loopne", "jecxz", "jcxz", "int", "int3",

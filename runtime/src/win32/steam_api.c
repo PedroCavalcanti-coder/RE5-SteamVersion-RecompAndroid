@@ -630,6 +630,58 @@ static const method k_remote[] = {
     {0, NULL, NULL, 0},
 };
 
+/* ---- ISteamNetworking005: P2P e sockets de uma Steam offline, sem nenhum par ----
+ * O co-op (também com "Network Selection: LOCAL") consulta a fila P2P a cada quadro
+ * (0x00414005: IsP2PPacketAvailable no canal 0x389) e abre/fecha sessões com o parceiro.
+ * Offline não há par: nenhum pacote chega, envio e sessões falham, sockets não abrem.
+ * Ordem da vtable: steam_api.h do SDK 1.30 (sem sobrecargas nesta interface). */
+
+static void n_IsP2PPacketAvailable(CPU *c)
+{
+    if (re5_arg(c, 0)) wr32(re5_arg(c, 0), 0);
+    ret_bool(c, 0);
+}
+
+static void n_ReadP2PPacket(CPU *c)
+{
+    if (re5_arg(c, 2)) wr32(re5_arg(c, 2), 0);
+    ret_bool(c, 0);
+}
+
+/* GetP2PSessionState(CSteamID, P2PSessionState_t *): sem sessão; a estrutura (20 bytes) zerada. */
+static void n_GetP2PSessionState(CPU *c)
+{
+    uint32_t st = re5_arg(c, 2);
+    if (st) memset(re5_g2h(st), 0, 20);
+    ret_bool(c, 0);
+}
+
+static const method k_networking[] = {
+    {0, "SendP2PPacket", t_False, 24},             /* CSteamID, dados, tamanho, tipo, canal */
+    {1, "IsP2PPacketAvailable", n_IsP2PPacketAvailable, 8},
+    {2, "ReadP2PPacket", n_ReadP2PPacket, 20},
+    {3, "AcceptP2PSessionWithUser", t_False, 8},
+    {4, "CloseP2PSessionWithUser", t_False, 8},
+    {5, "CloseP2PChannelWithUser", t_False, 12},
+    {6, "GetP2PSessionState", n_GetP2PSessionState, 12},
+    {7, "AllowP2PPacketRelay", a_True, 4},
+    {8, "CreateListenSocket", t_Zero, 16},         /* 0 = k_HSteamListenSocket_Invalid */
+    {9, "CreateP2PConnectionSocket", t_Zero, 20},
+    {10, "CreateConnectionSocket", t_Zero, 12},
+    {11, "DestroySocket", t_False, 8},
+    {12, "DestroyListenSocket", t_False, 8},
+    {13, "SendDataOnSocket", t_False, 16},
+    {14, "IsDataAvailableOnSocket", t_False, 8},
+    {15, "RetrieveDataFromSocket", t_False, 16},
+    {16, "IsDataAvailable", t_False, 12},
+    {17, "RetrieveData", t_False, 20},
+    {18, "GetSocketInfo", t_False, 20},
+    {19, "GetListenSocketInfo", t_False, 12},
+    {20, "GetSocketConnectionType", t_Zero, 4},    /* k_ESNetSocketConnectionTypeNotConnected */
+    {21, "GetMaxPacketSize", t_Zero, 4},
+    {0, NULL, NULL, 0},
+};
+
 /* ---- interfaces sem nada implementado ainda (co-op online) ---- */
 
 static const method k_none[] = {{0, NULL, NULL, 0}};
@@ -649,7 +701,7 @@ static interface g_stats_if = {"ISteamUserStats011", k_stats, 0};
 static interface g_friends = {"ISteamFriends014", k_friends, 0};
 static interface g_remote = {"ISteamRemoteStorage012", k_remote, 0};
 static interface g_matchmaking = {"ISteamMatchmaking009", k_none, 0};
-static interface g_networking = {"ISteamNetworking005", k_none, 0};
+static interface g_networking = {"ISteamNetworking005", k_networking, 0};
 static interface g_client = {"ISteamClient015", k_client, 0};
 
 static void s_SteamUser(CPU *c) { c->eax = make_object(&g_user); }

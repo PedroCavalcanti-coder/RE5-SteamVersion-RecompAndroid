@@ -622,8 +622,12 @@ class Lifter:
         # AL = [EBX + AL]: the MSVC CRT turns the x87 class (fxam) into a
         # result with a 16-byte table this way.
         if m == "xlatb": return ["SET8L(c->eax, rd8((uint32_t)(c->ebx + R8L(c->eax))));"]
-        if m in ("wait","fwait","nop","int3","cld","fnop","hint_nop"): return [f"/* {m} */"]
-        if m == "std": return ["/* std (DF=1 unsupported; string ops assume forward) */"]
+        if m in ("wait","fwait","nop","int3","fnop","hint_nop"): return [f"/* {m} */"]
+        # Direction flag: real state (cpu.h CPU.df), stepped by STR_STEP in every
+        # string op. MSVC's strrchr (std; repne scasb) and memmove's overlapping
+        # path (std; rep movsd) depend on it.
+        if m == "std": return ["c->df = 1;"]
+        if m == "cld": return ["c->df = 0;"]
         # Carry flag by hand: hand-written asm and some compiler idioms
         # (`stc; sbb eax,eax`, carry-chained bignum loops) set it explicitly.
         if m == "stc": return ["c->cf = 1;"]
@@ -684,7 +688,7 @@ class Lifter:
             if sg: return [f"{{ int16_t _n=(int16_t)R16(c->eax); int8_t _d=(int8_t)({v}); SET8L(c->eax,(uint8_t)(int8_t)(_n/_d)); SET8H(c->eax,(uint8_t)(int8_t)(_n%_d)); }}"]
             return [f"{{ uint16_t _n=R16(c->eax); uint8_t _d=(uint8_t)({v}); SET8L(c->eax,_n/_d); SET8H(c->eax,_n%_d); }}"]
 
-        # string ops (assume DF=0 / forward; rep prefix loops on ECX)
+        # string ops (DF in c->df, stepped by STR_STEP; rep prefix loops on ECX)
         parts = m.split()
         # An F3 prefix is only a REP on a string instruction. On anything else
         # it is a hint, and the one that matters is `repz ret` (F3 C3) - AMD's
@@ -701,16 +705,17 @@ class Lifter:
             esz = {"b":1,"w":2,"d":4}[base[-1]]
             wfn = {1:"wr8",2:"wr16",4:"wr32"}[esz]; rfn = {1:"rd8",2:"rd16",4:"rd32"}[esz]
             areg = {1:"R8L(c->eax)",2:"R16(c->eax)",4:"c->eax"}[esz]
-            if base.startswith("stos"): body = f"{wfn}(c->edi, {areg}); c->edi += {esz};"
-            elif base.startswith("movs"): body = f"{wfn}(c->edi, {rfn}(c->esi)); c->esi += {esz}; c->edi += {esz};"
-            elif base.startswith("lods"): body = f"{('SET8L(c->eax,'+rfn+'(c->esi))') if esz==1 else (('SET16(c->eax,'+rfn+'(c->esi))') if esz==2 else 'c->eax = '+rfn+'(c->esi)')}; c->esi += {esz};"
+            step = f"STR_STEP(c, {esz})"
+            if base.startswith("stos"): body = f"{wfn}(c->edi, {areg}); c->edi += {step};"
+            elif base.startswith("movs"): body = f"{wfn}(c->edi, {rfn}(c->esi)); c->esi += {step}; c->edi += {step};"
+            elif base.startswith("lods"): body = f"{('SET8L(c->eax,'+rfn+'(c->esi))') if esz==1 else (('SET16(c->eax,'+rfn+'(c->esi))') if esz==2 else 'c->eax = '+rfn+'(c->esi)')}; c->esi += {step};"
             elif base.startswith("scas"):
-                cmp = f"flags_sub(c, {areg}, {rfn}(c->edi), {esz}); c->edi += {esz};"
+                cmp = f"flags_sub(c, {areg}, {rfn}(c->edi), {esz}); c->edi += {step};"
                 if rep in ("repe","repz"):  return [f"while (c->ecx) {{ c->ecx--; {cmp} if (!c->zf) break; }}"]
                 if rep in ("repne","repnz"):return [f"while (c->ecx) {{ c->ecx--; {cmp} if (c->zf) break; }}"]
                 return [cmp]
             elif base.startswith("cmps"):
-                cmp = f"flags_sub(c, {rfn}(c->esi), {rfn}(c->edi), {esz}); c->esi += {esz}; c->edi += {esz};"
+                cmp = f"flags_sub(c, {rfn}(c->esi), {rfn}(c->edi), {esz}); c->esi += {step}; c->edi += {step};"
                 if rep in ("repe","repz"):  return [f"while (c->ecx) {{ c->ecx--; {cmp} if (!c->zf) break; }}"]
                 if rep in ("repne","repnz"):return [f"while (c->ecx) {{ c->ecx--; {cmp} if (c->zf) break; }}"]
                 return [cmp]

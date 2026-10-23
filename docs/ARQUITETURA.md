@@ -189,7 +189,9 @@ A palavra de controle do x87 é estado (`CPU.fpu_cw`): `fistp`/`frndint` arredon
 pelo campo RC, como o idioma `fnstcw; or 0xC00; fldcw; fistp` do MSVC espera (1222
 `fistp` truncados e os floor/ceil inline do RE5; ignorá-lo deixava o som do jogo
 chiado). O MXCSR é guardado e só FTZ/DAZ vão para o SSE do host (a thread de som
-liga FTZ); o RC do SSE é só guardado. É o modelo que levou NFSU2 e outros a jogáveis. Se um bug for
+liga FTZ); o RC do SSE é só guardado. Diferente do Windows (0x1F80), toda thread do
+guest nasce com 0x9FC0 (FTZ+DAZ, `re5_guest_mxcsr_default`): subnormais no Havok
+custam ~100 ciclos por operação no host; `RE5_FTZ=0` volta ao 0x1F80 para comparar. É o modelo que levou NFSU2 e outros a jogáveis. Se um bug for
 rastreado até precisão, a correção vai para o pcrecomp com teste.
 
 ## Pipeline de ponta a ponta (já testado com o PE sintético)

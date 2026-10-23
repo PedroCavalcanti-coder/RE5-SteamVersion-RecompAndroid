@@ -49,9 +49,11 @@ def main():
             report(MISSING, mod, "pip install -r scripts/requirements.txt")
 
     print("== Toolchain ==")
+    cc_exe = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    cc_ver = tool_version([cc_exe, "--version"]) if cc_exe else None
+    report(OK if cc_ver else MISSING, "cc (gcc/clang)", cc_ver or "não encontrado")
     for name, cmd, required in (("cmake", ["cmake", "--version"], True),
                                 ("ninja", ["ninja", "--version"], False),
-                                ("cc (gcc/clang)", ["cc", "--version"], True),
                                 ("clang", ["clang", "--version"], False),
                                 ("git-lfs", ["git", "lfs", "version"], True)):
         ver = tool_version(cmd) if shutil.which(cmd[0]) else None
@@ -60,6 +62,12 @@ def main():
     report(OK if sdl else WARN, "SDL2 (dev)", sdl or "sem headers: o host roda só headless (Fase 4 precisa)")
     ndk = os.environ.get("ANDROID_NDK_HOME") or os.environ.get("ANDROID_NDK_ROOT")
     report(OK if ndk else WARN, "Android NDK", ndk or "ANDROID_NDK_HOME não definido (necessário só na Fase 5)")
+
+    print("== Varredura (Ghidra / opcional) ==")
+    ghidra = rc.find_ghidra()
+    report(OK if ghidra else WARN, "Ghidra", ghidra or "não encontrado (necessário para varredura/auditoria)")
+    java_cmd, jdk_ver = rc.find_jdk()
+    report(OK if java_cmd else WARN, "JDK", f"{jdk_ver} ({java_cmd})" if java_cmd else "não encontrado (Ghidra precisa de JDK 21+)")
 
     print("== Repositório ==")
     report(OK if os.path.isdir(os.path.join(rc.PCRECOMP, "tools", "lift")) else MISSING,

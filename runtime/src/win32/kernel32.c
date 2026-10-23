@@ -106,7 +106,7 @@ static const char *module_name(uint32_t h)
 
 uint32_t k32_tick_ms(void) { return (uint32_t)(host_ns() / 1000000ull); }
 
-static void k_GetTickCount(CPU *c) { c->eax = k32_tick_ms(); }
+static void k_GetTickCount(CPU *c) { c->eax = re5_det_is_enabled() ? re5_det_tick() : k32_tick_ms(); }
 static void k_GetCurrentProcessId(CPU *c) { c->eax = RE5_GUEST_PID; }
 static void k_GetCurrentProcess(CPU *c) { c->eax = RE5_PSEUDO_PROCESS; }
 static void k_GetCurrentThread(CPU *c) { c->eax = RE5_PSEUDO_THREAD; }
@@ -130,7 +130,10 @@ static void k_Sleep(CPU *c)
 static void k_ExitProcess(CPU *c)
 {
     uint32_t code = re5_arg(c, 0);
-    RE5_INFO("kernel32", "ExitProcess(%u)", code);
+    uint32_t ret = rd32(c->esp);
+    const char *nm = re5_name_lookup(ret);
+    RE5_INFO("kernel32", "ExitProcess(%u) chamado de 0x%08X%s%s", code, ret, nm ? " " : "", nm ? nm : "");
+    re5_dispatch_trail_print();
     fflush(NULL);
     exit((int)code);
 }
@@ -145,7 +148,7 @@ static void k_QueryPerformanceFrequency(CPU *c)
 
 static void k_QueryPerformanceCounter(CPU *c)
 {
-    uint64_t t = host_ns() / (1000000000ull / QPC_FREQUENCY);
+    uint64_t t = re5_det_is_enabled() ? re5_det_qpc() : (host_ns() / (1000000000ull / QPC_FREQUENCY));
     uint32_t p = re5_arg(c, 0);
     w32(p, (uint32_t)t);
     w32(p + 4, (uint32_t)(t >> 32));

@@ -69,6 +69,9 @@ typedef struct {
 
 int re5_mem_query(uint32_t va, re5_mem_region *out);
 
+/* Copia até `max` regiões (ordenadas por endereço); devolve quantas. Para o despejo da memória. */
+uint32_t re5_mem_regions(re5_mem_region *out, uint32_t max);
+
 /* Imprime o mapa de regiões (diagnóstico). */
 void re5_mem_dump(void);
 

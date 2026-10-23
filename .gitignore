@@ -48,6 +48,11 @@ bin_input/game/
 bin_input/*
 !bin_input/.gitkeep
 
+# Ghidra (projetos contêm o binário inteiro)
+testes com ghidra/
+*.gpr
+*.rep/
+
 # Fora do repositório: ferramentas de remoção/contorno de proteção (ficam só no disco)
 tools/Steamless/
 tools/re5_logger/

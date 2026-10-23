@@ -108,7 +108,16 @@ typedef struct {
      * the host counts them here, per thread and without TLS, to keep its
      * periodic scheduling point (re5: RE5_CALL in cpu_epilogue.h). */
     uint32_t ncalls;
+    /* Direction flag (EFLAGS bit 10): std/cld set it, and every string
+     * instruction steps ESI/EDI by -size while it is 1 (STR_STEP). MSVC's CRT
+     * relies on it: strrchr scans back with `std; repne scasb`, and memmove
+     * copies an overlapping buffer downwards with `std; rep movsd`. Modelling
+     * it as always-forward made strrchr return NULL and memmove replicate. */
+    uint32_t df;
 } CPU;
+
+/* ESI/EDI step of one string element: +size, or -size with DF=1. */
+#define STR_STEP(c, n) ((c)->df ? (uint32_t)0u - (uint32_t)(n) : (uint32_t)(n))
 
 /* ---- partial register access (preserve unaffected bits, like x86) ---- */
 #define R8L(r)        ((uint8_t)(r))
@@ -201,11 +210,11 @@ static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
 
 static inline uint32_t eflags_pack(CPU *c) {
     return 0x202u | (c->cf) | (c->pf << 2) | (c->af << 4) |
-           (c->zf << 6) | (c->sf << 7) | (c->of << 11);
+           (c->zf << 6) | (c->sf << 7) | (c->df << 10) | (c->of << 11);
 }
 static inline void eflags_unpack(CPU *c, uint32_t v) {
     c->cf = v & 1; c->pf = (v >> 2) & 1; c->af = (v >> 4) & 1;
-    c->zf = (v >> 6) & 1; c->sf = (v >> 7) & 1; c->of = (v >> 11) & 1;
+    c->zf = (v >> 6) & 1; c->sf = (v >> 7) & 1; c->df = (v >> 10) & 1; c->of = (v >> 11) & 1;
 }
 
 /* ---- stack ----
@@ -511,37 +520,54 @@ static inline double rdi32(uint32_t a) { int32_t i; memcpy(&i, (void *)(uintptr_
 static inline double rdi64(uint32_t a) { int64_t i; memcpy(&i, (void *)(uintptr_t)a, 8); return (double)i; }
 static inline void   wrf32(uint32_t a, double v) { float  f = (float)v; memcpy((void *)(uintptr_t)a, &f, 4); }
 static inline void   wrf64(uint32_t a, double v) { memcpy((void *)(uintptr_t)a, &v, 8); }
-/* rep stos / rep movs, forward (DF=0, as the lifter assumes everywhere): one
- * bulk host operation with the result the element loop would give. A forward
- * copy whose destination starts inside the source replicates elements, which
- * memmove would not, so that case alone goes element by element. */
+/* rep stos / rep movs: one bulk host operation with the result the element
+ * loop would give. With DF=1 the elements go from EDI/ESI downwards, so the
+ * block is the n elements ending at (and including) the start address. A copy
+ * that walks into its own source replicates elements, which memmove would
+ * not: forward when the destination starts inside the source, backward when
+ * the source starts inside the destination. Those cases go element by element. */
 static inline void *rep_ptr(uint32_t a) { return (void *)(uintptr_t)a; }
 static inline void rep_stos(CPU *c, uint32_t esz) {
-    uint32_t n = c->ecx, d = c->edi, v = c->eax;
+    uint32_t n = c->ecx, v = c->eax;
     if (!n) return;
     uint32_t bytes = n * esz;
+    uint32_t d = c->df ? c->edi - (bytes - esz) : c->edi;
     if (esz == 1 || (esz == 2 && (v & 0xFFu) == ((v >> 8) & 0xFFu)) || (esz == 4 && v == (v & 0xFFu) * 0x01010101u)) {
         memset(rep_ptr(d), (int)(v & 0xFFu), bytes);
     } else {
         uint8_t *p = (uint8_t *)rep_ptr(d);
         for (uint32_t i = 0; i < bytes; i += esz) memcpy(p + i, &v, esz);
     }
-    c->edi = d + bytes;
+    c->edi = c->df ? c->edi - bytes : c->edi + bytes;
     c->ecx = 0;
 }
 static inline void rep_movs(CPU *c, uint32_t esz) {
-    uint32_t n = c->ecx, d = c->edi, s = c->esi;
+    uint32_t n = c->ecx;
     if (!n) return;
     uint32_t bytes = n * esz;
-    if (d - s >= bytes) {   /* d below s, or past the end of the source */
-        memmove(rep_ptr(d), rep_ptr(s), bytes);
+    if (!c->df) {
+        uint32_t d = c->edi, s = c->esi;
+        if (d - s >= bytes) {   /* d below s, or past the end of the source */
+            memmove(rep_ptr(d), rep_ptr(s), bytes);
+        } else {
+            uint8_t *pd = (uint8_t *)rep_ptr(d);
+            const uint8_t *ps = (const uint8_t *)rep_ptr(s);
+            for (uint32_t i = 0; i < bytes; i += esz) memmove(pd + i, ps + i, esz);
+        }
+        c->edi = d + bytes;
+        c->esi = s + bytes;
     } else {
-        uint8_t *pd = (uint8_t *)rep_ptr(d);
-        const uint8_t *ps = (const uint8_t *)rep_ptr(s);
-        for (uint32_t i = 0; i < bytes; i += esz) memmove(pd + i, ps + i, esz);
+        uint32_t d = c->edi - (bytes - esz), s = c->esi - (bytes - esz);   /* lowest element */
+        if (s - d >= bytes) {   /* s below d, or past the end of the destination */
+            memmove(rep_ptr(d), rep_ptr(s), bytes);
+        } else {
+            uint8_t *pd = (uint8_t *)rep_ptr(d);
+            const uint8_t *ps = (const uint8_t *)rep_ptr(s);
+            for (uint32_t i = bytes; i > 0; i -= esz) memmove(pd + i - esz, ps + i - esz, esz);
+        }
+        c->edi -= bytes;
+        c->esi -= bytes;
     }
-    c->edi = d + bytes;
-    c->esi = s + bytes;
     c->ecx = 0;
 }
 

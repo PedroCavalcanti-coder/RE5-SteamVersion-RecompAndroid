@@ -8,6 +8,8 @@
 > Estado vivo dos marcos, com evidências: [`docs/STATUS.md`](STATUS.md).
 > Decisões técnicas e o porquê delas: [`docs/ARQUITETURA.md`](ARQUITETURA.md).
 > Números medidos do binário: [`docs/RECON_RE5.md`](RECON_RE5.md).
+> Auditoria em curso (2026-10-22): [`docs/PLANO_VARREDURA_GHIDRA.md`](PLANO_VARREDURA_GHIDRA.md),
+> varredura com o Ghidra e o jogo original como oráculo (etapas V0–V8).
 
 ---
 

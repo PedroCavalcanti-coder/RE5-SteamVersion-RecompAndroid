@@ -46,8 +46,26 @@ int main(void)
     CHECK_EQ_U32(FS_RD32(&t->cpu, RE5_TEB_SELF), t->teb);           /* fs:[0x18] pelo caminho do cpu.h */
     CHECK_EQ_U32(FS_RD32(&t->cpu, RE5_TEB_PEB), re5_process_peb());
 
+    /* FTZ/DAZ: o guest vê 0x9FC0 no stmxcsr e o SSE do host zera subnormais. */
+    CHECK_EQ_U32(t->cpu.mxcsr, re5_guest_mxcsr_default());
+    if (!getenv("RE5_FTZ")) {
+        CHECK_EQ_U32(t->cpu.mxcsr, 0x9FC0u);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
+        volatile float tiny = 1e-39f, one = 1.0f, half = 0.5f;
+        CHECK(tiny * one == 0.0f);                 /* DAZ (ARM64: FZ também zera entradas) */
+        volatile float small = 1.5e-38f;           /* normal; metade dele é subnormal */
+        CHECK(small * half == 0.0f);               /* FTZ */
+#endif
+    }
+
     CHECK(re5_lookup(VA_ADD_CDECL) == L_00401000);
     CHECK(re5_lookup(VA_ADD_CDECL + 1) == NULL);
+
+    /* Lookup de nomes: se work/names.tsv estiver presente, resolve; senão NULL. */
+    const char *vname = re5_name_lookup(0x00401010u);
+    if (vname) {
+        CHECK(strcmp(vname, "vector_constructor_iterator") == 0);
+    }
 
     uint32_t esp0 = t->cpu.esp;
     uint32_t args[2] = {40, 2};

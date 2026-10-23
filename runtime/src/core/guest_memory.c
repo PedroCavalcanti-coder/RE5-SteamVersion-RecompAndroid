@@ -284,6 +284,15 @@ int re5_mem_query(uint32_t va, re5_mem_region *out)
     return r ? 0 : -1;
 }
 
+uint32_t re5_mem_regions(re5_mem_region *out, uint32_t max)
+{
+    re5_mutex_lock(&g_mu);
+    uint32_t n = g_count < max ? g_count : max;
+    for (uint32_t i = 0; i < n; i++) out[i] = g_regions[i];
+    re5_mutex_unlock(&g_mu);
+    return n;
+}
+
 void re5_mem_dump(void)
 {
     re5_mutex_lock(&g_mu);

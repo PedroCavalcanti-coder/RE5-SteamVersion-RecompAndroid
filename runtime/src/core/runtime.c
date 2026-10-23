@@ -12,6 +12,7 @@ int re5_runtime_init(void)
         RE5_ERROR("runtime", "falha ao criar a faixa de thunks");
         return -1;
     }
+    re5_names_init();
     re5_lookup(0);   /* monta a tabela hash do dispatch antes de haver threads do guest */
     re5_watchdog_start();
     re5_profile_start();

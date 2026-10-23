@@ -47,14 +47,18 @@ add_library(re5_runtime STATIC
     src/core/image.c
     src/core/imports.c
     src/core/log.c
+    src/core/memdump.c
+    src/core/names.c
     src/core/overrides.c
     src/core/runtime.c
     src/core/thread.c
     src/core/thunks.c
+    src/core/trace.c
     src/core/vfs.c
     src/gfx/d3d9_host.c
     src/win32/advapi32.c
     src/win32/avifil32.c
+    src/win32/coldebug.c
     src/win32/d3d9.c
     src/win32/dinput8.c
     src/win32/dsound.c

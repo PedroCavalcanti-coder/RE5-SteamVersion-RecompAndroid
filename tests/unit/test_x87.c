@@ -124,9 +124,9 @@ int main(void)
     CHECK(g_t != NULL);
     CPU *c = &g_t->cpu;
 
-    /* Thread nova: palavra de controle e MXCSR do Windows. */
+    /* Thread nova: palavra de controle do Windows; MXCSR com FTZ/DAZ (RE5_FTZ=0: o do Windows). */
     CHECK_EQ_U32(c->fpu_cw, 0x027Fu);
-    CHECK_EQ_U32(c->mxcsr, 0x1F80u);
+    CHECK_EQ_U32(c->mxcsr, re5_guest_mxcsr_default());
 
     /* RC = 11 (or 0xC00): o _ftol do MSVC, truncando para zero. */
     CHECK_EQ_U32(to_int(2.7f, 0xC00), 2);
@@ -202,6 +202,36 @@ int main(void)
         rep_movs(c, 4);
         rep_stos(c, 4);
         CHECK_EQ_U32(c->edi, 0);
+
+        /* DF=1 (std): o memmove do CRT (0x00E69D6F) copia para cima, de trás para frente,
+         * quando destino e origem se sobrepõem; ESI/EDI apontam para o último dword. */
+        for (uint32_t i = 0; i < 64; i++) wr8(m + i, (uint8_t)i);
+        c->df = 1;
+        c->esi = m + 12; c->edi = m + 16; c->ecx = 4;     /* [m, m+16) -> [m+4, m+20) */
+        rep_movs(c, 4);
+        CHECK_EQ_U32(rd32(m + 4), 0x03020100u);           /* sem replicar: cópia fiel */
+        CHECK_EQ_U32(rd32(m + 16), 0x0F0E0D0Cu);
+        CHECK_EQ_U32(rd32(m + 0), 0x03020100u);           /* abaixo do destino: intacto */
+        CHECK_EQ_U32(c->esi, m - 4);
+        CHECK_EQ_U32(c->edi, m);
+        for (uint32_t i = 0; i < 64; i++) wr8(m + i, (uint8_t)i);
+        c->esi = m + 16; c->edi = m + 12; c->ecx = 4;     /* origem dentro do destino: replica, como o x86 */
+        rep_movs(c, 4);
+        CHECK_EQ_U32(rd32(m + 12), 0x13121110u);
+        CHECK_EQ_U32(rd32(m + 0), 0x13121110u);
+        c->edi = m + 60; c->ecx = 2; c->eax = 0;          /* stos para trás: [m+56, m+64) */
+        rep_stos(c, 4);
+        CHECK_EQ_U32(rd32(m + 56), 0);
+        CHECK_EQ_U32(rd32(m + 60), 0);
+        CHECK_EQ_U32(rd8(m + 55), 55);
+        CHECK_EQ_U32(c->edi, m + 52);
+        CHECK_EQ_U32(eflags_pack(c) & 0x400u, 0x400u);   /* pushfd vê o DF */
+        eflags_unpack(c, 0x202u);                         /* popfd com DF=0 */
+        CHECK_EQ_U32(c->df, 0);
+        CHECK_EQ_U32(STR_STEP(c, 4), 4);
+        c->df = 1;
+        CHECK_EQ_U32(STR_STEP(c, 2), 0xFFFFFFFEu);
+        c->df = 0;
     }
 
     /* ldmxcsr com FTZ|DAZ: guardado para o stmxcsr e aplicado ao SSE do host. */

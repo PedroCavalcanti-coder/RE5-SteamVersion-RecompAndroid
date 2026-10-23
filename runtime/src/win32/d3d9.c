@@ -28,6 +28,7 @@
 
 #include <SDL2/SDL.h>
 
+#include "re5/coldebug.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/user32.h"
 #include "kernel32_internal.h"
@@ -570,6 +571,17 @@ static void shot(IDirect3DDevice9 *dev, uint32_t n)
     if (bb) bb->lpVtbl->Release(bb);
 }
 
+/* O guest manda as constantes de vertex shader; a sobreposição de colisão (coldebug) procura nelas a
+ * matriz de câmera. Fora isso, é o repasse automático de sempre. */
+static void d_SetVertexShaderConstantF(CPU *c)
+{
+    IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
+    uint32_t start = re5_arg(c, 1), n = re5_arg(c, 3);
+    const float *data = d9_ptr(re5_arg(c, 2));
+    re5_coldebug_vs_const(start, data, n);
+    c->eax = (uint32_t)dev->lpVtbl->SetVertexShaderConstantF(dev, start, data, n);
+}
+
 static void d_Present(CPU *c)
 {
     IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
@@ -577,7 +589,10 @@ static void d_Present(CPU *c)
     HWND over = host_hwnd(re5_arg(c, 3), "IDirect3DDevice9::Present");
     const RGNDATA *dirty = d9_ptr(re5_arg(c, 4));
     HRESULT hr;
+    re5_coldebug_draw(dev);
     if (shot_wanted(g_presents + 1)) shot(dev, g_presents + 1);
+    re5_dump_at_present(g_presents + 1);
+    re5_det_on_present();
     {
         RE5_BLOCKING_BEGIN();
         hr = dev->lpVtbl->Present(dev, src, dst, over, dirty);
@@ -960,6 +975,7 @@ static const d9_manual k_manual[] = {
     {D9K_DEVICE, "GetCreationParameters", d_GetCreationParameters},
     {D9K_DEVICE, "Reset", d_Reset},
     {D9K_DEVICE, "Present", d_Present},
+    {D9K_DEVICE, "SetVertexShaderConstantF", d_SetVertexShaderConstantF},
     {D9K_SURFACE, "LockRect", s_LockRect},
     {D9K_SURFACE, "UnlockRect", s_UnlockRect},
     {D9K_TEXTURE, "LockRect", t_LockRect},
