@@ -13,15 +13,3 @@
 0x009DF110    jogo: chamador de 0x00CFC5E0 (provável inimigo)
 0x00B72FA0    jogo: chamador de 0x00CFC5E0 (provável parceiro/NPC)
 0x00426660    MT Framework: propriedade JobThread (arg = valor pedido; guarda min(valor, 8, nº de processadores) em +0x94)
-# Filtro de colisão do Havok (hkpGroupFilter, vtable 0x0105BD44). Todas as variantes de
-# isCollisionEnabled chamam o núcleo 0x00D99740(hkBool *res, infoA, infoB); a saída mostra
-# *eax = 1 (colide) ou 0 (rejeitado). filterInfo = grupo<<16 | subsistema-ignorado<<10 |
-# subsistema<<5 | camada. Obs.: 0x00D36BD0 é o destrutor do hkpRayCollidableFilter, não um filtro.
-0x00D99740    Havok: hkpGroupFilter::isCollisionEnabled(infoA, infoB), o núcleo (args: res*, infoA, infoB)
-0x00D99A40    Havok: hkpGroupFilter raio x collidable (args: res*, hkpWorldRayCastInput* [+0x24 info], hkpCollidable* [+0x1C info])
-0x00D997F0    Havok: hkpGroupFilter raio x subshape de coleção (triângulos da malha MOPP estática)
-0x00D99A10    Havok: hkpGroupFilter collidable x collidable (args: res*, hkpCollidable* A, hkpCollidable* B)
-# Raycasters: callback da broadphase para cada corpo cujo AABB o raio cruza (o fixo tem de passar aqui).
-0x00DA5170    Havok: hkpWorldRayCaster, callback da broadphase
-0x00DA5A60    Havok: hkpSimpleWorldRayCaster, callback da broadphase
-0x00DA7E20    Havok: hkpWorldLinearCaster, callback da broadphase (linear cast)

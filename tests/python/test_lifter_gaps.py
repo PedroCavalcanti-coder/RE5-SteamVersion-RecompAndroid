@@ -116,6 +116,43 @@ class LifterGaps(unittest.TestCase):
         self.assertIn("while (c->ecx)", lift(b"\xf3\xa6"))         # repe cmpsb continua laço
         self.assertNotIn("rep_", lift(b"\xab"))                    # stosd sem rep: um elemento
 
+    def test_packed_sse_is_one_vector_op(self):
+        # Desempenho (2026-10-23): mulps pista a pista virava 4 mulss no host.
+        self.assertEqual(lift(b"\x0f\x59\xc3"), "c->xmm[0] = xmm_mulps(c->xmm[0], c->xmm[3]);")
+        self.assertEqual(lift(b"\x66\x0f\xfe\xc3"), "c->xmm[0] = xmm_paddd(c->xmm[0], c->xmm[3]);")
+        self.assertEqual(lift(b"\x0f\x55\xc3"), "c->xmm[0] = xmm_andn(c->xmm[0], c->xmm[3]);")
+        self.assertIn("XMM_SHUF4(c->xmm[0], _s, 0, 3, 5, 6)", lift(b"\x0f\xc6\xc1\x9c"))   # shufps 0x9c
+        self.assertIn("XMM_SHUF4(c->xmm[0], _s, 0, 4, 1, 5)", lift(b"\x0f\x14\xc1"))       # unpcklps
+
+    def test_flag_liveness_and_register_cache(self):
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        lifter = Lifter.__new__(Lifter)
+        lifter.md = md
+        lifter.reloc_vas = set()
+        lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+        lifter.read_va = None
+        lifter.flags_dead_ret_below = 0x00E63000
+        # add eax, ebx ; sub ecx, 1 ; cmp eax, ecx ; je +1 ; push esi ; call 0x1fff ; ret
+        code = bytes.fromhex("01d8" "83e901" "39c8" "7401" "56" "e8f00f0000" "c3")
+        c = lifter.lift_function(code, 0x1000)
+        lines = {l.split("/* ")[1][:8]: l for l in c.splitlines() if "/* 0000" in l}
+        self.assertIn("flags_add_m(c, 0x000u", lines["00001000"])       # add: tudo sobrescrito pelo cmp
+        self.assertIn("flags_sub_m(c, 0x000u", lines["00001002"])
+        self.assertIn("flags_sub_m(c, 0x040u", lines["00001005"])       # cmp: só ZF (je)
+        self.assertIn("uint32_t R_eax = c->eax", c)                       # registradores em locais
+        self.assertIn("push32_r(c, &R_esp, R_esi)", lines["00001009"])
+        call = lines["0000100A"]
+        self.assertLess(call.index("c->esp = R_esp;"), call.index("dispatch(c, 0x00001FFFu)"))  # sincroniza antes
+        self.assertIn("c->eax = R_eax;", call)                            # add escreveu eax
+        self.assertNotIn("c->edx = R_edx;", call)                         # edx não mudou: não grava
+        self.assertGreater(call.index("R_eax = c->eax;"), call.index("dispatch("))              # recarrega depois
+        self.assertIn("return; }", lines["0000100F"])
+        # No CRT o ret mantém as flags vivas (0x00E72105 devolve resultado em ZF).
+        lifter.flags_dead_ret_below = 0x00000800
+        c2 = lifter.lift_function(bytes.fromhex("39c8" "c3"), 0x1000)
+        self.assertIn("flags_sub(c, ", c2)
+
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
         # (0x00E64680, std; repne scasb) devolvia NULL e o 0x0072BC80 registrava toda

@@ -472,6 +472,7 @@ static void test_env(void)
     CHECK_EQ_U32(call("SetEnvironmentVariableA", 2, gstr("RE5_X"), gstr("1")), 1);
     uint32_t env = call("GetEnvironmentStringsW", 0);
     int found_os = 0, found_x = 0;
+    char env_ncpu[32] = "";
     for (uint32_t p = env; r16(p);) {
         char line[128];
         uint32_t n = 0;
@@ -480,6 +481,7 @@ static void test_env(void)
         p += 2;
         found_os |= strcmp(line, "OS=Windows_NT") == 0;
         found_x |= strcmp(line, "RE5_X=1") == 0;
+        if (strncmp(line, "NUMBER_OF_PROCESSORS=", 21) == 0) snprintf(env_ncpu, sizeof env_ncpu, "%s", line + 21);
     }
     CHECK(found_os && found_x);
     CHECK_EQ_U32(call("FreeEnvironmentStringsW", 1, env), 1);
@@ -488,11 +490,17 @@ static void test_env(void)
     call("GetSystemInfo", 1, si);
     CHECK_EQ_U32(rd32(si + 4), 4096);
     CHECK_EQ_U32(rd32(si + 28), 0x10000);
-    /* Núcleos: 2 com o lock global; no hle, os do host (1..8). Máscara coerente. */
+    /* Núcleos: 2 com o lock global; no hle, os do host menos um (1..8). Máscara e
+     * NUMBER_OF_PROCESSORS coerentes. */
     uint32_t ncpu = rd32(si + 20);
     if (re5_guest_lock_mode_hle()) CHECK(ncpu >= 1 && ncpu <= 8);
     else CHECK_EQ_U32(ncpu, 2);
     CHECK_EQ_U32(rd32(si + 16), (1u << ncpu) - 1);
+    {
+        char want[16];
+        snprintf(want, sizeof want, "%u", ncpu);
+        CHECK(strcmp(env_ncpu, want) == 0);
+    }
     uint32_t sti = gbuf(68);
     call("GetStartupInfoA", 1, sti);
     CHECK_EQ_U32(rd32(sti), 68);

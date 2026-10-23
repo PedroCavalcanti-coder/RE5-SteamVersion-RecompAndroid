@@ -20,10 +20,12 @@
 #include <unistd.h>
 #endif
 
-/* Núcleos anunciados ao jogo (GetSystemInfo); a MT Framework divide os jobs por
- * eles. Com o lock global (D5) mais núcleos só disputam o mesmo lock: 2. Com
- * RE5_GUEST_LOCK=hle o código do guest roda em paralelo: os do host, até 8 (o
- * que a MT Framework de 2009 conhece). RE5_CPUS força um número (1..32). */
+/* Núcleos anunciados ao jogo (GetSystemInfo, NUMBER_OF_PROCESSORS); a MT Framework
+ * divide os jobs por eles (workers = min(JobThread do config.ini, 8, este número)).
+ * Com o lock global (D5) mais núcleos só disputam o mesmo lock: 2. Com
+ * RE5_GUEST_LOCK=hle o código do guest roda em paralelo: os do host menos um (fica
+ * para a thread de render da DXVK e o sistema), até 8, o que a MT Framework de 2009
+ * conhece. RE5_CPUS força um número (1..32). */
 static uint32_t guest_cpus(void)
 {
     static uint32_t n;
@@ -39,7 +41,8 @@ static uint32_t guest_cpus(void)
 #else
     long host = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-    n = host < 1 ? 1u : host > 8 ? 8u : (uint32_t)host;
+    long use = host - 1;
+    n = use < 1 ? 1u : use > 8 ? 8u : (uint32_t)use;
     RE5_INFO("kernel32", "GetSystemInfo: %u núcleos para o jogo (host: %ld)", n, host);
     return n;
 }
@@ -187,7 +190,6 @@ static void env_init(void)
         "ALLUSERSPROFILE=C:\\ProgramData",
         "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
         "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
-        "NUMBER_OF_PROCESSORS=2",
         "OS=Windows_NT",
         "PATH=C:\\Windows\\system32;C:\\Windows",
         "PROCESSOR_ARCHITECTURE=x86",
@@ -200,6 +202,9 @@ static void env_init(void)
         "windir=C:\\Windows",
     };
     for (size_t i = 0; i < sizeof k_initial / sizeof k_initial[0]; i++) g_env[g_nenv++] = strdup(k_initial[i]);
+    char cpus[40];
+    snprintf(cpus, sizeof cpus, "NUMBER_OF_PROCESSORS=%u", guest_cpus());   /* o mesmo que GetSystemInfo */
+    g_env[g_nenv++] = strdup(cpus);
 }
 
 static int env_find(const char *name, size_t len)

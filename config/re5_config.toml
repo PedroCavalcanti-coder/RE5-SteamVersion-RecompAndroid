@@ -39,6 +39,12 @@ bytes_per_file = 0x10000
 # dispatch(c, va): sem a busca na tabela a cada chamada. false = tudo pelo
 # dispatch, com a trilha de diagnóstico completa nas falhas.
 direct_calls = true
+# Flags no `ret`: abaixo deste endereço (jogo, MT Framework, Havok) nenhuma flag que a
+# função deixa é lida por quem a chamou (contado com capstone: zero leituras depois de
+# um call no código do jogo), então a análise de flags vivas as trata como mortas no
+# `ret`. O CRT, daqui para cima, tem rotina que devolve resultado em ZF (0x00E72105,
+# lida com `je` em 0x00E66C5C) e mantém todas vivas. Ausente = todas vivas sempre.
+flags_dead_at_ret_below = 0x00E63000
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"

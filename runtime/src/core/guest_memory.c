@@ -21,7 +21,10 @@
 
 #define GUEST_SPACE ((uint64_t)1 << 32)
 
+#if !RE5_GUEST_BASE_FIXED
 uintptr_t re5_guest_base;
+#endif
+static int g_reserved;   /* a reserva de 4 GiB existe (a base pode ser constante) */
 
 static re5_mutex g_mu;
 static re5_mem_region *g_regions;
@@ -40,9 +43,19 @@ static DWORD host_prot(uint32_t p)
 }
 static int host_reserve(void)
 {
+#if RE5_GUEST_BASE_FIXED
+    void *p = VirtualAlloc((void *)re5_guest_base, (SIZE_T)GUEST_SPACE, MEM_RESERVE, PAGE_NOACCESS);
+    if (p != (void *)re5_guest_base) {
+        if (p) VirtualFree(p, 0, MEM_RELEASE);
+        RE5_ERROR("mem", "endereço fixo do guest %p ocupado (compile com -DRE5_GUEST_BASE_FIXED=0)",
+                  (void *)re5_guest_base);
+        return -1;
+    }
+#else
     void *p = VirtualAlloc(NULL, (SIZE_T)GUEST_SPACE, MEM_RESERVE, PAGE_NOACCESS);
     if (!p) return -1;
     re5_guest_base = (uintptr_t)p;
+#endif
     return 0;
 }
 static int host_commit(uint32_t va, uint32_t size, uint32_t prot)
@@ -70,9 +83,23 @@ static int host_prot(uint32_t p)
 }
 static int host_reserve(void)
 {
+#if RE5_GUEST_BASE_FIXED
+    /* Sem MAP_FIXED (que esmagaria um mapeamento existente): o endereço é uma dica e
+     * qualquer outro resultado é recusado. */
+    void *p = mmap((void *)re5_guest_base, (size_t)GUEST_SPACE, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    if (p != (void *)re5_guest_base) {
+        munmap(p, (size_t)GUEST_SPACE);
+        RE5_ERROR("mem", "endereço fixo do guest %p ocupado (compile com -DRE5_GUEST_BASE_FIXED=0)",
+                  (void *)re5_guest_base);
+        return -1;
+    }
+#else
     void *p = mmap(NULL, (size_t)GUEST_SPACE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return -1;
     re5_guest_base = (uintptr_t)p;
+#endif
     return 0;
 }
 static int host_commit(uint32_t va, uint32_t size, uint32_t prot)
@@ -94,21 +121,25 @@ static void host_release(void) { munmap((void *)re5_guest_base, (size_t)GUEST_SP
 
 int re5_mem_init(void)
 {
-    if (re5_guest_base) return 0;
+    if (g_reserved) return 0;
     re5_mutex_init(&g_mu);
     if (host_reserve() != 0) {
         RE5_ERROR("mem", "não foi possível reservar 4 GiB para o espaço do guest");
         return -1;
     }
+    g_reserved = 1;
     RE5_DEBUG("mem", "espaço do guest em host %p", (void *)re5_guest_base);
     return 0;
 }
 
 void re5_mem_shutdown(void)
 {
-    if (!re5_guest_base) return;
+    if (!g_reserved) return;
     host_release();
+    g_reserved = 0;
+#if !RE5_GUEST_BASE_FIXED
     re5_guest_base = 0;
+#endif
     free(g_regions);
     g_regions = NULL;
     g_count = g_cap = 0;

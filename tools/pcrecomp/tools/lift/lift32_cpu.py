@@ -35,7 +35,7 @@ Usage:
 funcs.txt lines: "0xADDR  size  name" (IDA/Ghidra export), used for bounds.
 With no addresses given, lifts every function in funcs.txt.
 """
-import sys, re
+import os, sys, re
 from capstone import *
 from capstone.x86 import *
 
@@ -245,6 +245,376 @@ def _todo(va, what):
     says otherwise, so nothing that already includes cpu.h changes.
     """
     return 'RECOMP_TODO(0x%08X, "%s");' % (va, what.replace('"', "'").strip())
+
+
+# ---- flag liveness -------------------------------------------------------------
+#
+# Every add/sub/cmp/test/shift computes six flags through a cpu.h helper, and in
+# compiled code the next flag reader is almost always a jcc right after a cmp - the
+# rest are overwritten unread. lift_function runs a backward liveness over the
+# emitted C and hands each helper the mask of flags something can still read
+# (flags_sub_m & co.). Everything is derived from the C text, not from tables of
+# x86 semantics, so the analysis agrees with what the model actually does:
+#   uses  = every `c->xf` that is not an assignment, plus the flags the cpu.h
+#           helpers it calls read internally (parsed from cpu.h itself);
+#   kills = only definite writes: an unconditional masked-family helper, a shift by
+#           a nonzero constant, a plain `c->xf = ...`, or a call (the callee leaves
+#           the flags it leaves, and its own `ret` keeps them all live).
+# Leaving the function any other way (ret, jmp/jcc/fallthrough to another catalog
+# entry, dispatch, abort) keeps all flags live: a catalog entry can be the middle of
+# a real function that branches on flags set before the jump.
+FLAG_BITS = {"cf": 0x001, "pf": 0x004, "af": 0x010, "zf": 0x040, "sf": 0x080, "of": 0x800}
+ALL_FLAGS = 0x8D5
+_FLAG_READ = re.compile(r"c->(cf|zf|sf|of|pf|af)\b(?!\s*=(?!=))")
+_FLAG_WRITE = re.compile(r"(?:^|[;{]\s*)c->(cf|zf|sf|of|pf|af)\s*=(?!=)")
+_GOTO = re.compile(r"goto L_([0-9A-F]{8});")
+_CALLS = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+# helper -> (flags it always writes, index of its count argument or None)
+_MASKED = {
+    "flags_add": (ALL_FLAGS, None), "flags_sub": (ALL_FLAGS, None),
+    "flags_adc": (ALL_FLAGS, None), "flags_sbb": (ALL_FLAGS, None),
+    "flags_logicz": (0x8C5, None),   # cf of sf zf pf (af is left alone)
+    "op_shl": (0x0C5, 2), "op_shr": (0x0C5, 2), "op_sar": (0x0C5, 2),   # cf zf sf pf
+}
+
+
+def _bits(names):
+    v = 0
+    for n in names:
+        v |= FLAG_BITS[n]
+    return v
+
+
+def _helper_reads():
+    """Flags each cpu.h helper reads, directly or through the helpers it calls."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "runtime", "recomp32_cpu", "cpu.h")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    bodies = {}
+    for m in re.finditer(r"static inline [^;{(]*?\b(\w+)\s*\(([^)]*)\)\s*\{", text):
+        depth, i = 1, m.end()
+        while depth and i < len(text):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        bodies[m.group(1)] = text[m.end():i]
+    reads = {n: _bits(_FLAG_READ.findall(b)) for n, b in bodies.items()}
+    for _ in range(8):                                   # transitive closure
+        for n, b in bodies.items():
+            for callee in _CALLS.findall(b):
+                if callee in reads and callee != n:
+                    reads[n] |= reads[callee]
+    return reads
+
+
+_HELPER_READS = _helper_reads()
+
+
+def _uses(text):
+    if _HELPER_READS is None:
+        return ALL_FLAGS
+    v = _bits(_FLAG_READ.findall(text))
+    for name in _CALLS.findall(text):
+        v |= _HELPER_READS.get(name, 0)
+    return v
+
+
+def _call_args(text, start):
+    """Arguments of the call whose '(' is at text[start]; None if unbalanced."""
+    depth, i, args, cur = 0, start, [], ""
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+            if depth > 1:
+                cur += ch
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                args.append(cur.strip())
+                return args, i
+            cur += ch
+        elif ch == "," and depth == 1:
+            args.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    return None
+
+
+def _kills(mnem, text):
+    if mnem == "call":
+        return ALL_FLAGS
+    if any(k in text for k in ("while", "if (", "?", "for (")):
+        return 0                       # conditional: may write nothing
+    v = _bits(_FLAG_WRITE.findall(text))
+    for m in re.finditer(r"\b(%s)\(" % "|".join(_MASKED), text):
+        defs, cnt_i = _MASKED[m.group(1)]
+        if cnt_i is not None:
+            parsed = _call_args(text, m.end() - 1)
+            if not parsed:
+                continue
+            arg = parsed[0][cnt_i] if len(parsed[0]) > cnt_i else ""
+            try:
+                if int(arg.rstrip("uU"), 0) & 31 == 0:
+                    continue
+            except ValueError:
+                continue               # variable count: a zero count writes nothing
+        v |= defs
+    return v
+
+
+def _apply_masks(text, mask):
+    """Give every masked-family helper in `text` the flags that are live."""
+    if mask == ALL_FLAGS:
+        return text
+    return re.sub(r"\b(%s)\(c, " % "|".join(_MASKED), lambda m: f"{m.group(1)}_m(c, 0x{mask:03X}u, ", text)
+
+
+def flag_liveness(items, labels, dead_at_ret=False):
+    """items: [(insn, [C lines])]. Returns the live-out flag mask of each item.
+
+    dead_at_ret: the caller never reads flags this function leaves (true of compiled
+    code; a hand-written CRT routine can return a result in ZF), so `ret` keeps none."""
+    n = len(items)
+    index = {ins.address: i for i, (ins, _) in enumerate(items)}
+    succ, use, kill = [], [], []
+    for i, (ins, lines) in enumerate(items):
+        text = " ".join(lines)
+        mnem = ins.mnemonic.split()[-1]
+        s, leaves = [], False
+        for t in _GOTO.findall(text):
+            a = int(t, 16)
+            if a in index:
+                s.append(index[a])
+            else:
+                leaves = True
+        if mnem in ("ret", "retn") and dead_at_ret and "dispatch" not in text and "RECOMP_TODO" not in text:
+            pass                       # returns to a caller that rewrites flags before reading any
+        elif mnem != "call" and ("dispatch" in text or "return" in text or "RECOMP_TODO" in text):
+            leaves = True
+        stops = mnem in ("jmp", "ret", "retn", "retf", "iret", "iretd", "hlt")
+        if not stops:
+            if i + 1 < n:
+                s.append(i + 1)
+            else:
+                leaves = True
+        succ.append((s, leaves))
+        use.append(_uses(text))
+        kill.append(_kills(mnem, text))
+    live_in = [0] * n
+    live_out = [0] * n
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n - 1, -1, -1):
+            s, leaves = succ[i]
+            out = ALL_FLAGS if leaves else 0
+            for j in s:
+                out |= live_in[j]
+            inn = use[i] | (out & ~kill[i])
+            if out != live_out[i] or inn != live_in[i]:
+                live_out[i], live_in[i] = out, inn
+                changed = True
+    flag_liveness.succ = succ           # the CFG, for cache_registers
+    return [live_out[i] | use[i] for i in range(n)]
+
+
+# ---- registers in locals --------------------------------------------------------
+#
+# The GPRs and XMM registers live in the CPU struct, and GCC cannot prove that a
+# store to guest memory (a pointer computed from an integer) does not write it: after
+# every wr32 it reloaded esi/edi and every xmm from the struct, so a mulss became
+# load/mulss/store. Inside a function they become locals (R_eax, R_x0...), loaded at
+# entry. The struct is brought up to date only where something outside the function
+# body can look at it - a call into the runtime or another lifted function, a
+# return, a helper that takes the CPU and touches registers - and only for the
+# registers written since the last sync (forward "dirty" dataflow over the same CFG
+# as the flag liveness). After such a call every register is reloaded; the compiler
+# drops the loads nobody uses.
+CACHED = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi") + tuple("x%d" % i for i in range(8))
+_REG_REF = re.compile(r"\bc->(eax|ecx|edx|ebx|esp|ebp|esi|edi)\b")
+_XMM_REF = re.compile(r"\bc->xmm\[([0-7])\]")
+_LOCAL = re.compile(r"\bR_(eax|ecx|edx|ebx|esp|ebp|esi|edi|x[0-7])\b")
+_ASSIGN = re.compile(r"\s*(?:\.\w+\s*\[[^\]]*\]|\.\w+|\[[^\]]*\])*\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
+# Calls that see the whole CPU: everything must be in the struct before, reloaded after.
+_FULL_SYNC = ("dispatch", "dispatch_jmp", "re5_override", "recomp_cpuid", "recomp_rdtsc", "RECOMP_TODO",
+              "re5_recomp_todo", "RE5_CALL")
+# Helpers that read/write some registers through the CPU: (reads, writes).
+_PARTIAL_SYNC = {"rep_stos": (("eax", "ecx", "edi"), ("ecx", "edi")),
+                 "rep_movs": (("ecx", "esi", "edi"), ("ecx", "esi", "edi"))}
+# Everything else that takes `c` is a cpu.h helper/macro that never touches a GPR or
+# an XMM register through it (checked against cpu.h when it is parsed, see below).
+_SAFE_MACROS = {"FS_RD8", "FS_RD16", "FS_RD32", "FS_WR8", "FS_WR16", "FS_WR32", "STR_STEP", "RE5_LOOP_BARRIER",
+                "RE5_COV", "R8L", "R8H", "R16", "SET8L", "SET8H", "SET16"}
+
+
+def _cpu_h_touch_regs():
+    """cpu.h helpers that take the CPU and read or write a GPR/XMM register through it."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "runtime", "recomp32_cpu", "cpu.h")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None, set()
+    names, touching = set(), set()
+    for m in re.finditer(r"static inline [^;{(]*?\b(\w+)\s*\(([^)]*)\)\s*\{", text):
+        depth, i = 1, m.end()
+        while depth and i < len(text):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        names.add(m.group(1))
+        if "CPU" in m.group(2) and re.search(r"c->(eax|ecx|edx|ebx|esp|ebp|esi|edi|xmm)\b", text[m.end():i]):
+            touching.add(m.group(1))
+    return names, touching
+
+
+_CPU_H_NAMES, _CPU_H_TOUCH = _cpu_h_touch_regs()
+
+
+def _lname(r):
+    return "R_" + r
+
+
+def _store(r):
+    return f"c->xmm[{r[1:]}] = R_{r};" if r.startswith("x") else f"c->{r} = R_{r};"
+
+
+def _load(r):
+    return f"R_{r} = c->xmm[{r[1:]}];" if r.startswith("x") else f"R_{r} = c->{r};"
+
+
+def _rewrite(line):
+    line = re.sub(r"\bpush32\(c, ", "push32_r(c, &R_esp, ", line)
+    line = re.sub(r"\bpop32\(c\)", "pop32_r(c, &R_esp)", line)
+    line = _REG_REF.sub(lambda m: "R_" + m.group(1), line)
+    return _XMM_REF.sub(lambda m: "R_x" + m.group(1), line)
+
+
+def _writes(text):
+    out = set()
+    for m in _LOCAL.finditer(text):
+        r = m.group(1)
+        before = text[:m.start()].rstrip()
+        if before.endswith("&"):
+            out.add(r)
+            continue
+        if re.search(r"\b(SET8L|SET8H|SET16)\(\s*$", before):
+            out.add(r)
+            continue
+        if before.endswith("++") or before.endswith("--"):
+            out.add(r)
+            continue
+        if _ASSIGN.match(text, m.end()):
+            out.add(r)
+    return out
+
+
+def _sync_kind(text):
+    """'full', a _PARTIAL_SYNC name, or None for an instruction's (rewritten) text."""
+    kind = None
+    if "RECOMP_TODO(" in text or "re5_recomp_todo(" in text:
+        return "full"                  # aborts: the crash report reads the struct
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(\s*&?c\b", text):
+        name = m.group(1)
+        if name in _FULL_SYNC:
+            return "full"
+        if name in _PARTIAL_SYNC:
+            kind = name
+        elif name in _SAFE_MACROS or name.endswith("_r"):
+            continue
+        elif _CPU_H_NAMES is not None and name in _CPU_H_NAMES and name not in _CPU_H_TOUCH:
+            continue
+        else:
+            return "full"              # unknown callee that sees the CPU: be safe
+    return kind
+
+
+def _insert_around(text, names, before, after):
+    """Put `before` in front of each call statement to one of `names` and `after` behind it."""
+    out, i = [], 0
+    pat = re.compile(r"\b(%s)\(" % "|".join(map(re.escape, names)))
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            return "".join(out)
+        parsed = _call_args(text, m.end() - 1)
+        if not parsed:
+            out.append(text[i:])
+            return "".join(out)
+        end = parsed[1] + 1
+        semi = text.find(";", end)
+        stmt_end = semi + 1 if semi >= 0 and text[end:semi].strip() == "" else end
+        out.append(text[i:m.start()] + before + " " + text[m.start():stmt_end] + (" " + after if after else ""))
+        i = stmt_end
+
+
+def cache_registers(items, succ):
+    """items: [(insn, [rewritable C lines])], succ from flag_liveness. Returns new items
+    and the declaration line for the top of the function."""
+    n = len(items)
+    texts = [[_rewrite(l) for l in lines] for _, lines in items]
+    joined = [" ".join(t) for t in texts]
+    kinds = [_sync_kind(t) for t in joined]
+    writes = [_writes(t) for t in joined]
+    preds = [[] for _ in range(n)]
+    for i, (s, _) in enumerate(succ):
+        for j in s:
+            preds[j].append(i)
+    dirty_in = [set() for _ in range(n)]
+    dirty_out = [None] * n
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            din = set()
+            for p in preds[i]:
+                if dirty_out[p] is not None:
+                    din |= dirty_out[p]
+            if i == 0:
+                din = set(din)                         # entry: everything loaded, nothing dirty
+            # Only an unconditional `call` leaves every register clean: a conditional
+            # dispatch, or a jump table that gotos before dispatching, falls through or
+            # branches with the registers as they were.
+            clean = kinds[i] == "full" and items[i][0].mnemonic == "call" and not writes_after_call(joined[i])
+            dout = set() if clean else din | writes[i]
+            if din != dirty_in[i] or dout != dirty_out[i]:
+                dirty_in[i], dirty_out[i] = din, dout
+                changed = True
+    new_items = []
+    for i, (ins, _) in enumerate(items):
+        d = dirty_in[i] | writes[i]
+        stores = " ".join(_store(r) for r in CACHED if r in d)
+        loads_all = " ".join(_load(r) for r in CACHED)
+        lines = []
+        for line in texts[i]:
+            if kinds[i] == "full":
+                line = _insert_around(line, _FULL_SYNC, stores, loads_all)
+            elif kinds[i] in _PARTIAL_SYNC:
+                rd, wr = _PARTIAL_SYNC[kinds[i]]
+                st = " ".join(_store(r) for r in rd if r in d)
+                ld = " ".join(_load(r) for r in wr)
+                line = _insert_around(line, (kinds[i],), st, ld)
+            if "return;" in line:
+                line = line.replace("return;", "{ " + stores + " return; }" if stores else "return;")
+            lines.append(line)
+        new_items.append((ins, lines))
+    decl = ("uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[:8]) + "; "
+            "XMM " + ", ".join(f"R_{r} = c->xmm[{r[1:]}]" for r in CACHED[8:]) + ";")
+    return new_items, decl
+
+
+def writes_after_call(text):
+    """Does the instruction write a register after its full-sync call (so it ends dirty)?"""
+    m = None
+    for m in re.finditer(r"\b(%s)\(" % "|".join(_FULL_SYNC), text):
+        pass
+    if not m:
+        return False
+    parsed = _call_args(text, m.end() - 1)
+    return bool(parsed and _writes(text[parsed[1]:]))
 
 
 class Lifter:
@@ -615,8 +985,9 @@ class Lifter:
                 return [self.dst_write(insn, ops[0], f"(({cond}) ? 1 : 0)")]
         if m == "pushfd": return ["push32(c, eflags_pack(c));"]
         if m == "popfd":  return ["eflags_unpack(c, pop32(c));"]
-        if m == "pushf":  return ["push32(c, eflags_pack(c) & 0xFFFFu);"]
-        if m == "popf":   return ["eflags_unpack(c, pop32(c) & 0xFFFFu);"]
+        # 16-bit forms (66 9C / 66 9D) move two bytes, not four (difftest_cpu).
+        if m == "pushf":  return ["c->esp -= 2; wr16(c->esp, (uint16_t)eflags_pack(c));"]
+        if m == "popf":   return ["eflags_unpack(c, rd16(c->esp)); c->esp += 2;"]
         if m in ("cbw",):  return ["SET16(c->eax, (uint16_t)(int16_t)(int8_t)R8L(c->eax));"]
         if m in ("cwd",):  return ["SET16(c->edx, (R16(c->eax) & 0x8000u) ? 0xFFFFu : 0u);"]
         # AL = [EBX + AL]: the MSVC CRT turns the x87 class (fxam) into a
@@ -1184,11 +1555,8 @@ class Lifter:
                         f" c->xmm[{xd}].u64[0] = _d.u64[{a}];"
                         f" c->xmm[{xd}].u64[1] = _s.u64[{b}]; }}"]
             i, j = (0, 1) if lo else (2, 3)
-            return [f"{{ XMM _s = {src}; XMM _d = c->xmm[{xd}];"
-                    f" c->xmm[{xd}].u32[0] = _d.u32[{i}];"
-                    f" c->xmm[{xd}].u32[1] = _s.u32[{i}];"
-                    f" c->xmm[{xd}].u32[2] = _d.u32[{j}];"
-                    f" c->xmm[{xd}].u32[3] = _s.u32[{j}]; }}"]
+            return [f"{{ XMM _s = {src};"
+                    f" c->xmm[{xd}] = XMM_SHUF4(c->xmm[{xd}], _s, {i}, {4 + i}, {j}, {4 + j}); }}"]
 
         # movd/movq: the integer-lane moves. Same asymmetry as above.
         if m == "movd":
@@ -1216,6 +1584,8 @@ class Lifter:
         if m in SSE_BITWISE:
             op = SSE_BITWISE[m]
             n = self._xi(d)
+            fn = {"&": "xmm_and", "|": "xmm_or", "^": "xmm_xor", "andn": "xmm_andn"}[op]
+            return [f"c->xmm[{n}] = {fn}(c->xmm[{n}], {self._xm(insn, s)});"]
             lanes = (f"c->xmm[{n}].u64[0] = ~c->xmm[{n}].u64[0] & _s.u64[0];"
                      f" c->xmm[{n}].u64[1] = ~c->xmm[{n}].u64[1] & _s.u64[1];"
                      if op == "andn" else
@@ -1243,6 +1613,7 @@ class Lifter:
         if m in SSE_PINT:
             op, bits, n = SSE_PINT[m]
             xd = self._xi(d)
+            return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {self._xm(insn, s)});"]   # wraps, one vector op
             sets = " ".join(
                 "c->xmm[%d].u%d[%d] = (uint%d_t)(_d.u%d[%d] %s _s.u%d[%d]);"
                 % (xd, bits, i, bits, bits, i, op, bits, i) for i in range(n))
@@ -1432,18 +1803,13 @@ class Lifter:
                 sets = ("c->xmm[%d].f64[0] = _d.f64[%d];"
                         " c->xmm[%d].f64[1] = _s.f64[%d];"
                         % (xd, imm & 1, xd, (imm >> 1) & 1))
-            elif m == "shufps":
-                sets = " ".join(
-                    "c->xmm[%d].u32[%d] = %s.u32[%d];"
-                    % (xd, i, "_d" if i < 2 else "_s", (imm >> (2 * i)) & 3)
-                    for i in range(4)
-                )
             else:
-                sets = " ".join(
-                    "c->xmm[%d].u32[%d] = _s.u32[%d];"
-                    % (xd, i, (imm >> (2 * i)) & 3)
-                    for i in range(4)
-                )
+                # One shuffle (cpu.h XMM_SHUF4, lanes 0-3 = destination, 4-7 = source).
+                sel = [(imm >> (2 * i)) & 3 for i in range(4)]
+                idx = ([sel[0], sel[1], 4 + sel[2], 4 + sel[3]] if m == "shufps"
+                       else [4 + k for k in sel])
+                return [f"{{ XMM _s = {self._xm(insn, s)};"
+                        f" c->xmm[{xd}] = XMM_SHUF4(c->xmm[{xd}], _s, {idx[0]}, {idx[1]}, {idx[2]}, {idx[3]}); }}"]
             return [f"{{ XMM _s = {self._xm(insn, s)};"
                     f" XMM _d = c->xmm[{xd}]; {sets} }}"]
 
@@ -1456,16 +1822,10 @@ class Lifter:
         # through a temporary for the same reason unpck needs one: the
         # destination is an input and may be the source.
         if m[:-2] in SSE_ARITH and m[-2:] in ("ps", "pd"):
-            wide = m[-2:] == "pd"
-            op = SSE_ARITH[m[:-2]]
-            lane, n = ("f64", 2) if wide else ("f32", 4)
-            sets = " ".join(
-                "c->xmm[%d].%s[%d] = _d.%s[%d] %s _s.%s[%d];"
-                % (self._xi(d), lane, i, lane, i, op, lane, i)
-                for i in range(n)
-            )
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{self._xi(d)}]; {sets} }}"]
+            # One vector operation (cpu.h xmm_mulps & co.): the lane-by-lane form
+            # compiled to four mulss per mulps in RE5's matrix code.
+            xd = self._xi(d)
+            return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {self._xm(insn, s)});"]
         if m in ("sqrtps", "sqrtpd"):
             wide = m == "sqrtpd"
             lane, n, fn = ("f64", 2, "sqrt") if wide else ("f32", 4, "sqrtf")
@@ -1756,10 +2116,18 @@ class Lifter:
         out = []
         out.append(f"void L_{start:08X}(CPU *c)")
         out.append("{")
-        for ins in insns:
+        items = [(ins, self.translate(ins, labels)) for ins in insns]
+        below = getattr(self, "flags_dead_ret_below", None)
+        masks = flag_liveness(items, labels, dead_at_ret=below is not None and start < below)
+        items = [(ins, [_apply_masks(l, mask) for l in lines]) for (ins, lines), mask in zip(items, masks)]
+        cache = getattr(self, "cache_registers", True) and bool(items)
+        if cache:
+            items, decl = cache_registers(items, flag_liveness.succ)
+            out.append(f"    {decl}")
+        for ins, lines in items:
             if ins.address in labels:
                 out.append(f"L_{ins.address:08X}:")
-            for line in self.translate(ins, labels):
+            for line in lines:
                 out.append(f"    {line:<60} /* {ins.address:08X}: {ins.mnemonic} {ins.op_str} */")
 
         # A body whose last instruction is not a transfer falls THROUGH into
@@ -1788,6 +2156,8 @@ class Lifter:
             # it. Mario Kart lost a pointer to a memcpy that way.
             nxt = insns[-1].address + insns[-1].size if insns else end
             out.append(f"    /* extent ends mid-function: fall through */")
+            if cache:
+                out.append("    " + " ".join(_store(r) for r in CACHED))
             out.append(f"    dispatch(c, 0x{nxt:08X}u); return;")
 
         out.append("}")

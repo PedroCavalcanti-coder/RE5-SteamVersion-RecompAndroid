@@ -148,6 +148,7 @@ por imports do kernel32, que são atômicos de verdade (`Interlocked*` com atôm
 host) ou serializados pelo lock do HLE. Handlers que só mexem no que é da própria
 thread (TLS, `LastError`, relógios) têm `RE5_THUNK_NOLOCK`. O modo `global` (acima)
 continua com `RE5_GUEST_LOCK=global` e é o padrão no ARM64 até a estratégia de TSO.
+No `hle` o jogo vê os núcleos do host menos um (até 8, o limite da MT Framework).
 Medido: de 72% das amostras esperando o lock a ~2-3x mais quadros por segundo.
 No modo `hle` o lock é uma flag com mutex e variável de condição: quem espera
 acorda quando ele é solto (a thread da janela acorda também a cada 10 ms para

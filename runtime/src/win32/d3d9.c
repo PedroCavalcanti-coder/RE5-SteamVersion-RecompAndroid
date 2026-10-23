@@ -592,6 +592,7 @@ static void d_Present(CPU *c)
     re5_coldebug_draw(dev);
     if (shot_wanted(g_presents + 1)) shot(dev, g_presents + 1);
     re5_dump_at_present(g_presents + 1);
+    re5_capture_at_present(g_presents + 1);
     re5_det_on_present();
     {
         RE5_BLOCKING_BEGIN();

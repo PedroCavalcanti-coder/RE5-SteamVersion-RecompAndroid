@@ -89,7 +89,9 @@ def main():
 #include <windows.h>
 #include "cpu.h"
 uint32_t g_image_delta;
+#if !RE5_GUEST_BASE_FIXED
 uintptr_t re5_guest_base;
+#endif
 const re5_func_entry re5_lifted_table[1];
 const uint32_t re5_lifted_count = 0;
 void re5_recomp_todo(uint32_t va, const char *what) { printf("X todo 0x%08X %s\n", va, what); fflush(stdout); exit(3); }
@@ -119,11 +121,16 @@ int main(int argc, char **argv)
 {
     size_t size = %d;
     /* Guest em re5_guest_base + VA: imagem em 0x00400000, pilha em 0x30000000. */
+#if RE5_GUEST_BASE_FIXED
+    uint8_t *mem = VirtualAlloc((void *)re5_guest_base, 0x31000000u, MEM_RESERVE, PAGE_NOACCESS);
+    if (mem != (uint8_t *)re5_guest_base) return 2;
+#else
     uint8_t *mem = VirtualAlloc(NULL, 0x31000000u, MEM_RESERVE, PAGE_NOACCESS);
     if (!mem) return 2;
+    re5_guest_base = (uintptr_t)mem;
+#endif
     if (!VirtualAlloc(mem + 0x00400000u, size, MEM_COMMIT, PAGE_READWRITE) ||
         !VirtualAlloc(mem + 0x30000000u, 0x00100000u, MEM_COMMIT, PAGE_READWRITE)) return 2;
-    re5_guest_base = (uintptr_t)mem;
     FILE *f = fopen(argv[1], "rb");
     if (fread(mem + 0x00400000u, 1, size, f) != size) return 2;
     fclose(f);

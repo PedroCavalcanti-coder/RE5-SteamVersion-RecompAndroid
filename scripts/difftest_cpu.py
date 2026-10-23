@@ -67,8 +67,11 @@ SKIP = {  # controle de fluxo, sistema, segmentos e o que o modelo de propósito
     "into", "iretd", "hlt", "cpuid", "rdtsc", "in", "out", "insb", "insd", "outsb", "outsd", "sysenter",
     "les", "lds", "lss", "lfs", "lgs", "fnstenv", "fldenv", "fnsave", "frstor", "fsave", "fstenv", "fwait",
     "wait", "fbld", "fbstp", "fldcw", "fnstcw", "fninit", "fnclex", "ldmxcsr", "stmxcsr", "nop", "pause",
-    "bound", "arpl", "aaa", "aas", "daa", "das", "aam", "aad", "lahf", "sahf", "pushfd", "popfd", "enter",
-    "fxsave", "fxrstor", "pushf", "popf",
+    "bound", "arpl", "aaa", "aas", "daa", "das", "aam", "aad", "enter",
+    "fxsave", "fxrstor",
+    # popfd/popf tiram da pilha um EFLAGS sorteado: com TF/AC ligados o Unicorn passa a
+    # tratar armadilhas e a referência sai errada (até no x87). lahf/sahf/pushfd ficam.
+    "popfd", "popf",
     # A referência erra aqui: o QEMU calcula fprem/fprem1 em double aproximado
     # (261,4498 rem1 -250,1177 deu -238,79; o exato é 11,3321, o que o modelo dá
     # com remainder) e não desempilha no fyl2x de argumento negativo.
@@ -255,7 +258,9 @@ HARNESS_HEAD = r"""
 #include <windows.h>
 #include "cpu.h"
 uint32_t g_image_delta;
+#if !RE5_GUEST_BASE_FIXED
 uintptr_t re5_guest_base;
+#endif
 const re5_func_entry re5_lifted_table[1];
 const uint32_t re5_lifted_count = 0;
 void re5_recomp_todo(uint32_t va, const char *what) { printf("X todo 0x%08X %s\n", va, what); fflush(stdout); exit(3); }
@@ -273,9 +278,16 @@ static uint8_t *g_pat;
 int main(int argc, char **argv)
 {
     /* O cpu.h gerado do RE5: endereço do guest = re5_guest_base + VA (como no jogo). */
+#if RE5_GUEST_BASE_FIXED
+    /* base constante (guest_base.h): a janela do teste fica no mesmo lugar que no jogo */
+    uint8_t *mem = VirtualAlloc((void *)(re5_guest_base + %(lo)du), %(size)du, MEM_RESERVE | MEM_COMMIT,
+                                PAGE_READWRITE);
+    if (mem != (uint8_t *)(re5_guest_base + %(lo)du)) { printf("X VirtualAlloc\n"); return 2; }
+#else
     uint8_t *mem = VirtualAlloc(NULL, %(size)du, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!mem) { printf("X VirtualAlloc\n"); return 2; }
     re5_guest_base = (uintptr_t)mem - %(lo)du;
+#endif
     g_pat = malloc(%(size)du);
     FILE *f = fopen(argv[1], "rb");
     if (!f || fread(g_pat, 1, %(size)du, f) != %(size)du) { printf("X padrão\n"); return 2; }

@@ -268,6 +268,7 @@ def cmd_lift(args, cfg):
         return pe.get_data(va - base, n)
 
     lifter = lift32_cpu.Lifter(exe, pe.OPTIONAL_HEADER.SizeOfImage, read_va)
+    lifter.flags_dead_ret_below = cfg["lift"].get("flags_dead_at_ret_below")
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
     lifter.reloc_vas = {(base + e.rva) & 0xFFFFFFFF
                         for br in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", [])
@@ -316,6 +317,7 @@ def cmd_lift(args, cfg):
             with open(path, "rb") as f:
                 tool_hash.update(f.read())
     tool_hash.update(rc.sha256_file(exe).encode())
+    tool_hash.update(repr(cfg["lift"].get("flags_dead_at_ret_below")).encode())
     file_cache = {}
 
     funcs = [fd for fd in cat["functions"] if fd["size"] > 0]

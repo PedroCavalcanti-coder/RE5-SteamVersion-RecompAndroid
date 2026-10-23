@@ -97,7 +97,27 @@ com o bit 10, `STR_STEP` em lods/stos/movs/scas/cmps, `rep_movs`/`rep_stos` em b
 para trás (sem replicar quando o memmove não replicaria). `difftest_cpu.py` sorteia e
 compara DF: movs/stos/lods/scas/cmps/std/cld 270/270 iguais ao Unicorn. Testes:
 `test_lifter_gaps.test_direction_flag`, `test_x87` (cópia para trás com sobreposição).
-Falta medir no jogo: drops, escada e câmera com o build novo.
+Confirmado no jogo pelo usuário (2026-10-23): drops, escada e câmera corrigidos.
+
+Auditoria por outros erros da mesma classe (estado oculto que a tradução isolada não
+vê), 2026-10-23: no C gerado, só `int3`/`nop`/`prefetch`/`wait`/`fnclex` viram
+comentário. Instruções que o difftest pulava, contadas no catálogo: `lahf` 6.734 (o
+`comiss; lahf; test ah, 44h` do MSVC), `pushfd` 149, `sahf` 39 saíram da lista de pulados e
+batem com o Unicorn (`popfd` volta a ser pulado: o EFLAGS sorteado liga TF/AC e o
+Unicorn se perde; difftest geral 2.607/2.610, só esses 3); `pushf`/`popf` de 16 bits empilhavam 4 bytes
+(só em dado desmontado, corrigido assim mesmo). MXCSR: os 6 `ldmxcsr` só ligam FTZ (som)
+ou testam DAZ (CRT), o arredondamento do SSE nunca muda. x87: as palavras de controle
+carregadas são 0x027F ou `or 0xC00` (truncar), a precisão fica em 53 bits (D9 vale).
+`fnstenv` real só no teste do FDIV do Pentium (CRT). Nenhum `lock`/`cmpxchg` em linha.
+
+### Núcleos (2026-10-23)
+
+O `.bat` ainda forçava `RE5_GUEST_LOCK=global` (do teste de colisão): uma thread do
+jogo por vez e 2 núcleos anunciados; e o `config.ini` estava com `JobThread=1`. Agora: o
+modo `hle` (padrão no x86-64) e `GetSystemInfo`/`NUMBER_OF_PROCESSORS` = núcleos do host
+menos um, até 8 (a MT Framework usa min(JobThread, 8, núcleos)); `JobThread=8` no
+`config.ini` do usuário (backup `config.ini.bak`). `RE5_CPUS` força um número. Teste
+`kernel32` confere a máscara e a variável de ambiente.
 
 ### Otimização do código gerado: -O2 (2026-10-22)
 

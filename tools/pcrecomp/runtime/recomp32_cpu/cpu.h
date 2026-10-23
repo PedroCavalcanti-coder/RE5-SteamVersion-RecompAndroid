@@ -229,6 +229,9 @@ static inline void eflags_unpack(CPU *c, uint32_t v) {
 #endif
 static inline void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(STACK_BASE(c) + c->esp, v); }
 static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp); c->esp += 4; return v; }
+/* The same on a cached ESP (lift32_cpu keeps the GPRs in locals, see cache_registers). */
+static inline void push32_r(CPU *c, uint32_t *sp, uint32_t v) { (void)c; *sp -= 4; wr32(STACK_BASE(c) + *sp, v); }
+static inline uint32_t pop32_r(CPU *c, uint32_t *sp) { (void)c; uint32_t v = rd32(STACK_BASE(c) + *sp); *sp += 4; return v; }
 
 /* An instruction the lifter could not express. Plain abort() by default, so a
  * project that includes only cpu.h is unchanged; a runtime that can say
@@ -308,6 +311,70 @@ static inline uint32_t flags_logicz(CPU *c, uint32_t r, int sz) {
     c->cf = 0; c->of = 0; c->sf = (r & s) != 0; c->zf = (r == 0);
     c->pf = parity8((uint8_t)r); return r;
 }
+/* Masked forms: the lifter's flag liveness (lift32_cpu: lift_function) passes the
+ * flags something can still read, as EFLAGS bits (CF 0x1, PF 0x4, AF 0x10, ZF 0x40,
+ * SF 0x80, OF 0x800), and only those are computed. `lm` is a constant at every call
+ * site, so the compiler drops the rest; without it every add/sub/cmp/test spent ~20
+ * host instructions on six flags that the next instruction overwrote. */
+#define RF_CF 0x001u
+#define RF_PF 0x004u
+#define RF_AF 0x010u
+#define RF_ZF 0x040u
+#define RF_SF 0x080u
+#define RF_OF 0x800u
+static inline uint32_t flags_sub_m(CPU *c, uint32_t lm, uint32_t a, uint32_t b, int sz) {
+    uint32_t m = mask_sz(sz), s = sign_sz(sz);
+    a &= m; b &= m; uint32_t r = (a - b) & m;
+    if (lm & RF_CF) c->cf = (a < b);
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & s) != 0;
+    if (lm & RF_OF) c->of = (((a ^ b) & (a ^ r)) & s) != 0;
+    if (lm & RF_AF) c->af = ((a ^ b ^ r) & 0x10) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t flags_add_m(CPU *c, uint32_t lm, uint32_t a, uint32_t b, int sz) {
+    uint32_t m = mask_sz(sz), s = sign_sz(sz);
+    a &= m; b &= m; uint32_t r = (a + b) & m;
+    if (lm & RF_CF) c->cf = (r < a);
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & s) != 0;
+    if (lm & RF_OF) c->of = ((~(a ^ b) & (a ^ r)) & s) != 0;
+    if (lm & RF_AF) c->af = ((a ^ b ^ r) & 0x10) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t flags_logicz_m(CPU *c, uint32_t lm, uint32_t r, int sz) {
+    uint32_t m = mask_sz(sz), s = sign_sz(sz); r &= m;
+    if (lm & RF_CF) c->cf = 0;
+    if (lm & RF_OF) c->of = 0;
+    if (lm & RF_SF) c->sf = (r & s) != 0;
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t flags_adc_m(CPU *c, uint32_t lm, uint32_t a, uint32_t b, int sz) {
+    uint32_t m = mask_sz(sz), s = sign_sz(sz), cin = c->cf & 1;
+    a &= m; b &= m; uint64_t full = (uint64_t)a + b + cin; uint32_t r = (uint32_t)full & m;
+    if (lm & RF_CF) c->cf = (full >> (sz * 8)) & 1;
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & s) != 0;
+    if (lm & RF_OF) c->of = ((~(a ^ b) & (a ^ r)) & s) != 0;
+    if (lm & RF_AF) c->af = ((a ^ b ^ r) & 0x10) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t flags_sbb_m(CPU *c, uint32_t lm, uint32_t a, uint32_t b, int sz) {
+    uint32_t m = mask_sz(sz), s = sign_sz(sz), bin = c->cf & 1;
+    a &= m; b &= m; uint64_t full = (uint64_t)a - b - bin; uint32_t r = (uint32_t)full & m;
+    if (lm & RF_CF) c->cf = (full >> (sz * 8)) & 1;
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & s) != 0;
+    if (lm & RF_OF) c->of = (((a ^ b) & (a ^ r)) & s) != 0;
+    if (lm & RF_AF) c->af = ((a ^ b ^ r) & 0x10) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
 static inline uint32_t flags_incs(CPU *c, uint32_t a, int sz) {
     uint32_t keep = c->cf, r = flags_add(c, a, 1, sz); c->cf = keep; return r;
 }
@@ -349,6 +416,36 @@ static inline uint32_t op_sar(CPU *c, uint32_t v, uint32_t cnt, int sz) {
     int32_t sv = (v & s) ? (int32_t)(v | ~m) : (int32_t)v;
     c->cf = (uint32_t)(sv >> (cnt - 1)) & 1; uint32_t r = (uint32_t)(sv >> cnt) & m;
     c->zf = (r == 0); c->sf = (r & s) != 0; c->pf = parity8((uint8_t)r); return r;
+}
+
+/* Masked shifts (see flags_sub_m). A zero count still leaves every flag alone. */
+static inline uint32_t op_shl_m(CPU *c, uint32_t lm, uint32_t v, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz); cnt &= 31; if (!cnt) return v & m;
+    uint32_t r = (v << cnt) & m;
+    if (lm & RF_CF) c->cf = (uint32_t)((((uint64_t)(v & m)) << cnt) >> (sz * 8)) & 1;
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & sign_sz(sz)) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t op_shr_m(CPU *c, uint32_t lm, uint32_t v, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz); v &= m; cnt &= 31; if (!cnt) return v;
+    uint32_t r = v >> cnt;
+    if (lm & RF_CF) c->cf = (v >> (cnt - 1)) & 1;
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & sign_sz(sz)) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t op_sar_m(CPU *c, uint32_t lm, uint32_t v, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz), s = sign_sz(sz); v &= m; cnt &= 31; if (!cnt) return v;
+    int32_t sv = (v & s) ? (int32_t)(v | ~m) : (int32_t)v;
+    uint32_t r = (uint32_t)(sv >> cnt) & m;
+    if (lm & RF_CF) c->cf = (uint32_t)(sv >> (cnt - 1)) & 1;
+    if (lm & RF_ZF) c->zf = (r == 0);
+    if (lm & RF_SF) c->sf = (r & s) != 0;
+    if (lm & RF_PF) c->pf = parity8((uint8_t)r);
+    return r;
 }
 
 /* ---- rotates. Unlike the shifts these leave ZF/SF/PF alone, which is not an
@@ -670,6 +767,59 @@ static inline void   wrxm(uint32_t a, XMM    v) { memcpy((void *)(uintptr_t)a, &
  * register-to-register forms leave the high lanes alone. Getting that
  * backwards is invisible until something reads the high lanes, which is why
  * it is a named helper and not an open-coded assignment. */
+/* Packed SSE as one vector operation. Lane by lane (`_d.f32[i] * _s.f32[i]` four
+ * times) the compiler emitted four mulss for each mulps; with GCC/Clang vector
+ * types it is one mulps on x86 and one fmul on ARM64 NEON, with the same IEEE result
+ * per lane. Only the operations whose lanes are independent and exact go here
+ * (+ - * /, wrapping integer +/-, bitwise, shuffles); min/max keep their own NaN
+ * rule elsewhere. memcpy in and out: no alignment or aliasing assumption on XMM. */
+#if defined(__GNUC__) || defined(__clang__)
+typedef float    xv4f __attribute__((vector_size(16)));
+typedef double   xv2d __attribute__((vector_size(16)));
+typedef uint8_t  xv16b __attribute__((vector_size(16)));
+typedef uint16_t xv8w __attribute__((vector_size(16)));
+typedef uint32_t xv4d __attribute__((vector_size(16)));
+typedef uint64_t xv2q __attribute__((vector_size(16)));
+typedef int32_t  xv4i __attribute__((vector_size(16)));
+#define XMM_VOP(name, vt, expr) \
+    static inline XMM name(XMM a, XMM b) { vt x, y; memcpy(&x, &a, 16); memcpy(&y, &b, 16); x = (expr); memcpy(&a, &x, 16); return a; }
+XMM_VOP(xmm_addps, xv4f, x + y) XMM_VOP(xmm_subps, xv4f, x - y)
+XMM_VOP(xmm_mulps, xv4f, x * y) XMM_VOP(xmm_divps, xv4f, x / y)
+XMM_VOP(xmm_addpd, xv2d, x + y) XMM_VOP(xmm_subpd, xv2d, x - y)
+XMM_VOP(xmm_mulpd, xv2d, x * y) XMM_VOP(xmm_divpd, xv2d, x / y)
+XMM_VOP(xmm_paddb, xv16b, x + y) XMM_VOP(xmm_psubb, xv16b, x - y)
+XMM_VOP(xmm_paddw, xv8w, x + y)  XMM_VOP(xmm_psubw, xv8w, x - y)
+XMM_VOP(xmm_paddd, xv4d, x + y)  XMM_VOP(xmm_psubd, xv4d, x - y)
+XMM_VOP(xmm_paddq, xv2q, x + y)  XMM_VOP(xmm_psubq, xv2q, x - y)
+XMM_VOP(xmm_and, xv2q, x & y) XMM_VOP(xmm_or, xv2q, x | y)
+XMM_VOP(xmm_xor, xv2q, x ^ y) XMM_VOP(xmm_andn, xv2q, ~x & y)
+/* shufps/unpck*ps: result lane k = lane idx[k] of (d ++ s), idx in 0..7. */
+#if defined(__clang__)
+#define XMM_SHUF4(d, s, i0, i1, i2, i3) __extension__({ XMM _r; xv4d _x, _y, _z; \
+    memcpy(&_x, &(d), 16); memcpy(&_y, &(s), 16); \
+    _z = __builtin_shufflevector(_x, _y, i0, i1, i2, i3); memcpy(&_r, &_z, 16); _r; })
+#else
+#define XMM_SHUF4(d, s, i0, i1, i2, i3) __extension__({ XMM _r; xv4d _x, _y, _z; \
+    memcpy(&_x, &(d), 16); memcpy(&_y, &(s), 16); \
+    _z = __builtin_shuffle(_x, _y, (xv4d){i0, i1, i2, i3}); memcpy(&_r, &_z, 16); _r; })
+#endif
+#else
+#define XMM_LOP(name, fld, n, op) \
+    static inline XMM name(XMM a, XMM b) { for (int i = 0; i < n; i++) a.fld[i] = a.fld[i] op b.fld[i]; return a; }
+XMM_LOP(xmm_addps, f32, 4, +) XMM_LOP(xmm_subps, f32, 4, -) XMM_LOP(xmm_mulps, f32, 4, *) XMM_LOP(xmm_divps, f32, 4, /)
+XMM_LOP(xmm_addpd, f64, 2, +) XMM_LOP(xmm_subpd, f64, 2, -) XMM_LOP(xmm_mulpd, f64, 2, *) XMM_LOP(xmm_divpd, f64, 2, /)
+XMM_LOP(xmm_paddb, u8, 16, +) XMM_LOP(xmm_psubb, u8, 16, -) XMM_LOP(xmm_paddw, u16, 8, +) XMM_LOP(xmm_psubw, u16, 8, -)
+XMM_LOP(xmm_paddd, u32, 4, +) XMM_LOP(xmm_psubd, u32, 4, -) XMM_LOP(xmm_paddq, u64, 2, +) XMM_LOP(xmm_psubq, u64, 2, -)
+XMM_LOP(xmm_and, u64, 2, &) XMM_LOP(xmm_or, u64, 2, |) XMM_LOP(xmm_xor, u64, 2, ^)
+static inline XMM xmm_andn(XMM a, XMM b) { a.u64[0] = ~a.u64[0] & b.u64[0]; a.u64[1] = ~a.u64[1] & b.u64[1]; return a; }
+static inline XMM xmm_shuf4(XMM d, XMM s, int i0, int i1, int i2, int i3) {
+    XMM r; const int k[4] = {i0, i1, i2, i3};
+    for (int i = 0; i < 4; i++) r.u32[i] = k[i] < 4 ? d.u32[k[i]] : s.u32[k[i] - 4];
+    return r;
+}
+#define XMM_SHUF4(d, s, i0, i1, i2, i3) xmm_shuf4((d), (s), i0, i1, i2, i3)
+#endif
+
 static inline void sse_load_ss(XMM *d, float  v) { d->u64[0] = 0; d->u64[1] = 0; d->f32[0] = v; }
 static inline void sse_load_sd(XMM *d, double v) { d->u64[0] = 0; d->u64[1] = 0; d->f64[0] = v; }
 

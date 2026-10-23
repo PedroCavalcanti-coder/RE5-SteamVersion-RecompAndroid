@@ -12,9 +12,13 @@ rem Para ver cada import chamado: set RE5_LOG=trace
 set "RE5_LOG_FILE=%~dp0work\re5_run.log"
 set "RE5_SEED_LOG=%~dp0work\runtime_seeds.txt"
 if not exist "%~dp0work" mkdir "%~dp0work"
-rem Teste de colisao: uma thread do jogo por vez (mais lento). Se a colisao
-rem ficar certa assim, o defeito e corrida entre threads. Tire o "rem" para ligar:
-set "RE5_GUEST_LOCK=global"
+rem Threads: o codigo do jogo roda em paralelo (lock so nos imports, modo hle) e o
+rem jogo ve os nucleos do host menos um (ate 8, o limite da MT Framework). Para
+rem rodar uma thread do jogo por vez (diagnostico, bem mais lento), tire o "rem":
+rem set "RE5_GUEST_LOCK=global"
+rem Forcar um numero de nucleos para o jogo (1..32). Num APU de 15 W (CPU e GPU
+rem dividem a energia) menos threads pode dar MAIS fps: compare 4 com o padrao.
+rem set "RE5_CPUS=4"
 rem Diagnosticos (desligados: custam desempenho). Tire o "rem" para ligar:
 rem   perfil no log a cada 10 s (amostra as threads a cada 1 ms):
 rem set "RE5_PROFILE=10"
@@ -27,18 +31,18 @@ rem   F8 zera e F9 grava as funcoes executadas desde o F8 em work\cov\cov_N.txt
 rem   F6 = linhas de colisao por cima do quadro (experimental)
 if not exist "%~dp0work\dump" mkdir "%~dp0work\dump"
 if not exist "%~dp0work\cov" mkdir "%~dp0work\cov"
-set "RE5_DUMP=1"
-set "RE5_COV=1"
-set "RE5_COLDEBUG=1"
+rem set "RE5_DUMP=1"
+rem set "RE5_COV=1"
+rem set "RE5_COLDEBUG=1"
 rem   F7 = Deterministic TAS & Trace (grava work\trace_recomp.bin e aplica snapshot_s115.json)
-set "RE5_DETERMINISTIC=1"
-set "RE5_TAS_KEY=7"
-set "RE5_TRACE_FILE=%~dp0work\trace_recomp.bin"
+rem set "RE5_DETERMINISTIC=1"
+rem set "RE5_TAS_KEY=7"
+rem set "RE5_TRACE_FILE=%~dp0work\trace_recomp.bin"
 rem   F11 = captura o movimento dos dois personagens jogaveis (0x00B72FA0, uma chamada de cada)
 rem         com a memoria antes e depois, em work\dump\capture_N_* (para o snap_diff.py).
 rem         Teste da escada: segure "para frente" encostado no degrau e aperte F11.
-set "RE5_CAPTURE=00B72FA0"
-set "RE5_CAPTURE_N=2"
+rem set "RE5_CAPTURE=00B72FA0"
+rem set "RE5_CAPTURE_N=2"
 rem Video: Vulkan pela DXVK mais nova que a GPU aceita (build\test-build\dxvk\3.1.1
 rem ou 2.6.2; o log diz qual). Forcar uma: set "RE5_DXVK=2.6.2"
 rem Sem Vulkan (Direct3D do sistema): set "RE5_D3D9_DLL=d3d9.dll"

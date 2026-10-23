@@ -33,6 +33,9 @@ void re5_dump_named(const char *name);
 /* Captura de uma chamada (trace.c): F11 arma; a próxima chamada de RE5_CAPTURE=<VA> (um tracepoint)
  * grava registradores e memória na entrada e na saída, para o scripts/snap_diff.py. */
 void re5_capture_key(void);
+/* RE5_CAPTURE_AT=<n>[,<n>...]: arma a captura (como o F11) no n-ésimo Present, sem tecla
+ * (validação automática com o scripts/bench_re5.py). */
+void re5_capture_at_present(uint32_t present);
 
 /* Deterministic Replay & Trace Diff (estilo TAS / Lockstep) */
 void     re5_det_init(void);

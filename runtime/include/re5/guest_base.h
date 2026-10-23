@@ -18,7 +18,20 @@
 #error "re5-recompiled exige um host de 64 bits (o espaço de 4 GiB do guest é uma reserva do host). Ver docs/ARQUITETURA.md, D2."
 #endif
 
+/* Base fixa (padrão): a reserva de 4 GiB fica sempre em 64 GiB do espaço do host e
+ * a base é uma constante. Com uma variável global, cada escrita na memória do guest
+ * obrigava o compilador a reler a base antes do acesso seguinte (podia ter mudado):
+ * no código gerado do RE5 era uma carga extra em quase todo rd/wr. Se o endereço
+ * estiver ocupado o runtime aborta dizendo isso; -DRE5_GUEST_BASE_FIXED=0 volta à
+ * base variável. */
+#ifndef RE5_GUEST_BASE_FIXED
+#define RE5_GUEST_BASE_FIXED 0x1000000000ull
+#endif
+#if RE5_GUEST_BASE_FIXED
+#define re5_guest_base ((uintptr_t)RE5_GUEST_BASE_FIXED)
+#else
 extern uintptr_t re5_guest_base;
+#endif
 
 /* Endereço do guest -> endereço do host, como inteiro. */
 #define RE5_G2H(va) (re5_guest_base + (uintptr_t)(uint32_t)(va))

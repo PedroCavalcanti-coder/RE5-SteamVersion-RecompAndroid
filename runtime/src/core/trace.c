@@ -98,6 +98,28 @@ void re5_capture_key(void)
              g_cap_per, g_cap_n);
 }
 
+void re5_capture_at_present(uint32_t present)
+{
+    static int init;
+    static uint32_t at[16], nat;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("RE5_CAPTURE_AT");
+        for (const char *p = e; p && *p && nat < 16;) {
+            char *end;
+            uint32_t v = (uint32_t)strtoul(p, &end, 10);
+            if (end == p) break;
+            at[nat++] = v;
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    for (uint32_t i = 0; i < nat; i++)
+        if (at[i] == present) {
+            RE5_INFO("capture", "RE5_CAPTURE_AT: Present %u", present);
+            re5_capture_key();
+        }
+}
+
 static void cap_write_regs(const CPU *c, const char *name)
 {
     const char *dir = getenv("RE5_DUMP_DIR");
