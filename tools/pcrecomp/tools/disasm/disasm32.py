@@ -1144,6 +1144,36 @@ def interior_starts(functions, protected=frozenset(), weak=frozenset()):
     return inner
 
 
+def label_reentries(f, x):
+    """Is the start `x` really a label inside `f`?
+
+    interior_starts leaves a start alone when the body only reaches it by an
+    unconditional jmp or by falling out of a call - a tail call and a call
+    that does not return look the same. The loop condition at the bottom of a
+    thread's main loop is exactly that: RE5's 0x00447080 reaches 0x0044744D by
+    `jmp` and after `call 0x447020`, and 0x0044744D's `je 0x4470a0` goes back
+    up into 0x00447080. Cut there, each turn of the loop was a nested host call
+    (lifted jmp/jcc to another function) and the host stack overflowed after a
+    while.
+
+    The evidence a tail call never has: `f`'s own decode runs through `x`, and
+    `x` branches back into `f` - to an address of `f`'s body before `x`, other
+    than `f`'s start. A real function does not jump into the middle of the one
+    in front of it.
+    """
+    f_ins = {i.address for b in f.blocks.values() for i in b.instructions}
+    if x.address not in f_ins:
+        return False
+    for b in x.blocks.values():
+        for i in b.instructions:
+            if not i.is_jump:
+                continue
+            t = i.get_branch_target()
+            if t is not None and f.address < t < x.address and t in f_ins:
+                return True
+    return False
+
+
 def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                                  max_rounds=4, verbose=True, keep=frozenset(), callers=None,
                                  weak=frozenset()):

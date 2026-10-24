@@ -71,3 +71,32 @@ class ExtendCatalog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def loop_image():
+    text = bytearray(b"\x90" * 0x100)
+    # F: o laço do 0x00447080 do RE5 em miniatura, cortado na condição do laço.
+    text[0x00:0x01] = b"\x55"                    # 0x401000 push ebp
+    text[0x01:0x03] = b"\x31\xc0"                # 0x401001 xor eax, eax
+    text[0x03:0x04] = b"\x40"                    # 0x401003 inc eax          <- cabeça do laço
+    text[0x04:0x06] = b"\xeb\x02"                # 0x401004 jmp 0x401008
+    text[0x08:0x0B] = b"\x83\xf8\x05"            # 0x401008 cmp eax, 5       <- início falso
+    text[0x0B:0x0D] = b"\x75\xf6"                # 0x40100B jne 0x401003     (volta para o meio de F)
+    text[0x0D:0x0F] = b"\x5d\xc3"                # 0x40100D pop ebp; ret
+    text[0x10:0x11] = b"\xc3"                    # 0x401010 G
+    text[0x20:0x25] = b"\xe9\x0b\x00\x00\x00"    # 0x401020 jmp 0x401030     (tail call de verdade)
+    text[0x30:0x31] = b"\xc3"                    # 0x401030 H
+    return Disassembler(b"\x00" * 0x400 + bytes(text), BASE, [_Sec(".text", 0x1000, 0x400, 0x100, True)])
+
+
+class FixLabels(unittest.TestCase):
+    def test_loop_tail_becomes_alias_and_tail_call_stays(self):
+        def e(a, end):
+            return {"address": BASE + a, "end": BASE + end, "size": end - a, "entry_kind": "start", "is_thunk": False}
+        funcs = [e(0x1000, 0x1008), e(0x1008, 0x100F), e(0x1010, 0x1011), e(0x1020, 0x1025), e(0x1030, 0x1031)]
+        fixed = run_lift.fix_label_starts(loop_image(), {}, funcs, BASE + 0x1100)
+        self.assertEqual(fixed, [(BASE + 0x1000, BASE + 0x1008)])
+        by = {f["address"]: f for f in funcs}
+        self.assertEqual(by[BASE + 0x1008]["entry_kind"], "alias")
+        self.assertEqual(by[BASE + 0x1000]["end"], BASE + 0x100F)   # o laço inteiro numa função só
+        self.assertEqual(by[BASE + 0x1030]["entry_kind"], "start")  # alvo de jmp que não volta: função

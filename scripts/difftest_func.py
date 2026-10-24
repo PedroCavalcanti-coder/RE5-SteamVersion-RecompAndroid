@@ -87,6 +87,7 @@ def main():
     src = [r"""#include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
+#define RE5_CACHED_REGS 1
 #include "cpu.h"
 uint32_t g_image_delta;
 #if !RE5_GUEST_BASE_FIXED

@@ -331,6 +331,119 @@ static inline uint32_t flags_logicz(CPU *c, uint32_t r, int sz) {
 #define RF_ZF 0x040u
 #define RF_SF 0x080u
 #define RF_OF 0x800u
+#define ALL_FLAGS 0x8D5u
+
+#if defined(RE5_CACHED_REGS)
+
+#define flags_sub_m(c, lm, a, b, sz) ({ \
+    uint32_t _m = mask_sz(sz), _s = sign_sz(sz); \
+    uint32_t _a = (uint32_t)(a) & _m, _b = (uint32_t)(b) & _m; \
+    uint32_t _r = (_a - _b) & _m; \
+    if ((lm) & RF_CF) R_cf = (_a < _b); \
+    if ((lm) & RF_ZF) R_zf = (_r == 0); \
+    if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
+    if ((lm) & RF_OF) R_of = (((_a ^ _b) & (_a ^ _r)) & _s) != 0; \
+    if ((lm) & RF_AF) R_af = ((_a ^ _b ^ _r) & 0x10) != 0; \
+    if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    _r; \
+})
+#define flags_add_m(c, lm, a, b, sz) ({ \
+    uint32_t _m = mask_sz(sz), _s = sign_sz(sz); \
+    uint32_t _a = (uint32_t)(a) & _m, _b = (uint32_t)(b) & _m; \
+    uint32_t _r = (_a + _b) & _m; \
+    if ((lm) & RF_CF) R_cf = (_r < _a); \
+    if ((lm) & RF_ZF) R_zf = (_r == 0); \
+    if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
+    if ((lm) & RF_OF) R_of = ((~(_a ^ _b) & (_a ^ _r)) & _s) != 0; \
+    if ((lm) & RF_AF) R_af = ((_a ^ _b ^ _r) & 0x10) != 0; \
+    if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    _r; \
+})
+#define flags_logicz_m(c, lm, r, sz) ({ \
+    uint32_t _m = mask_sz(sz), _s = sign_sz(sz); \
+    uint32_t _r = (uint32_t)(r) & _m; \
+    if ((lm) & RF_CF) R_cf = 0; \
+    if ((lm) & RF_OF) R_of = 0; \
+    if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
+    if ((lm) & RF_ZF) R_zf = (_r == 0); \
+    if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    _r; \
+})
+#define flags_adc_m(c, lm, a, b, sz) ({ \
+    uint32_t _m = mask_sz(sz), _s = sign_sz(sz), _cin = R_cf & 1; \
+    uint32_t _a = (uint32_t)(a) & _m, _b = (uint32_t)(b) & _m; \
+    uint64_t _full = (uint64_t)_a + _b + _cin; \
+    uint32_t _r = (uint32_t)_full & _m; \
+    if ((lm) & RF_CF) R_cf = (_full >> ((sz) * 8)) & 1; \
+    if ((lm) & RF_ZF) R_zf = (_r == 0); \
+    if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
+    if ((lm) & RF_OF) R_of = ((~(_a ^ _b) & (_a ^ _r)) & _s) != 0; \
+    if ((lm) & RF_AF) R_af = ((_a ^ _b ^ _r) & 0x10) != 0; \
+    if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    _r; \
+})
+#define flags_sbb_m(c, lm, a, b, sz) ({ \
+    uint32_t _m = mask_sz(sz), _s = sign_sz(sz), _bin = R_cf & 1; \
+    uint32_t _a = (uint32_t)(a) & _m, _b = (uint32_t)(b) & _m; \
+    uint64_t _full = (uint64_t)_a - _b - _bin; \
+    uint32_t _r = (uint32_t)_full & _m; \
+    if ((lm) & RF_CF) R_cf = (_full >> ((sz) * 8)) & 1; \
+    if ((lm) & RF_ZF) R_zf = (_r == 0); \
+    if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
+    if ((lm) & RF_OF) R_of = (((_a ^ _b) & (_a ^ _r)) & _s) != 0; \
+    if ((lm) & RF_AF) R_af = ((_a ^ _b ^ _r) & 0x10) != 0; \
+    if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    _r; \
+})
+#define op_shl_m(c, lm, v, cnt, sz) ({ \
+    uint32_t _m = mask_sz(sz), _cnt = (uint32_t)(cnt) & 31; \
+    uint32_t _v = (uint32_t)(v), _r = _v & _m; \
+    if (_cnt) { \
+        _r = (_v << _cnt) & _m; \
+        if ((lm) & RF_CF) R_cf = (uint32_t)((((uint64_t)(_v & _m)) << _cnt) >> ((sz) * 8)) & 1; \
+        if ((lm) & RF_ZF) R_zf = (_r == 0); \
+        if ((lm) & RF_SF) R_sf = (_r & sign_sz(sz)) != 0; \
+        if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    } \
+    _r; \
+})
+#define op_shr_m(c, lm, v, cnt, sz) ({ \
+    uint32_t _m = mask_sz(sz), _cnt = (uint32_t)(cnt) & 31; \
+    uint32_t _v = (uint32_t)(v) & _m, _r = _v; \
+    if (_cnt) { \
+        _r = _v >> _cnt; \
+        if ((lm) & RF_CF) R_cf = (_v >> (_cnt - 1)) & 1; \
+        if ((lm) & RF_ZF) R_zf = (_r == 0); \
+        if ((lm) & RF_SF) R_sf = (_r & sign_sz(sz)) != 0; \
+        if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    } \
+    _r; \
+})
+#define op_sar_m(c, lm, v, cnt, sz) ({ \
+    uint32_t _m = mask_sz(sz), _s = sign_sz(sz), _cnt = (uint32_t)(cnt) & 31; \
+    uint32_t _v = (uint32_t)(v) & _m, _r = _v; \
+    if (_cnt) { \
+        int32_t _sv = (_v & _s) ? (int32_t)(_v | ~_m) : (int32_t)_v; \
+        _r = (uint32_t)(_sv >> _cnt) & _m; \
+        if ((lm) & RF_CF) R_cf = (uint32_t)(_sv >> (_cnt - 1)) & 1; \
+        if ((lm) & RF_ZF) R_zf = (_r == 0); \
+        if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
+        if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
+    } \
+    _r; \
+})
+#define flags_incs(c, a, sz) flags_add_m(c, (0x8D5u & ~RF_CF), a, 1, sz)
+#define flags_decs(c, a, sz) flags_sub_m(c, (0x8D5u & ~RF_CF), a, 1, sz)
+#define flags_sub(c, a, b, sz) flags_sub_m(c, 0x8D5u, a, b, sz)
+#define flags_add(c, a, b, sz) flags_add_m(c, 0x8D5u, a, b, sz)
+#define flags_logicz(c, r, sz) flags_logicz_m(c, 0x8D5u, r, sz)
+#define flags_adc(c, a, b, sz) flags_adc_m(c, 0x8D5u, a, b, sz)
+#define flags_sbb(c, a, b, sz) flags_sbb_m(c, 0x8D5u, a, b, sz)
+#define op_shl(c, v, cnt, sz) op_shl_m(c, 0x8D5u, v, cnt, sz)
+#define op_shr(c, v, cnt, sz) op_shr_m(c, 0x8D5u, v, cnt, sz)
+#define op_sar(c, v, cnt, sz) op_sar_m(c, 0x8D5u, v, cnt, sz)
+
+#else /* !RE5_CACHED_REGS */
 static inline uint32_t flags_sub_m(CPU *c, uint32_t lm, uint32_t a, uint32_t b, int sz) {
     uint32_t m = mask_sz(sz), s = sign_sz(sz);
     a &= m; b &= m; uint32_t r = (a - b) & m;
@@ -456,6 +569,7 @@ static inline uint32_t op_sar_m(CPU *c, uint32_t lm, uint32_t v, uint32_t cnt, i
     if (lm & RF_PF) c->pf = parity8((uint8_t)r);
     return r;
 }
+#endif /* !RE5_CACHED_REGS */
 
 /* ---- rotates. Unlike the shifts these leave ZF/SF/PF alone, which is not an
    omission: x86 does not touch them here, and code that rotates then branches
@@ -743,6 +857,21 @@ static inline void fcompare(CPU *c, double a, double b) {
  * going through `fnstsw ax; test ah`. Note the mapping is not the integer
  * one: "unordered" is ZF=PF=CF=1, which is why `jp` after an fcomi is the
  * NaN test, and OF/SF/AF are cleared. */
+#if defined(RE5_CACHED_REGS)
+#define fcompare_eflags(c, a, b) do { \
+    double _a = (a), _b = (b); \
+    R_of = R_sf = R_af = 0; \
+    if      (_a > _b)  { R_zf = 0; R_pf = 0; R_cf = 0; } \
+    else if (_a < _b)  { R_zf = 0; R_pf = 0; R_cf = 1; } \
+    else if (_a == _b) { R_zf = 1; R_pf = 0; R_cf = 0; } \
+    else               { R_zf = 1; R_pf = 1; R_cf = 1; } \
+} while (0)
+#define do_sahf(c, ah) do { \
+    uint32_t _ah = (ah); \
+    R_cf = _ah & 1; R_pf = (_ah >> 2) & 1; R_af = (_ah >> 4) & 1; \
+    R_zf = (_ah >> 6) & 1; R_sf = (_ah >> 7) & 1; \
+} while (0)
+#else
 static inline void fcompare_eflags(CPU *c, double a, double b) {
     c->of = c->sf = c->af = 0;
     if      (a > b)  { c->zf = 0; c->pf = 0; c->cf = 0; }
@@ -755,6 +884,7 @@ static inline void do_sahf(CPU *c, uint8_t ah) {
     c->cf = ah & 1; c->pf = (ah >> 2) & 1; c->af = (ah >> 4) & 1;
     c->zf = (ah >> 6) & 1; c->sf = (ah >> 7) & 1;
 }
+#endif
 
 /* ---- SSE ----
  *
@@ -964,12 +1094,37 @@ static inline XMM xmm_cmp_sd(XMM d, double a, double b, int pred) {
     return (XMM)v;
 }
 
+/* One SSE intrinsic per predicate, not _mm_cmp_ps(a, b, pred): GCC 15 folds an
+ * unaligned load (rdxm, memcpy) into the memory operand of the legacy `cmpps`
+ * that _mm_cmp_ps emits, and that form faults unless the address is 16-byte
+ * aligned. `movups xmm1, [p]; cmpps xmm0, xmm1` from the game would crash where
+ * the hardware does not (difftest_cpu: cmpeqps at 0x00C2C8B6, 2026-10-24). */
 static inline XMM xmm_cmp_ps(XMM a, XMM b, int pred) {
-    return (XMM)_mm_cmp_ps((__m128)a, (__m128)b, pred);
+    __m128 x = (__m128)a, y = (__m128)b;
+    switch (pred & 7) {
+    case 0:  return (XMM)_mm_cmpeq_ps(x, y);
+    case 1:  return (XMM)_mm_cmplt_ps(x, y);
+    case 2:  return (XMM)_mm_cmple_ps(x, y);
+    case 3:  return (XMM)_mm_cmpunord_ps(x, y);
+    case 4:  return (XMM)_mm_cmpneq_ps(x, y);
+    case 5:  return (XMM)_mm_cmpnlt_ps(x, y);
+    case 6:  return (XMM)_mm_cmpnle_ps(x, y);
+    default: return (XMM)_mm_cmpord_ps(x, y);
+    }
 }
 
 static inline XMM xmm_cmp_pd(XMM a, XMM b, int pred) {
-    return (XMM)_mm_cmp_pd((__m128d)a, (__m128d)b, pred);
+    __m128d x = (__m128d)a, y = (__m128d)b;
+    switch (pred & 7) {
+    case 0:  return (XMM)_mm_cmpeq_pd(x, y);
+    case 1:  return (XMM)_mm_cmplt_pd(x, y);
+    case 2:  return (XMM)_mm_cmple_pd(x, y);
+    case 3:  return (XMM)_mm_cmpunord_pd(x, y);
+    case 4:  return (XMM)_mm_cmpneq_pd(x, y);
+    case 5:  return (XMM)_mm_cmpnlt_pd(x, y);
+    case 6:  return (XMM)_mm_cmpnle_pd(x, y);
+    default: return (XMM)_mm_cmpord_pd(x, y);
+    }
 }
 #else
 #define XMM_LOP(name, fld, n, op) \
@@ -995,11 +1150,20 @@ static inline void sse_load_sd(XMM *d, double v) { d->u64[0] = 0; d->u64[1] = 0;
  * is exactly what makes `ucomiss; jp` a NaN test and `ucomiss; jbe` mean
  * "below or equal, or unordered". Note the flags are the UNSIGNED set: the
  * compiler emits `ja`/`jbe` after a float compare, never `jg`/`jle`. */
+#if defined(RE5_CACHED_REGS)
+#define sse_compare(c, a, b) do { \
+    double _a = (a), _b = (b); \
+    R_of = 0; R_sf = 0; R_af = 0; \
+    if (_a != _a || _b != _b) { R_zf = 1; R_pf = 1; R_cf = 1; }   /* unordered */ \
+    else                      { R_zf = (_a == _b); R_pf = 0; R_cf = (_a < _b); } \
+} while (0)
+#else
 static inline void sse_compare(CPU *c, double a, double b) {
     c->of = 0; c->sf = 0; c->af = 0;
     if (a != a || b != b) { c->zf = 1; c->pf = 1; c->cf = 1; }   /* unordered */
     else                  { c->zf = (a == b); c->pf = 0; c->cf = (a < b); }
 }
+#endif
 
 /* MINSS/MAXSS are not fmin/fmax. The manual defines them as
  *     if (dst OP src) then dst else src

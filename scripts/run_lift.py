@@ -125,6 +125,44 @@ def extend_catalog(dis, iat, functions, seeds, code_start, code_end, max_rounds=
     return added
 
 
+def fix_label_starts(dis, iat, functions, code_end, max_rounds=8):
+    """Inícios falsos que são rótulos da função anterior (disasm32.label_reentries):
+    viram `alias` e a função anterior volta ao tamanho de verdade, cortada só na
+    próxima entrada `start`. Caso que motivou: o laço principal de uma thread do
+    RE5 (0x00447080) cortado em 0x0044744D; cada volta do laço aninhava uma
+    chamada no host até estourar a pilha (2026-10-24).
+
+    `functions` é a lista do catálogo, editada no lugar. Devolve [(função, rótulo)].
+    """
+    from disasm32 import label_reentries
+    by_addr = {f["address"]: f for f in functions}
+    fixed = []
+    for _ in range(max_rounds):
+        starts = sorted(a for a, f in by_addr.items() if f.get("entry_kind") != "alias")
+        found = []
+        for fa, xa in zip(starts, starts[1:]):
+            if by_addr[fa]["end"] != xa:
+                continue                 # não foi cortada nesta entrada
+            ff = dis.disassemble_function(fa, iat)
+            if not ff or not ff.blocks or ff.end <= xa:
+                continue
+            fx = dis.disassemble_function(xa, iat)
+            if fx and fx.blocks and label_reentries(ff, fx):
+                found.append((fa, xa, ff.end))
+        if not found:
+            break
+        for fa, xa, natural in found:
+            by_addr[xa]["entry_kind"] = "alias"
+            fixed.append((fa, xa))
+        starts = sorted(a for a, f in by_addr.items() if f.get("entry_kind") != "alias")
+        import bisect
+        for fa, xa, natural in found:
+            i = bisect.bisect_right(starts, fa)
+            end = min(natural, starts[i] if i < len(starts) else code_end)
+            by_addr[fa]["end"], by_addr[fa]["size"] = end, end - fa
+    return fixed
+
+
 def cmd_catalog(args, cfg):
     from pe_analyze import analyze_pe, build_iat_map
     from disasm32 import Disassembler
@@ -134,6 +172,19 @@ def cmd_catalog(args, cfg):
     info = analyze_pe(exe)
     iat = build_iat_map(info)
     out = args.out or rc.repo_path(cfg["lift"]["catalog"])
+    if args.fix_labels:
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        if doc.get("sha256") != rc.sha256_file(exe):
+            sys.exit("[!] o catálogo existente é de outro executável: rode `run_lift.py catalog` completo.")
+        with open(exe, "rb") as f:
+            dis = Disassembler(f.read(), info.image_base, info.sections)
+        fixed = fix_label_starts(dis, iat, doc["functions"], info.code_end)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        print(f"[*] {len(fixed)} inícios falsos viraram alias: "
+              f"{', '.join(f'0x{x:08X} (em 0x{f:08X})' for f, x in fixed[:20])}{' ...' if len(fixed) > 20 else ''}")
+        return
     if args.add_seeds:
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -296,6 +347,7 @@ def cmd_lift(args, cfg):
     # re5_cov: um byte por endereço de código; a função gerada marca o seu na entrada
     # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1). Custo: um store por chamada.
     header = ["/* GERADO por scripts/run_lift.py (pcrecomp lift32_cpu) - não edite. */",
+              "#define RE5_CACHED_REGS 1",
               '#include "cpu.h"',
               "extern unsigned char re5_cov[];",
               "#define RE5_COV(va) (re5_cov[(va) - 0x401000u] = 1)", ""]
@@ -453,6 +505,9 @@ def main():
             p.add_argument("--seeds", help="sementes extras (JSON ou texto), separadas por vírgula")
             p.add_argument("--add-seeds", help="só acrescenta estas sementes ao catálogo existente "
                                                "(ex.: work/runtime_seeds.txt gravado pelo re5 com RE5_SEED_LOG)")
+            p.add_argument("--fix-labels", action="store_true",
+                           help="no catálogo existente, inícios falsos que desviam de volta para o meio "
+                                "da função anterior viram alias (disasm32.label_reentries)")
         else:
             p.add_argument("--catalog")
             p.add_argument("--per-file", type=int)

@@ -435,10 +435,10 @@ def flag_liveness(items, labels, dead_at_ret=False):
 # registers written since the last sync (forward "dirty" dataflow over the same CFG
 # as the flag liveness). After such a call every register is reloaded; the compiler
 # drops the loads nobody uses.
-CACHED = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi") + tuple("x%d" % i for i in range(8))
-_REG_REF = re.compile(r"\bc->(eax|ecx|edx|ebx|esp|ebp|esi|edi)\b")
+CACHED = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi") + tuple("x%d" % i for i in range(8)) + ("cf", "pf", "af", "zf", "sf", "of")
+_REG_REF = re.compile(r"\bc->(eax|ecx|edx|ebx|esp|ebp|esi|edi|cf|pf|af|zf|sf|of)\b")
 _XMM_REF = re.compile(r"\bc->xmm\[([0-7])\]")
-_LOCAL = re.compile(r"\bR_(eax|ecx|edx|ebx|esp|ebp|esi|edi|x[0-7])\b")
+_LOCAL = re.compile(r"\bR_(eax|ecx|edx|ebx|esp|ebp|esi|edi|x[0-7]|cf|pf|af|zf|sf|of)\b")
 _ASSIGN = re.compile(r"\s*(?:\.\w+\s*\[[^\]]*\]|\.\w+|\[[^\]]*\])*\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
 # Calls that see the whole CPU: everything must be in the struct before, reloaded after.
 _FULL_SYNC = ("dispatch", "dispatch_jmp", "re5_override", "recomp_cpuid", "recomp_rdtsc", "RECOMP_TODO",
@@ -449,17 +449,25 @@ _PARTIAL_SYNC = {"rep_stos": (("eax", "ecx", "edi"), ("ecx", "edi")),
 # Everything else that takes `c` is a cpu.h helper/macro that never touches a GPR or
 # an XMM register through it (checked against cpu.h when it is parsed, see below).
 _SAFE_MACROS = {"FS_RD8", "FS_RD16", "FS_RD32", "FS_WR8", "FS_WR16", "FS_WR32", "STR_STEP", "RE5_LOOP_BARRIER",
-                "RE5_COV", "R8L", "R8H", "R16", "SET8L", "SET8H", "SET16"}
+                "RE5_COV", "R8L", "R8H", "R16", "SET8L", "SET8H", "SET16",
+                "flags_sub_m", "flags_add_m", "flags_logicz_m", "flags_adc_m", "flags_sbb_m",
+                "flags_sub", "flags_add", "flags_logicz", "flags_adc", "flags_sbb",
+                "flags_incs", "flags_decs", "op_shl_m", "op_shr_m", "op_sar_m",
+                "op_shl", "op_shr", "op_sar", "sse_compare", "do_sahf", "fcompare_eflags"}
+
+
+_FLAGS = ("cf", "pf", "af", "zf", "sf", "of")
 
 
 def _cpu_h_touch_regs():
-    """cpu.h helpers that take the CPU and read or write a GPR/XMM register through it."""
+    """cpu.h helpers that take the CPU: (all names, those that read or write a GPR/XMM
+    register through it, those that read or write a flag through it)."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "runtime", "recomp32_cpu", "cpu.h")
     try:
         text = open(path, encoding="utf-8").read()
     except OSError:
-        return None, set()
-    names, touching = set(), set()
+        return None, set(), set()
+    names, touching, flagging = set(), set(), set()
     for m in re.finditer(r"static inline [^;{(]*?\b(\w+)\s*\(([^)]*)\)\s*\{", text):
         depth, i = 1, m.end()
         while depth and i < len(text):
@@ -468,10 +476,17 @@ def _cpu_h_touch_regs():
         names.add(m.group(1))
         if "CPU" in m.group(2) and re.search(r"c->(eax|ecx|edx|ebx|esp|ebp|esi|edi|xmm)\b", text[m.end():i]):
             touching.add(m.group(1))
-    return names, touching
+        if "CPU" in m.group(2) and re.search(r"c->(cf|pf|af|zf|sf|of)\b", text[m.end():i]):
+            flagging.add(m.group(1))
+    return names, touching, flagging
 
 
-_CPU_H_NAMES, _CPU_H_TOUCH = _cpu_h_touch_regs()
+# The flags live in locals too (R_cf...). The helpers that have a macro form over the
+# locals are in _SAFE_MACROS; the rest (rol/ror/rcl/rcr, shld/shrd, bsf/bsr, bt on
+# memory, pushfd/popfd) still go through c->cf..c->of, so the flags are stored before
+# and reloaded after them. Without that, `bt [esp], eax; jae` in the CRT's strpbrk
+# (0x00E7DA28) wrote c->cf and branched on a stale R_cf.
+_CPU_H_NAMES, _CPU_H_TOUCH, _CPU_H_FLAGS = _cpu_h_touch_regs()
 
 
 def _lname(r):
@@ -509,11 +524,29 @@ def _writes(text):
             continue
         if _ASSIGN.match(text, m.end()):
             out.add(r)
+    for m in re.finditer(r"\b(?:flags_\w+|op_\w+)_m\(\s*c\s*,\s*0x([0-9A-Fa-f]+)u?", text):
+        mask = int(m.group(1), 16)
+        if mask & 0x001: out.add("cf")
+        if mask & 0x004: out.add("pf")
+        if mask & 0x010: out.add("af")
+        if mask & 0x040: out.add("zf")
+        if mask & 0x080: out.add("sf")
+        if mask & 0x800: out.add("of")
+    if any(k in text for k in ("flags_add(c,", "flags_sub(c,", "flags_adc(c,", "flags_sbb(c,", "flags_incs(", "flags_decs(")):
+        out.update(_FLAGS)
+    if "flags_logicz(c," in text:
+        out.update(("cf", "pf", "zf", "sf", "of"))
+    if any(k in text for k in ("op_shl(c,", "op_shr(c,", "op_sar(c,")):
+        out.update(("cf", "pf", "zf", "sf"))
+    if "sse_compare(" in text or "fcompare_eflags(" in text:
+        out.update(_FLAGS)
+    if "do_sahf(" in text:
+        out.update(("cf", "pf", "af", "zf", "sf"))
     return out
 
 
 def _sync_kind(text):
-    """'full', a _PARTIAL_SYNC name, or None for an instruction's (rewritten) text."""
+    """'full', a _PARTIAL_SYNC name, 'flags' or None for an instruction's (rewritten) text."""
     kind = None
     if "RECOMP_TODO(" in text or "re5_recomp_todo(" in text:
         return "full"                  # aborts: the crash report reads the struct
@@ -526,6 +559,8 @@ def _sync_kind(text):
         elif name in _SAFE_MACROS or name.endswith("_r"):
             continue
         elif _CPU_H_NAMES is not None and name in _CPU_H_NAMES and name not in _CPU_H_TOUCH:
+            if name in _CPU_H_FLAGS and kind is None:
+                kind = "flags"
             continue
         else:
             return "full"              # unknown callee that sees the CPU: be safe
@@ -598,12 +633,19 @@ def cache_registers(items, succ):
                 st = " ".join(_store(r) for r in rd if r in d)
                 ld = " ".join(_load(r) for r in wr)
                 line = _insert_around(line, (kinds[i],), st, ld)
+            elif kinds[i] == "flags" and _sync_kind(line) == "flags":
+                # The helper sits inside an expression (R_eax = op_rol(c, ...)), so the
+                # sync goes around the whole statement, not around the call.
+                st = " ".join(_store(r) for r in _FLAGS if r in d)
+                ld = " ".join(_load(r) for r in _FLAGS)
+                line = (st + " " if st else "") + line + " " + ld
             if "return;" in line:
                 line = line.replace("return;", "{ " + stores + " return; }" if stores else "return;")
             lines.append(line)
         new_items.append((ins, lines))
     decl = ("uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[:8]) + "; "
-            "XMM " + ", ".join(f"R_{r} = c->xmm[{r[1:]}]" for r in CACHED[8:]) + ";")
+            "XMM " + ", ".join(f"R_{r} = c->xmm[{r[1:]}]" for r in CACHED[8:16]) + "; "
+            "uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[16:]) + ";")
     return new_items, decl
 
 

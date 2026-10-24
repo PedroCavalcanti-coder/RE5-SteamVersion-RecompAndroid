@@ -119,6 +119,42 @@ menos um, até 8 (a MT Framework usa min(JobThread, 8, núcleos)); `JobThread=8`
 `config.ini` do usuário (backup `config.ini.bak`). `RE5_CPUS` força um número. Teste
 `kernel32` confere a máscara e a variável de ambiente.
 
+### Estouro da pilha do host com o tempo: causa raiz no catálogo (2026-10-24)
+
+Comparação do usuário: `c875e6ce` tem ~10 fps a menos que o item 1 (`030b33b1`) e fecha
+bem mais tarde; o item 1 + item 2 fecha mais cedo. O fechamento existe em todos; o código
+mais rápido só gira o laço culpado mais vezes por segundo. O item 2 (flags em locais) e o
+diagnóstico do `crash.c` voltaram (de `work/patches/item2_flags_e_diag_crash.patch`).
+
+- Bug do item 2, corrigido no patch: helpers do `cpu.h` sem versão em macro
+  (`rol/ror/rcl/rcr`, `shld/shrd`, `bsf/bsr`, `bt*` na memória, `pushfd/popfd`) usavam
+  `c->cf..c->of` sem sincronizar; o `bt [esp], eax; jae` do `strpbrk` do CRT
+  (`0x00E7DA28`) desviava pelo CF velho.
+- O fechamento: Event Viewer `0xC0000005` em `ntdll!__chkstk` = estouro da pilha do host
+  (64 MiB nas threads do jogo). O filtro do `crash.c` rodava na pilha estourada e o processo
+  sumia sem log. Com `SetThreadStackGuarantee` + desenrolar a pilha do host (no patch), o
+  log mostrou um ciclo `L_004470A0 -> L_0044711C -> L_0044744D -> L_004470A0` (thread
+  0x1008), com a trilha EnterCriticalSection/Sleep/LeaveCriticalSection repetida.
+  `0x0044711C` e `0x0044744D` são pedaços da MESMA função real (`jmp 0x44711c` em
+  0x00447113, `jmp 0x44744d` em 0x00447141, `je 0x4470a0` em 0x00447454): o catálogo os
+  tem como inícios de função, e cada `jmp` entre pedaços vira uma chamada C aninhada. Um
+  laço de espera que atravessa os pedaços cresce a pilha do host a cada volta, até estourar.
+  Quadros do host não cresceram (média 155 -> 129 bytes em `re5_0024.c`).
+- Correção: `disasm32.label_reentries` (o início falso desvia de volta para o meio da função
+  cuja decodificação passa por ele) e `run_lift.py catalog --fix-labels`, que aplica a regra
+  ao catálogo existente e estende a função cortada até a próxima entrada `start`. No RE5:
+  **120** inícios falsos viraram alias, 109 funções estendidas (`0x00447080` agora vai até
+  0x0044748B; os `jmp`/`je` do laço viraram `goto`). Amostras conferidas no disassembly:
+  caudas de laço (`sub [esp+0x10],1; jne` em 0x00409999, incremento de `for` em 0x00439140).
+  Catálogo anterior em `work/catalog.before_fixlabels.json`. Teste em
+  `test_catalog_seeds.py` (laço cortado vira alias; tail call de verdade fica função).
+  Relift sem falhas; RECOMP_TODO 1.482 -> 1.497 (corpos estendidos).
+- Achado no caminho (item 1): `xmm_cmp_ps/pd` usavam `_mm_cmp_ps`, e o GCC 15 junta uma
+  leitura desalinhada (`rdxm`) no operando de memória do `cmpps` legado, que exige
+  alinhamento de 16: `difftest_cpu` derrubava o processo em `cmpeqps` a 0x00C2C8B6.
+  Agora um intrínseco SSE por predicado (`_mm_cmpeq_ps`...), que mantém o `movups`.
+  Falta: conferir no jogo se o fechamento sumiu.
+
 ### Otimização do código gerado: -O2 (2026-10-22)
 
 `scripts/bench_re5.py` roda o benchmark variável sozinho (`RE5_INPUT_SYNC=titlelogo`

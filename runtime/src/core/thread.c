@@ -684,9 +684,19 @@ void re5_profile_start(void)
 typedef struct { void (*fn)(void *); void *arg; } trampoline;
 
 #if defined(RE5_HOST_WINDOWS)
+/* Num estouro da pilha do host o filtro do crash.c roda na própria pilha estourada:
+ * sem reserva ele falha no __chkstk e o processo some sem log (visto no RE5,
+ * 2026-10-24: 0xC0000005 em ntdll!__chkstk). */
+static void stack_guarantee(void)
+{
+    ULONG g = 256u << 10;
+    SetThreadStackGuarantee(&g);
+}
+
 static DWORD WINAPI host_entry(LPVOID p)
 {
     trampoline *tr = p;
+    stack_guarantee();
     tr->fn(tr->arg);
     return 0;
 }
@@ -705,6 +715,7 @@ static DWORD WINAPI host_entry_detached(LPVOID p)
 {
     trampoline tr = *(trampoline *)p;
     free(p);
+    stack_guarantee();
     tr.fn(tr.arg);
     return 0;
 }

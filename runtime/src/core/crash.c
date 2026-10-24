@@ -43,6 +43,52 @@ static void report(const char *what, uintptr_t host_addr, int has_addr)
 #if defined(RE5_HOST_WINDOWS)
 #include <windows.h>
 
+/* Função gerada que contém o endereço do host `pc`: a de maior endereço <= pc. A
+ * tabela do dispatch é ordenada por VA do guest, não por endereço do host. */
+static uint32_t guest_fn_at(uintptr_t pc)
+{
+    uintptr_t best = 0;
+    uint32_t va = 0;
+    for (uint32_t i = 0; i < re5_lifted_count; i++) {
+        uintptr_t f = (uintptr_t)re5_lifted_table[i].fn;
+        if (f <= pc && f > best) best = f, va = re5_lifted_table[i].va;
+    }
+    return pc - best < 0x100000u ? va : 0;
+}
+
+/* Estouro da pilha do host: o código gerado aninha uma chamada C por call (e por
+ * jmp para outra função) do guest, então a pilha do host mostra o ciclo. Desenrola
+ * a partir do contexto da falha e traduz cada quadro para a função do guest. */
+static void report_host_stack(const CONTEXT *fault)
+{
+    CONTEXT ctx = *fault;
+    RE5_ERROR("crash", "pilha do host (topo primeiro, função do guest de cada quadro):");
+    uint32_t last = 0, reps = 0;
+    for (int n = 0; n < 96 && ctx.Rip; n++) {
+        uint32_t va = guest_fn_at((uintptr_t)ctx.Rip);
+        if (va && va == last) {
+            reps++;
+        } else {
+            if (reps) RE5_ERROR("crash", "    (mais %u vezes)", reps);
+            reps = 0;
+            last = va;
+            if (va) RE5_ERROR("crash", "  #%02d L_%08X", n, va);
+            else    RE5_ERROR("crash", "  #%02d host %p", n, (void *)(uintptr_t)ctx.Rip);
+        }
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+        if (f) {
+            PVOID hd = NULL;
+            DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &hd, &est, NULL);
+        } else {                       /* folha sem unwind info: o topo é o retorno */
+            ctx.Rip = *(DWORD64 *)(uintptr_t)ctx.Rsp;
+            ctx.Rsp += 8;
+        }
+    }
+    if (reps) RE5_ERROR("crash", "    (mais %u vezes)", reps);
+}
+
 static LONG WINAPI on_unhandled(EXCEPTION_POINTERS *ep)
 {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
@@ -70,6 +116,7 @@ static LONG WINAPI on_unhandled(EXCEPTION_POINTERS *ep)
     }
     report(what, addr, has_addr);
     RE5_ERROR("crash", "código do host em %p", er->ExceptionAddress);
+    if (er->ExceptionCode == EXCEPTION_STACK_OVERFLOW) report_host_stack(ep->ContextRecord);
     fflush(NULL);
     return EXCEPTION_EXECUTE_HANDLER;
 }

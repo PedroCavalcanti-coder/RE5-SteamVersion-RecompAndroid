@@ -151,6 +151,17 @@ class LifterGaps(unittest.TestCase):
         lifter.flags_dead_ret_below = 0x00000800
         c2 = lifter.lift_function(bytes.fromhex("39c8" "c3"), 0x1000)
         self.assertIn("flags_sub(c, ", c2)
+        # Flags em locais (R_cf...): helper do cpu.h que escreve c->cf (bt na memória,
+        # strpbrk do CRT 0x00E7DA28) recebe as flags antes e devolve depois.
+        # test eax, eax ; bt [esp], eax ; jae +1 ; nop ; ret
+        c3 = lifter.lift_function(bytes.fromhex("85c0" "0fa30424" "7301" "90" "c3"), 0x1000)
+        bt = [l for l in c3.splitlines() if "bit_string_op" in l][0]
+        self.assertLess(bt.index("c->cf = R_cf;"), bt.index("bit_string_op("))
+        self.assertGreater(bt.index("R_cf = c->cf;"), bt.index("bit_string_op("))
+        # shl sem máscara (flags vivas no ret do CRT) suja as flags: o ret as grava.
+        c4 = lifter.lift_function(bytes.fromhex("d3e0" "c3"), 0x1000)
+        self.assertIn("op_shl(c, ", c4)
+        self.assertIn("c->zf = R_zf;", [l for l in c4.splitlines() if "return" in l][0])
 
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
