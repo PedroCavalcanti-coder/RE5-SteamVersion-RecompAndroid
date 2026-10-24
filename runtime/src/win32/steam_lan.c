@@ -158,6 +158,10 @@ static lan_p2p_msg *g_p2p_queue;
 static re5_lan_event g_events[MAX_EVENTS];
 static int           g_evt_head, g_evt_tail, g_evt_count;
 
+static uint64_t g_pending_search_call;
+static uint32_t g_pending_search_expire;
+static uint64_t g_join_call_id;
+
 static uint32_t get_ticks_ms(void)
 {
 #if defined(_WIN32)
@@ -204,6 +208,20 @@ static int sock_set_broadcast(hsock_t s)
 {
     int on = 1;
     return setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof on);
+}
+
+static void sock_fix_connreset(hsock_t s)
+{
+#if defined(_WIN32)
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+    BOOL bNewBehavior = FALSE;
+    DWORD dwBytesReturned = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+#else
+    (void)s;
+#endif
 }
 
 static void push_event(re5_lan_event_type type, uint64_t call_id, uint64_t lobby_id, uint64_t user_id, uint32_t p1, uint32_t p2)
@@ -270,17 +288,28 @@ static void send_broadcast(const void *data, size_t len)
     bcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
     send_raw_udp(g_disc_sock, &bcast, data, len);
 
-    /* Envia também explicitamente em 127.0.0.1 para que testes e instâncias locais recebam */
+    /* Envia também explicitamente em 127.0.0.1:27015 para recepção loopback */
     bcast.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     send_raw_udp(g_disc_sock, &bcast, data, len);
+
+    /* Envia também para as portas P2P locais em loopback (instâncias no mesmo PC) */
+    uint16_t base_p2p = RE5_LAN_DEFAULT_P2P_PORT;
+    const char *env_p2p = getenv("RE5_LAN_PORT");
+    if (env_p2p && atoi(env_p2p) > 0) base_p2p = (uint16_t)atoi(env_p2p);
+
+    for (uint16_t p = base_p2p; p < base_p2p + 10; p++) {
+        if (p == g_p2p_port) continue;
+        bcast.sin_port = htons(p);
+        send_raw_udp(g_p2p_sock, &bcast, data, len);
+    }
 }
 
-static void broadcast_beacon(void)
+static size_t build_beacon_packet(uint8_t *buf, size_t max_len)
 {
-    if (!g_has_active_lobby || !g_active_lobby.is_local) return;
-    if (g_active_lobby.owner_id != g_local_steam_id) return;
+    if (!g_has_active_lobby || !g_active_lobby.is_local) return 0;
+    if (g_active_lobby.owner_id != g_local_steam_id) return 0;
+    if (max_len < sizeof(lan_hdr) + sizeof(lan_beacon_body)) return 0;
 
-    uint8_t buf[RE5_LAN_MAX_PACKET_SIZE];
     lan_hdr *h = (lan_hdr *)buf;
     h->magic = RE5_LAN_MAGIC;
     h->type = PKT_BEACON;
@@ -297,11 +326,18 @@ static void broadcast_beacon(void)
     b->data_count = (uint16_t)g_active_lobby.data_count;
 
     size_t off = sizeof(lan_hdr) + sizeof(lan_beacon_body);
-    for (int i = 0; i < g_active_lobby.data_count && off + sizeof(lan_kv) <= sizeof buf; i++) {
+    for (int i = 0; i < g_active_lobby.data_count && off + sizeof(lan_kv) <= max_len; i++) {
         memcpy(buf + off, &g_active_lobby.data[i], sizeof(lan_kv));
         off += sizeof(lan_kv);
     }
-    send_broadcast(buf, off);
+    return off;
+}
+
+static void broadcast_beacon(void)
+{
+    uint8_t buf[RE5_LAN_MAX_PACKET_SIZE];
+    size_t len = build_beacon_packet(buf, sizeof buf);
+    if (len > 0) send_broadcast(buf, len);
 }
 
 static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, const struct sockaddr_in *from)
@@ -349,14 +385,24 @@ static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, 
         }
         off += sizeof(lan_kv);
     }
+    RE5_INFO("steam_lan", "Lobby detectado na LAN: ID %llu, Dono '%s' (membros %u/%u)",
+             (unsigned long long)b->lobby_id, b->owner_name, b->member_count, b->max_members);
 }
 
 static void handle_ping(const lan_hdr *h, const struct sockaddr_in *from)
 {
-    (void)h;
-    (void)from;
     if (g_has_active_lobby && g_active_lobby.owner_id == g_local_steam_id) {
         broadcast_beacon();
+        uint8_t buf[RE5_LAN_MAX_PACKET_SIZE];
+        size_t len = build_beacon_packet(buf, sizeof buf);
+        if (len > 0) {
+            send_raw_udp(g_p2p_sock, from, buf, len);
+            if (h->port) {
+                struct sockaddr_in to_p2p = *from;
+                to_p2p.sin_port = htons(h->port);
+                send_raw_udp(g_p2p_sock, &to_p2p, buf, len);
+            }
+        }
     }
 }
 
@@ -413,11 +459,11 @@ static void handle_join_resp(const lan_hdr *h, const uint8_t *payload, size_t le
         g_active_lobby.members[1] = g_local_steam_id;
         snprintf(g_active_lobby.member_names[1], sizeof g_active_lobby.member_names[1], "%s", g_local_name);
 
-        push_event(RE5_LAN_EVT_LOBBY_ENTERED, 0, g_active_lobby.lobby_id, g_local_steam_id, 1 /* Success */, 0);
+        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join_call_id, g_active_lobby.lobby_id, g_local_steam_id, 1 /* Success */, 0);
         push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, g_active_lobby.lobby_id, g_local_steam_id, 0x01 /* Entered */, 0);
         RE5_INFO("steam_lan", "Conectado ao lobby %llu com sucesso", (unsigned long long)resp->lobby_id);
     } else {
-        push_event(RE5_LAN_EVT_LOBBY_ENTERED, 0, g_active_lobby.lobby_id, g_local_steam_id, resp->response_code, 0);
+        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join_call_id, g_active_lobby.lobby_id, g_local_steam_id, resp->response_code, 0);
         g_has_active_lobby = 0;
         RE5_INFO("steam_lan", "Falha ao entrar no lobby: codigo %u", resp->response_code);
     }
@@ -561,6 +607,27 @@ static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_i
     }
 }
 
+static void check_pending_search(void)
+{
+    if (g_pending_search_call == 0) return;
+    uint32_t now = get_ticks_ms();
+    if (now < g_pending_search_expire) return;
+
+    /* Remove lobbies inativos (sem beacon ha mais de 5 segundos) */
+    int active = 0;
+    for (int i = 0; i < g_num_lobbies; i++) {
+        if (now - g_lobbies[i].last_seen_ms < 5000) {
+            if (active != i) g_lobbies[active] = g_lobbies[i];
+            active++;
+        }
+    }
+    g_num_lobbies = active;
+
+    push_event(RE5_LAN_EVT_LOBBY_MATCH_LIST, g_pending_search_call, 0, 0, (uint32_t)g_num_lobbies, 0);
+    RE5_INFO("steam_lan", "Busca de salas concluida: %d sala(s) encontrada(s)", g_num_lobbies);
+    g_pending_search_call = 0;
+}
+
 static void poll_sockets_once(void)
 {
     uint8_t buf[RE5_LAN_MAX_PACKET_SIZE];
@@ -570,11 +637,17 @@ static void poll_sockets_once(void)
     for (;;) {
 #if defined(_WIN32)
         int fromlen = sizeof from;
+        int n = recvfrom(g_disc_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
+        if (n <= 0) {
+            int err = WSAGetLastError();
+            if (err == WSAECONNRESET) continue;
+            break;
+        }
 #else
         socklen_t fromlen = sizeof from;
-#endif
         int n = recvfrom(g_disc_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
         if (n <= 0) break;
+#endif
         re5_mutex_lock(&g_mu);
         parse_packet(buf, (size_t)n, &from);
         re5_mutex_unlock(&g_mu);
@@ -584,11 +657,17 @@ static void poll_sockets_once(void)
     for (;;) {
 #if defined(_WIN32)
         int fromlen = sizeof from;
+        int n = recvfrom(g_p2p_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
+        if (n <= 0) {
+            int err = WSAGetLastError();
+            if (err == WSAECONNRESET) continue;
+            break;
+        }
 #else
         socklen_t fromlen = sizeof from;
-#endif
         int n = recvfrom(g_p2p_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
         if (n <= 0) break;
+#endif
         re5_mutex_lock(&g_mu);
         parse_packet(buf, (size_t)n, &from);
         re5_mutex_unlock(&g_mu);
@@ -602,13 +681,15 @@ static void lan_worker(void *arg)
     while (g_running) {
         poll_sockets_once();
 
+        re5_mutex_lock(&g_mu);
+        check_pending_search();
+
         uint32_t now = get_ticks_ms();
         if (now - last_beacon_ms >= 1000) {
-            re5_mutex_lock(&g_mu);
             broadcast_beacon();
-            re5_mutex_unlock(&g_mu);
             last_beacon_ms = now;
         }
+        re5_mutex_unlock(&g_mu);
 
         re5_host_sleep_ms(5);
     }
@@ -644,6 +725,7 @@ int steam_lan_init(void)
     sock_set_reuse(g_disc_sock);
     sock_set_broadcast(g_disc_sock);
     sock_set_nonblocking(g_disc_sock);
+    sock_fix_connreset(g_disc_sock);
 
     struct sockaddr_in disc_addr;
     memset(&disc_addr, 0, sizeof disc_addr);
@@ -660,8 +742,10 @@ int steam_lan_init(void)
         re5_fatal("steam_lan", "Falha ao criar socket P2P");
         return -1;
     }
-    sock_set_reuse(g_p2p_sock);
+    /* NAO usar sock_set_reuse em g_p2p_sock para que o bind falhe se a porta ja estiver
+     * ocupada por outra instancia no mesmo computador, permitindo auto-alocar 27017, 27018... */
     sock_set_nonblocking(g_p2p_sock);
+    sock_fix_connreset(g_p2p_sock);
 
     uint16_t bound_port = 0;
     for (uint16_t p = base_p2p; p < base_p2p + 100; p++) {
@@ -746,6 +830,9 @@ void steam_lan_shutdown(void)
 void steam_lan_poll(void)
 {
     poll_sockets_once();
+    re5_mutex_lock(&g_mu);
+    check_pending_search();
+    re5_mutex_unlock(&g_mu);
 }
 
 uint64_t steam_lan_get_local_steam_id(void)
@@ -817,21 +904,11 @@ uint64_t steam_lan_request_lobby_list(uint64_t call_id)
     ping.sender_steam_id = g_local_steam_id;
     send_broadcast(&ping, sizeof ping);
 
-    /* Remove lobbies inativos (sem beacon ha mais de 5 segundos) */
-    uint32_t now = get_ticks_ms();
-    int active = 0;
-    for (int i = 0; i < g_num_lobbies; i++) {
-        if (now - g_lobbies[i].last_seen_ms < 5000) {
-            if (active != i) g_lobbies[active] = g_lobbies[i];
-            active++;
-        }
-    }
-    g_num_lobbies = active;
+    g_pending_search_call = call_id;
+    g_pending_search_expire = get_ticks_ms() + 200; /* Janela de 200ms para resposta de pings */
 
-    push_event(RE5_LAN_EVT_LOBBY_MATCH_LIST, call_id, 0, 0, (uint32_t)g_num_lobbies, 0);
     re5_mutex_unlock(&g_mu);
-
-    return (uint64_t)g_num_lobbies;
+    return 1;
 }
 
 int steam_lan_get_lobby_count(void)
@@ -1071,6 +1148,7 @@ void steam_lan_set_lobby_member_data(uint64_t lobby_id, const char *key, const c
 int steam_lan_join_lobby(uint64_t lobby_id, uint64_t call_id)
 {
     re5_mutex_lock(&g_mu);
+    g_join_call_id = call_id;
     lan_lobby *lb = NULL;
     for (int i = 0; i < g_num_lobbies; i++) {
         if (g_lobbies[i].lobby_id == lobby_id) {
