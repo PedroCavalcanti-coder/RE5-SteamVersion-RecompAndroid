@@ -60,8 +60,9 @@ static uint32_t vcall(uint32_t obj, uint32_t slot, int n, const uint32_t *args)
     return re5_guest_call(T, rd32(rd32(obj) + 4 * slot), n, args);
 }
 
-static uint32_t g_created_calls, g_enter_calls, g_chat_calls, g_data_calls;
+static uint32_t g_created_calls, g_enter_calls, g_chat_calls, g_data_calls, g_p2p_req_calls;
 static uint64_t g_last_lobby_created;
+static uint64_t g_last_p2p_req_user;
 
 static void cb_created_run(CPU *c)
 {
@@ -86,6 +87,13 @@ static void cb_chat_run(CPU *c)
 static void cb_data_run(CPU *c)
 {
     g_data_calls++;
+}
+
+static void cb_p2p_req_run(CPU *c)
+{
+    g_p2p_req_calls++;
+    uint32_t p = re5_arg(c, 0);
+    g_last_p2p_req_user = (uint64_t)rd32(p + 4) << 32 | rd32(p);
 }
 
 static void cb_dummy(CPU *c) { (void)c; }
@@ -292,6 +300,14 @@ int main(int argc, char **argv)
     const uint32_t reg_data[2] = {cb_data, 505};
     flat("SteamAPI_RegisterCallback", 2, reg_data);
 
+    uint32_t vt_p2p = gbuf(12), cb_p2p = gbuf(16);
+    wr32(vt_p2p, re5_thunk_new("teste!P2PReqResult", cb_dummy, 16, NULL));
+    wr32(vt_p2p + 4, re5_thunk_new("teste!P2PReqRun", cb_p2p_req_run, 4, NULL));
+    wr32(vt_p2p + 8, re5_thunk_new("teste!P2PReqSize", cb_dummy, 0, NULL));
+    wr32(cb_p2p, vt_p2p);
+    const uint32_t reg_p2p[2] = {cb_p2p, 1202};
+    flat("SteamAPI_RegisterCallback", 2, reg_p2p);
+
     /* 3. Criação de Lobby via ISteamMatchmaking009 (slot 13) */
     uint32_t match = flat("SteamMatchmaking", 0, NULL);
     CHECK(match != 0);
@@ -303,7 +319,7 @@ int main(int argc, char **argv)
     /* Despacha os callbacks pendentes */
     flat("SteamAPI_RunCallbacks", 0, NULL);
     CHECK_EQ_U32(g_created_calls, 1);
-    CHECK_EQ_U32(g_enter_calls, 1);
+    CHECK_EQ_U32(g_enter_calls, 0); /* Host não recebe LobbyEnter_t na criação */
     CHECK(g_last_lobby_created != 0);
     uint64_t lobby_id = g_last_lobby_created;
 
@@ -376,6 +392,10 @@ int main(int argc, char **argv)
         CHECK_EQ_U32(vcall(net, 2, 5, read_args) & 0xFF, 1);
         CHECK_EQ_U32(rd32(read_sz), payload_len);
         CHECK(strcmp(re5_gstr(dest_buf), test_payload) == 0);
+
+        flat("SteamAPI_RunCallbacks", 0, NULL);
+        CHECK_EQ_U32(g_p2p_req_calls, 1);
+        CHECK(g_last_p2p_req_user == my_id);
     }
 
     /* 8. Saída do Lobby */
@@ -387,6 +407,7 @@ int main(int argc, char **argv)
     flat("SteamAPI_UnregisterCallback", 1, &cb_enter);
     flat("SteamAPI_UnregisterCallback", 1, &cb_chat);
     flat("SteamAPI_UnregisterCallback", 1, &cb_data);
+    flat("SteamAPI_UnregisterCallback", 1, &cb_p2p);
 
     flat("SteamAPI_Shutdown", 0, NULL);
     re5_thread_detach();

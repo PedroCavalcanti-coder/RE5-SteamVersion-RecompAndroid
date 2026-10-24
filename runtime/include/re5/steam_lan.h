@@ -34,6 +34,7 @@ typedef enum {
     RE5_LAN_EVT_LOBBY_MATCH_LIST,
     RE5_LAN_EVT_LOBBY_CHAT_UPDATE,
     RE5_LAN_EVT_LOBBY_DATA_UPDATE,
+    RE5_LAN_EVT_P2P_SESSION_REQUEST,
 } re5_lan_event_type;
 
 typedef struct {

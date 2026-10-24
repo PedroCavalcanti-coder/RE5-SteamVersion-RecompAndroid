@@ -214,6 +214,11 @@ static void s_RunCallbacks(CPU *c)
             post_callback(505, d, sizeof d, 0);
             break;
         }
+        case RE5_LAN_EVT_P2P_SESSION_REQUEST: {
+            uint32_t d[2] = {(uint32_t)evt.user_id, (uint32_t)(evt.user_id >> 32)};
+            post_callback(1202, d, sizeof d, 0);
+            break;
+        }
         default:
             break;
         }

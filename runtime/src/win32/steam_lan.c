@@ -101,6 +101,7 @@ typedef struct {
     char               name[32];
     struct sockaddr_in addr;
     uint32_t           last_seen_ms;
+    int                p2p_session_requested;
 } lan_peer;
 
 typedef struct {
@@ -126,7 +127,7 @@ typedef struct lan_p2p_msg {
     uint64_t            remote_id;
     uint16_t            channel;
     uint32_t            len;
-    uint8_t             data[1200];
+    uint8_t             data[RE5_LAN_MAX_PACKET_SIZE];
     struct lan_p2p_msg *next;
 } lan_p2p_msg;
 
@@ -293,14 +294,19 @@ static void send_broadcast(const void *data, size_t len)
     send_raw_udp(g_disc_sock, &bcast, data, len);
 
     /* Envia também para as portas P2P locais em loopback (instâncias no mesmo PC) */
-    uint16_t base_p2p = RE5_LAN_DEFAULT_P2P_PORT;
-    const char *env_p2p = getenv("RE5_LAN_PORT");
-    if (env_p2p && atoi(env_p2p) > 0) base_p2p = (uint16_t)atoi(env_p2p);
-
-    for (uint16_t p = base_p2p; p < base_p2p + 10; p++) {
+    for (uint16_t p = RE5_LAN_DEFAULT_P2P_PORT; p < RE5_LAN_DEFAULT_P2P_PORT + 16; p++) {
         if (p == g_p2p_port) continue;
         bcast.sin_port = htons(p);
         send_raw_udp(g_p2p_sock, &bcast, data, len);
+    }
+    const char *env_p2p = getenv("RE5_LAN_PORT");
+    if (env_p2p && atoi(env_p2p) > 0) {
+        uint16_t custom_p2p = (uint16_t)atoi(env_p2p);
+        for (uint16_t p = custom_p2p; p < custom_p2p + 16; p++) {
+            if (p == g_p2p_port) continue;
+            bcast.sin_port = htons(p);
+            send_raw_udp(g_p2p_sock, &bcast, data, len);
+        }
     }
 }
 
@@ -427,6 +433,9 @@ static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len
         snprintf(g_active_lobby.member_names[idx], sizeof g_active_lobby.member_names[idx], "%s", req->client_name);
 
         push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, g_active_lobby.lobby_id, h->sender_steam_id, 0x01 /* Entered */, 0);
+        push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
+        lan_peer *p = peer_find(h->sender_steam_id);
+        if (p) p->p2p_session_requested = 1;
         RE5_INFO("steam_lan", "Jogador '%s' (%llu) entrou no lobby", req->client_name, (unsigned long long)h->sender_steam_id);
     }
 
@@ -461,6 +470,9 @@ static void handle_join_resp(const lan_hdr *h, const uint8_t *payload, size_t le
 
         push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join_call_id, g_active_lobby.lobby_id, g_local_steam_id, 1 /* Success */, 0);
         push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, g_active_lobby.lobby_id, g_local_steam_id, 0x01 /* Entered */, 0);
+        push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
+        lan_peer *p = peer_find(h->sender_steam_id);
+        if (p) p->p2p_session_requested = 1;
         RE5_INFO("steam_lan", "Conectado ao lobby %llu com sucesso", (unsigned long long)resp->lobby_id);
     } else {
         push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join_call_id, g_active_lobby.lobby_id, g_local_steam_id, resp->response_code, 0);
@@ -551,11 +563,17 @@ static void handle_data_update(const lan_hdr *h, const uint8_t *payload, size_t 
 static void handle_p2p_data(const lan_hdr *h, const uint8_t *payload, size_t len, const struct sockaddr_in *from)
 {
     peer_update(h->sender_steam_id, NULL, from);
+    lan_peer *p = peer_find(h->sender_steam_id);
+    if (p && !p->p2p_session_requested) {
+        p->p2p_session_requested = 1;
+        push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
+    }
+
     if (len < sizeof(lan_p2p_hdr)) return;
 
     const lan_p2p_hdr *ph = (const lan_p2p_hdr *)payload;
     if (len < sizeof(lan_p2p_hdr) + ph->payload_len) return;
-    if (ph->payload_len > 1200) return;
+    if (ph->payload_len > RE5_LAN_MAX_PACKET_SIZE) return;
 
     lan_p2p_msg *msg = malloc(sizeof(lan_p2p_msg));
     if (!msg) return;
@@ -565,8 +583,19 @@ static void handle_p2p_data(const lan_hdr *h, const uint8_t *payload, size_t len
     memcpy(msg->data, payload + sizeof(lan_p2p_hdr), ph->payload_len);
     msg->next = NULL;
 
+    int qcount = 0;
     lan_p2p_msg **q = &g_p2p_queue;
-    while (*q) q = &(*q)->next;
+    while (*q) {
+        qcount++;
+        q = &(*q)->next;
+    }
+    if (qcount >= 256) {
+        lan_p2p_msg *old = g_p2p_queue;
+        g_p2p_queue = old->next;
+        free(old);
+        q = &g_p2p_queue;
+        while (*q) q = &(*q)->next;
+    }
     *q = msg;
 }
 
@@ -768,15 +797,19 @@ int steam_lan_init(void)
     /* Identidade SteamID */
     uint32_t account_id = 1;
     const char *env_id = getenv("RE5_STEAM_ID");
+    if (!env_id || !*env_id) env_id = getenv("RE5_LAN_STEAM_ID");
     if (env_id && atoi(env_id) > 0) {
         account_id = (uint32_t)atoi(env_id);
+    } else if (g_p2p_port >= RE5_LAN_DEFAULT_P2P_PORT) {
+        account_id = 1 + (g_p2p_port - RE5_LAN_DEFAULT_P2P_PORT);
     } else {
-        account_id = 1 + (g_p2p_port - base_p2p);
+        account_id = (uint32_t)g_p2p_port;
     }
     g_local_steam_id = ((uint64_t)0x01100001u << 32) | account_id;
 
     /* Nome do jogador */
     const char *env_name = getenv("RE5_PLAYER_NAME");
+    if (!env_name || !*env_name) env_name = getenv("RE5_LAN_NAME");
     if (env_name && *env_name) {
         snprintf(g_local_name, sizeof g_local_name, "%s", env_name);
     } else if (account_id == 1) {
@@ -882,7 +915,6 @@ uint64_t steam_lan_create_lobby(uint32_t lobby_type, int max_members, uint64_t c
     g_has_active_lobby = 1;
 
     push_event(RE5_LAN_EVT_LOBBY_CREATED, call_id, lobby_id, g_local_steam_id, 1 /* k_EResultOK */, 0);
-    push_event(RE5_LAN_EVT_LOBBY_ENTERED, 0, lobby_id, g_local_steam_id, 1 /* Success */, 0);
 
     broadcast_beacon();
     re5_mutex_unlock(&g_mu);
@@ -1234,7 +1266,7 @@ void steam_lan_set_lobby_joinable(uint64_t lobby_id, int joinable)
 
 int steam_lan_send_p2p(uint64_t remote_id, const void *data, uint32_t len, int send_type, int channel)
 {
-    if (!data || len > 1200) return 0;
+    if (!data || len > (RE5_LAN_MAX_PACKET_SIZE - sizeof(lan_hdr) - sizeof(lan_p2p_hdr))) return 0;
 
     re5_mutex_lock(&g_mu);
     lan_peer *p = peer_find(remote_id);
