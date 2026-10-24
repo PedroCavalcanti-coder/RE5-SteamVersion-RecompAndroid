@@ -138,6 +138,9 @@ static RE5_NORETURN void iid_fatal(uint32_t va, const char *who)
 typedef struct frame_node {
     AVFrame *f;
     int out;
+    uint64_t t100;
+    uint64_t d100;
+    uint32_t flags;
     struct frame_node *next;
 } frame_node;
 
@@ -149,6 +152,9 @@ typedef struct {
     int discontinuity;
     uint64_t next_t;        /* menor tempo da próxima amostra (100 ns) */
     uint64_t pred_t;        /* tempo de quem não traz tempo: o fim da anterior */
+    frame_node *head, *tail;
+    int eof;
+    int queue_count;
 } wm_out;
 
 typedef struct {
@@ -161,7 +167,6 @@ typedef struct {
     wm_out out[MAX_OUT];
     int nout, eof, discrete;
     uint32_t speaker;
-    frame_node *head, *tail;
     uint32_t free_va[8], free_size[8];   /* memória de amostras para reaproveitar */
 } wm_reader;
 
@@ -222,23 +227,45 @@ static int64_t io_seek(void *opaque, int64_t off, int whence)
 
 static void queue_clear(wm_reader *r)
 {
-    while (r->head) {
-        frame_node *n = r->head;
-        r->head = n->next;
-        av_frame_free(&n->f);
-        free(n);
+    for (int i = 0; i < r->nout; i++) {
+        wm_out *w = &r->out[i];
+        while (w->head) {
+            frame_node *n = w->head;
+            w->head = n->next;
+            av_frame_free(&n->f);
+            free(n);
+        }
+        w->tail = NULL;
+        w->queue_count = 0;
+        w->eof = 0;
     }
-    r->tail = NULL;
 }
 
-static void queue_push(wm_reader *r, AVFrame *f, int out)
+static void queue_push(wm_reader *r, AVFrame *f, int o)
 {
+    wm_out *w = &r->out[o];
+    AVStream *s = r->fmt->streams[w->st];
+    int64_t pts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
+    uint64_t t100 = pts == AV_NOPTS_VALUE ? w->pred_t
+                                          : (uint64_t)av_rescale_q(pts, s->time_base, (AVRational){1, 10000000});
+    if (t100 < w->next_t && !w->discontinuity) t100 = w->next_t;
+    uint64_t d100 = w->video ? (f->duration > 0 ? (uint64_t)av_rescale_q(f->duration, s->time_base,
+                                                                            (AVRational){1, 10000000})
+                                                    : 333667u)
+                             : (uint64_t)f->nb_samples * 10000000u / (uint64_t)w->dec->sample_rate;
+    uint32_t flags = (w->video ? ((f->flags & AV_FRAME_FLAG_KEY) ? WM_SF_CLEANPOINT : 0) : WM_SF_CLEANPOINT) |
+                     (w->discontinuity ? WM_SF_DISCONTINUITY : 0);
+    w->discontinuity = 0;
+    w->next_t = t100 + (w->video ? 1 : d100);
+    w->pred_t = t100 + d100;
+
     frame_node *n = malloc(sizeof *n);
     if (!n) re5_fatal("wmvcore", "sem memória");
-    *n = (frame_node){f, out, NULL};
-    if (r->tail) r->tail->next = n;
-    else r->head = n;
-    r->tail = n;
+    *n = (frame_node){f, o, t100, d100, flags, NULL};
+    if (w->tail) w->tail->next = n;
+    else w->head = n;
+    w->tail = n;
+    w->queue_count++;
 }
 
 static void reader_close(wm_reader *r)
@@ -453,6 +480,8 @@ static void r_SetRange(CPU *c)
         avcodec_flush_buffers(r->out[i].dec);
         r->out[i].discontinuity = 1;
         r->out[i].next_t = r->out[i].pred_t = start;
+        r->out[i].eof = 0;
+        r->out[i].queue_count = 0;
     }
     r->eof = 0;
     c->eax = S_OK_;
@@ -549,6 +578,28 @@ static void decode(wm_reader *r, int o, const AVPacket *pkt)
 }
 
 /* GetNextSample(this, WORD wStreamNum, INSSBuffer **, QWORD *time, QWORD *dur, DWORD *flags, DWORD *out, WORD *num) */
+static int read_packet(wm_reader *r)
+{
+    if (r->eof) return 0;
+    int e = av_read_frame(r->fmt, r->pkt);   /* com o lock: o IStream é do guest */
+    if (e == AVERROR_EOF) {
+        for (int o = 0; o < r->nout; o++) {
+            decode(r, o, NULL);
+            r->out[o].eof = 1;
+        }
+        r->eof = 1;
+        return 0;
+    }
+    if (e < 0) re5_fatal("wmvcore", "av_read_frame falhou (%d) no meio do ASF", e);
+    int o = -1;
+    for (int i = 0; i < r->nout; i++)
+        if (r->out[i].st == r->pkt->stream_index) o = i;
+    if (o >= 0) decode(r, o, r->pkt);
+    av_packet_unref(r->pkt);
+    return 1;
+}
+
+/* GetNextSample(this, WORD wStreamNum, INSSBuffer **, QWORD *time, QWORD *dur, DWORD *flags, DWORD *out, WORD *num) */
 static void r_GetNextSample(CPU *c)
 {
     wm_reader *r = reader(c);
@@ -558,68 +609,75 @@ static void r_GetNextSample(CPU *c)
     if (!pps) { c->eax = E_POINTER_; return; }
     int want_out = want ? out_of_stream(r, want) : -1;
     if (want && want_out < 0) { c->eax = E_INVALIDARG_; return; }
-    for (;;) {
-        frame_node **pp = &r->head, *prev = NULL;
-        while (*pp && want_out >= 0 && (*pp)->out != want_out) {
-            prev = *pp;
-            pp = &(*pp)->next;
+
+    int chosen = -1;
+    if (want_out >= 0) {
+        wm_out *w = &r->out[want_out];
+        while (!w->head && !w->eof && !r->eof) {
+            read_packet(r);
         }
-        if (*pp) {
-            frame_node *n = *pp;
-            *pp = n->next;
-            if (r->tail == n) r->tail = prev;
-            wm_out *w = &r->out[n->out];
-            AVStream *s = r->fmt->streams[w->st];
-            int64_t pts = n->f->best_effort_timestamp != AV_NOPTS_VALUE ? n->f->best_effort_timestamp : n->f->pts;
-            /* Só o 1º quadro de um pacote traz tempo (o wmapro tira vários de um pacote, e o último quadro
-             * do vc1 sai no flush sem tempo): os outros seguem o relógio da saída, que nunca anda para trás. */
-            uint64_t t100 = pts == AV_NOPTS_VALUE ? w->pred_t
-                                                  : (uint64_t)av_rescale_q(pts, s->time_base, (AVRational){1, 10000000});
-            if (t100 < w->next_t && !w->discontinuity) t100 = w->next_t;
-            uint64_t d100 = w->video ? (n->f->duration > 0 ? (uint64_t)av_rescale_q(n->f->duration, s->time_base,
-                                                                                    (AVRational){1, 10000000})
-                                                            : 333667u)
-                                     : (uint64_t)n->f->nb_samples * 10000000u / (uint64_t)w->dec->sample_rate;
-            uint32_t flags = (w->video ? ((n->f->flags & AV_FRAME_FLAG_KEY) ? WM_SF_CLEANPOINT : 0) : WM_SF_CLEANPOINT) |
-                             (w->discontinuity ? WM_SF_DISCONTINUITY : 0);
-            w->discontinuity = 0;
-            w->next_t = t100 + (w->video ? 1 : d100);
-            w->pred_t = t100 + d100;
-            wm_sample *sm = calloc(1, sizeof *sm);
-            if (!sm) re5_fatal("wmvcore", "sem memória");
-            sm->r = r;
-            r->obj.refs++;   /* a amostra segura o leitor (a memória dela é dele) */
-            sm->va = make_sample(r, n, &sm->len);
-            sm->max = sm->len;
-            k32_w32(pps, obj_init(&sm->obj, K_SAMPLE));
-            if (pt) { k32_w32(pt, (uint32_t)t100); k32_w32(pt + 4, (uint32_t)(t100 >> 32)); }
-            if (pd) { k32_w32(pd, (uint32_t)d100); k32_w32(pd + 4, (uint32_t)(d100 >> 32)); }
-            if (pf) k32_w32(pf, flags);
-            if (po) k32_w32(po, (uint32_t)n->out);
-            if (pn) k32_w16(pn, w->num);
-            av_frame_free(&n->f);
-            free(n);
-            c->eax = S_OK_;
-            return;
+        if (w->head) chosen = want_out;
+    } else {
+        /* want == 0: ordem cronológica de apresentação (presentation time order)
+         * entre todas as saídas ativas. Lê pacotes até que toda saída tenha ao menos
+         * uma amostra decodificada (ou chegue ao fim), com limite de segurança. */
+        for (;;) {
+            int need_more = 0;
+            int any_available = 0;
+            int max_queued = 0;
+            for (int i = 0; i < r->nout; i++) {
+                if (r->out[i].head) {
+                    any_available = 1;
+                    if (r->out[i].queue_count > max_queued)
+                        max_queued = r->out[i].queue_count;
+                } else if (!r->out[i].eof && !r->eof) {
+                    need_more = 1;
+                }
+            }
+            if (need_more && !r->eof && max_queued < 300) {
+                read_packet(r);
+                continue;
+            }
+            if (!any_available) break;
+
+            uint64_t min_t = UINT64_MAX;
+            for (int i = 0; i < r->nout; i++) {
+                if (r->out[i].head && r->out[i].head->t100 < min_t) {
+                    min_t = r->out[i].head->t100;
+                    chosen = i;
+                }
+            }
+            break;
         }
-        if (r->eof) {
-            k32_w32(pps, 0);
-            c->eax = NS_E_NO_MORE_SAMPLES;
-            return;
-        }
-        int e = av_read_frame(r->fmt, r->pkt);   /* com o lock: o IStream é do guest */
-        if (e == AVERROR_EOF) {
-            for (int o = 0; o < r->nout; o++) decode(r, o, NULL);
-            r->eof = 1;
-            continue;
-        }
-        if (e < 0) re5_fatal("wmvcore", "av_read_frame falhou (%d) no meio do ASF", e);
-        int o = -1;
-        for (int i = 0; i < r->nout; i++)
-            if (r->out[i].st == r->pkt->stream_index) o = i;
-        if (o >= 0) decode(r, o, r->pkt);
-        av_packet_unref(r->pkt);
     }
+
+    if (chosen < 0) {
+        k32_w32(pps, 0);
+        c->eax = NS_E_NO_MORE_SAMPLES;
+        return;
+    }
+
+    wm_out *w = &r->out[chosen];
+    frame_node *n = w->head;
+    w->head = n->next;
+    if (!w->head) w->tail = NULL;
+    w->queue_count--;
+
+    wm_sample *sm = calloc(1, sizeof *sm);
+    if (!sm) re5_fatal("wmvcore", "sem memória");
+    sm->r = r;
+    r->obj.refs++;   /* a amostra segura o leitor (a memória dela é dele) */
+    sm->va = make_sample(r, n, &sm->len);
+    sm->max = sm->len;
+    k32_w32(pps, obj_init(&sm->obj, K_SAMPLE));
+    if (pt) { k32_w32(pt, (uint32_t)n->t100); k32_w32(pt + 4, (uint32_t)(n->t100 >> 32)); }
+    if (pd) { k32_w32(pd, (uint32_t)n->d100); k32_w32(pd + 4, (uint32_t)(n->d100 >> 32)); }
+    if (pf) k32_w32(pf, n->flags);
+    if (po) k32_w32(po, (uint32_t)chosen);
+    if (pn) k32_w16(pn, w->num);
+    av_frame_free(&n->f);
+    free(n);
+    c->eax = S_OK_;
 }
 
 static void r_SetReadStreamSamples(CPU *c)

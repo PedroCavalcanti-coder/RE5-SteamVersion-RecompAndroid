@@ -247,6 +247,9 @@ int main(int argc, char **argv)
         uint32_t s = rd32(ps), o = rd32(po);
         uint64_t t = (uint64_t)rd32(pt) | (uint64_t)rd32(pt + 4) << 32;
         CHECK(rd32(pd) > 0);
+        if (nvid + naud > 0) {
+            CHECK(t >= last_t);   /* ordem cronológica de apresentação entre todos os streams */
+        }
         if ((int)o == vo) {
             CHECK_EQ_U32(rd16(pn), vnum);
             const uint32_t gb[1] = {pbuf};
