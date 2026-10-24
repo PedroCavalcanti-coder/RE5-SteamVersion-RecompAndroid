@@ -141,13 +141,13 @@ int main(int argc, char **argv)
         CPU cpu; memset(&cpu, 0, sizeof cpu); CPU *c = &cpu;
         c->fpu_cw = 0x027F; c->mxcsr = 0x1F80;
         c->esp = %du - 0x100u;
-        c->xmm[0].u64[0] = bits;
-        c->xmm[1].u64[0] = bits1;
+        ((uint64_t *)&c->xmm[0])[0] = bits;
+        ((uint64_t *)&c->xmm[1])[0] = bits1;
         fpush(c, x);
         push32(c, %du);
         dispatch(c, entry);
         double st0 = *fst(c, 0); uint64_t sb; memcpy(&sb, &st0, 8);
-        printf("R %%016llX %%016llX %%d\n", (unsigned long long)c->xmm[0].u64[0], (unsigned long long)sb, c->fpu_top);
+        printf("R %%016llX %%016llX %%d\n", (unsigned long long)((uint64_t *)&c->xmm[0])[0], (unsigned long long)sb, c->fpu_top);
         fflush(stdout);
     }
     return 0;

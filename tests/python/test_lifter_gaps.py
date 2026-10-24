@@ -56,14 +56,13 @@ class LifterGaps(unittest.TestCase):
 
     def test_reciprocals(self):
         # rcpss xmm3, xmm5 (0x00E64C4F, a parada depois do M7): só a pista 0 muda.
-        self.assertEqual(lift(b"\xf3\x0f\x53\xdd"), "c->xmm[3].f32[0] = 1.0f / (c->xmm[5].f32[0]);")
-        self.assertEqual(lift(b"\xf3\x0f\x52\xc1"), "c->xmm[0].f32[0] = 1.0f / sqrtf(c->xmm[1].f32[0]);")
+        self.assertEqual(lift(b"\xf3\x0f\x53\xdd"), "c->xmm[3][0] = 1.0f / (c->xmm[5][0]);")
+        self.assertEqual(lift(b"\xf3\x0f\x52\xc1"), "c->xmm[0][0] = 1.0f / sqrtf(c->xmm[1][0]);")
         self.assertIn("rdss((c->eax))", lift(b"\xf3\x0f\x53\x00"))           # rcpss xmm0, [eax]
         # Empacotadas: a fonte é copiada antes (rcpps xmm1, xmm1 não pode ler pista já escrita).
         c = lift(b"\x0f\x53\xc9")
-        self.assertIn("XMM _s = c->xmm[1];", c)
-        self.assertIn("c->xmm[1].f32[_i] = 1.0f / (_s.f32[_i]);", c)
-        self.assertIn("1.0f / sqrtf(_s.f32[_i])", lift(b"\x0f\x52\xca"))   # rsqrtps
+        self.assertIn("_mm_rcp_ps", c)
+        self.assertIn("_mm_rsqrt_ps", lift(b"\x0f\x52\xca"))   # rsqrtps
 
     def test_fxam(self):
         # 0x00E71F24 (CRT): classe de st(0) em C3 C2 C0 e sinal em C1, sem pop.
@@ -168,9 +167,9 @@ class LifterGaps(unittest.TestCase):
 
     def test_difftest_findings(self):
         # Achados do scripts/difftest_cpu.py (lift32_cpu contra o Unicorn).
-        self.assertIn(".u64[1]", lift(b"\x0f\x17\x17"))        # movhps [edi], xmm2: a metade ALTA
-        self.assertIn(".u64[1]", lift(b"\x0f\x16\x07"))        # movhps xmm0, [edi]
-        self.assertIn(".u64[0]", lift(b"\x0f\x13\x07"))        # movlps [edi], xmm0: a baixa
+        self.assertIn("xmm_get_qword(c->xmm[2], 1)", lift(b"\x0f\x17\x17"))        # movhps [edi], xmm2: a metade ALTA
+        self.assertIn("xmm_set_qword(c->xmm[0], 1,", lift(b"\x0f\x16\x07"))        # movhps xmm0, [edi]
+        self.assertIn("xmm_get_qword(c->xmm[0], 0)", lift(b"\x0f\x13\x07"))        # movlps [edi], xmm0: a baixa
         self.assertIn("c->fpu_top & 7) << 11", lift(b"\xdf\xe0"))   # fnstsw ax com TOP
         self.assertIn(", 1);", lift(b"\xd9\xf5"))              # fprem1: quociente arredondado
         self.assertIn(", 0);", lift(b"\xd9\xf8"))              # fprem: truncado
@@ -184,9 +183,8 @@ class LifterGaps(unittest.TestCase):
     def test_packed_min_max(self):
         # CRT 0x00E671BE: pmaxsw xmm1, xmm3 (com sinal, 8 palavras); a forma MMX segue TODO.
         c = lift(b"\x66\x0f\xee\xcb")
-        self.assertIn("XMM _s = c->xmm[3]; XMM _d = c->xmm[1];", c)
-        self.assertIn("c->xmm[1].i16[7] = _d.i16[7] > _s.i16[7] ? _d.i16[7] : _s.i16[7];", c)
-        self.assertIn("c->xmm[1].u8[15] = _d.u8[15] < _s.u8[15]", lift(b"\x66\x0f\xda\xcb"))   # pminub
+        self.assertIn("c->xmm[1] = xmm_pmaxsw(c->xmm[1], c->xmm[3]);", c)
+        self.assertIn("c->xmm[1] = xmm_pminub(c->xmm[1], c->xmm[3]);", lift(b"\x66\x0f\xda\xcb"))   # pminub
         self.assertIn("RECOMP_TODO", lift(b"\x0f\xee\xcb"))                                   # pmaxsw mm1, mm3
 
     def test_xlatb(self):

@@ -311,7 +311,7 @@ int main(int argc, char **argv)
         printf("ST");
         for (int k = 0; k < n; k++) { double v = *fst(c, k); uint64_t b; memcpy(&b, &v, 8); printf(" %%016llX", (unsigned long long)b); }
         printf("\nXM");
-        for (int r = 0; r < 8; r++) for (int k = 0; k < 4; k++) printf(" %%08X", c->xmm[r].u32[k]);
+        for (int r = 0; r < 8; r++) for (int k = 0; k < 4; k++) printf(" %%08X", ((const uint32_t *)&c->xmm[r])[k]);
         printf("\nM");
         int nd = 0;
         for (uint32_t a = 0; a < %(size)du; a += 8) {

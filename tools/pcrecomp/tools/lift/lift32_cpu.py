@@ -163,6 +163,7 @@ SSE_SHIFT = {
 
 SSE_AMBIGUOUS = (SSE_AMBIGUOUS | frozenset(SSE_PINT) | frozenset(SSE_PSAT)
                  | frozenset(SSE_PCMP) | frozenset(SSE_PMINMAX)
+                 | frozenset(SSE_SHIFT)
                  | frozenset(k for k in SSE_PUNPCK if k != "punpcklqdq"
                                                    and k != "punpckhqdq"))
 
@@ -1491,12 +1492,12 @@ class Lifter:
 
     def _ss(self, insn, op):
         """operand as a float (scalar single)"""
-        if self._is_xmm(op): return f"c->xmm[{self._xi(op)}].f32[0]"
+        if self._is_xmm(op): return f"c->xmm[{self._xi(op)}][0]"
         return f"rdss({self.addr_expr(insn, op)})"
 
     def _sd(self, insn, op):
         """operand as a double (scalar double)"""
-        if self._is_xmm(op): return f"c->xmm[{self._xi(op)}].f64[0]"
+        if self._is_xmm(op): return f"xmm_get_sd(c->xmm[{self._xi(op)}])"
         return f"rdsd({self.addr_expr(insn, op)})"
 
     def _xm(self, insn, op):
@@ -1511,68 +1512,48 @@ class Lifter:
         s = ops[1] if len(ops) > 1 else None
 
         # ---- scalar moves ----
-        # Loading from memory zeroes the rest of the register; the
-        # register-to-register form moves only the low lane. See sse_load_ss.
         if m in ("movss", "movsd"):
             wide = m == "movsd"
-            rd_ = self._sd if wide else self._ss
-            if self._is_xmm(d) and self._is_xmm(s):
-                return [f"{rd_(insn, d)} = {rd_(insn, s)};"]
-            if self._is_xmm(d):
-                return [f"sse_load_s{'d' if wide else 's'}(&c->xmm[{self._xi(d)}], "
-                        f"{rd_(insn, s)});"]
-            st = "wrsd" if wide else "wrss"
-            return [f"{st}({self.addr_expr(insn, d)}, {rd_(insn, s)});"]
+            if not wide:
+                if self._is_xmm(d) and self._is_xmm(s):
+                    return [f"c->xmm[{self._xi(d)}][0] = c->xmm[{self._xi(s)}][0];"]
+                if self._is_xmm(d):
+                    return [f"c->xmm[{self._xi(d)}] = sse_load_ss({self._ss(insn, s)});"]
+                return [f"wrss({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}][0]);"]
+            else:
+                if self._is_xmm(d) and self._is_xmm(s):
+                    return [f"c->xmm[{self._xi(d)}] = xmm_movsd_reg(c->xmm[{self._xi(d)}], c->xmm[{self._xi(s)}]);"]
+                if self._is_xmm(d):
+                    return [f"c->xmm[{self._xi(d)}] = sse_load_sd({self._sd(insn, s)});"]
+                return [f"wrsd({self.addr_expr(insn, d)}, xmm_get_sd(c->xmm[{self._xi(s)}]));"]
 
-        # pextrw/pinsrw: one 16-bit lane in or out, chosen by an immediate.
-        #
-        # MachStorm's C runtime reaches `pextrw eax, xmm0, 3` 26200 dispatches
-        # into its startup - it is how MSVC's SSE2 strlen finds which byte of
-        # a compare result matched. The index is masked to three bits because
-        # that is what the hardware does with it, rather than trusting the
-        # encoding to be in range.
         if m in ("pextrw", "pinsrw"):
             i = ops[2].imm & 7 if len(ops) > 2 else 0
             if m == "pextrw":
-                return [self.dst_write(insn, d,
-                                       f"c->xmm[{self._xi(s)}].u16[{i}]")]
-            return [f"c->xmm[{self._xi(d)}].u16[{i}] = "
-                    f"(uint16_t)({self.src(insn, s)});"]
+                return [self.dst_write(insn, d, f"((xv8w)c->xmm[{self._xi(s)}])[{i}]")]
+            return [f"c->xmm[{self._xi(d)}] = xmm_pinsrw(c->xmm[{self._xi(d)}], {i}, (uint16_t)({self.src(insn, s)}));"]
 
-        # unpck*: interleave lanes from the destination and the source.
-        #
-        # Through a temporary because the destination is also an input and is
-        # very often the same register as the source - MachStorm's CRT reaches
-        # `unpcklpd xmm1, xmm1` to broadcast a double into both lanes, which
-        # would read back what it had just written without one.
         if m in ("unpcklpd", "unpckhpd", "unpcklps", "unpckhps"):
             src = self._xm(insn, s)
             xd = self._xi(d)
             lo = m.endswith("lpd") or m.endswith("lps")
             if m.endswith("pd"):
-                a, b = (0, 0) if lo else (1, 1)
-                return [f"{{ XMM _s = {src}; XMM _d = c->xmm[{xd}];"
-                        f" c->xmm[{xd}].u64[0] = _d.u64[{a}];"
-                        f" c->xmm[{xd}].u64[1] = _s.u64[{b}]; }}"]
+                fn = "xmm_unpcklpd" if lo else "xmm_unpckhpd"
+                return [f"c->xmm[{xd}] = {fn}(c->xmm[{xd}], {src});"]
             i, j = (0, 1) if lo else (2, 3)
             return [f"{{ XMM _s = {src};"
                     f" c->xmm[{xd}] = XMM_SHUF4(c->xmm[{xd}], _s, {i}, {4 + i}, {j}, {4 + j}); }}"]
 
-        # movd/movq: the integer-lane moves. Same asymmetry as above.
         if m == "movd":
             if self._is_xmm(d):
-                return [f"c->xmm[{self._xi(d)}].u64[0] = {self.src(insn, s)};"
-                        f" c->xmm[{self._xi(d)}].u64[1] = 0;"]
-            return [self.dst_write(insn, d, f"c->xmm[{self._xi(s)}].u32[0]")]
+                return [f"c->xmm[{self._xi(d)}] = xmm_from_u32({self.src(insn, s)});"]
+            return [self.dst_write(insn, d, f"xmm_to_u32(c->xmm[{self._xi(s)}])")]
         if m == "movq":
             if self._is_xmm(d) and self._is_xmm(s):
-                return [f"c->xmm[{self._xi(d)}].u64[0] = c->xmm[{self._xi(s)}].u64[0];"
-                        f" c->xmm[{self._xi(d)}].u64[1] = 0;"]
+                return [f"c->xmm[{self._xi(d)}] = xmm_from_u64(xmm_to_u64(c->xmm[{self._xi(s)}]));"]
             if self._is_xmm(d):
-                return [f"c->xmm[{self._xi(d)}].u64[0] = "
-                        f"rdxm({self.addr_expr(insn, s)}).u64[0];"
-                        f" c->xmm[{self._xi(d)}].u64[1] = 0;"]
-            return [f"wrsd({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}].f64[0]);"]
+                return [f"c->xmm[{self._xi(d)}] = xmm_from_u64(rd64({self.addr_expr(insn, s)}));"]
+            return [f"wr64({self.addr_expr(insn, d)}, xmm_to_u64(c->xmm[{self._xi(s)}]));"]
 
         # ---- 128-bit moves ----
         if m in SSE_MOV128:
@@ -1586,437 +1567,153 @@ class Lifter:
             n = self._xi(d)
             fn = {"&": "xmm_and", "|": "xmm_or", "^": "xmm_xor", "andn": "xmm_andn"}[op]
             return [f"c->xmm[{n}] = {fn}(c->xmm[{n}], {self._xm(insn, s)});"]
-            lanes = (f"c->xmm[{n}].u64[0] = ~c->xmm[{n}].u64[0] & _s.u64[0];"
-                     f" c->xmm[{n}].u64[1] = ~c->xmm[{n}].u64[1] & _s.u64[1];"
-                     if op == "andn" else
-                     f"c->xmm[{n}].u64[0] {op}= _s.u64[0];"
-                     f" c->xmm[{n}].u64[1] {op}= _s.u64[1];")
-            return [f"{{ XMM _s = {self._xm(insn, s)}; {lanes} }}"]
 
-        # ---- packed integer ----
-        #
-        # The p* family, on xmm. Every one of these is also an MMX instruction
-        # with the same name and half the width, which is why they are routed
-        # by operand and not by mnemonic; the MMX forms stay a TODO on purpose,
-        # because guessing a width is worse than saying so.
-        #
-        # All of them read the destination and write it back, and the source
-        # may be the destination, so the source is copied first throughout.
-        if m in SSE_PMINMAX:
-            fld, n, keep = SSE_PMINMAX[m]
+        # ---- packed integer & saturating ----
+        if m in SSE_PMINMAX or m in SSE_PINT or m in SSE_PSAT or m in SSE_PCMP or m in ("pmullw", "pmaddwd") or m in SSE_PACK or m in SSE_PUNPCK:
             xd = self._xi(d)
-            sets = " ".join(
-                "c->xmm[%d].%s[%d] = _d.%s[%d] %s _s.%s[%d] ? _d.%s[%d] : _s.%s[%d];"
-                % (xd, fld, i, fld, i, keep, fld, i, fld, i, fld, i) for i in range(n))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
-        if m in SSE_PINT:
-            op, bits, n = SSE_PINT[m]
-            xd = self._xi(d)
-            return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {self._xm(insn, s)});"]   # wraps, one vector op
-            sets = " ".join(
-                "c->xmm[%d].u%d[%d] = (uint%d_t)(_d.u%d[%d] %s _s.u%d[%d]);"
-                % (xd, bits, i, bits, bits, i, op, bits, i) for i in range(n))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
+            return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {self._xm(insn, s)});"]
 
-        # The saturating forms. The arithmetic has to happen a width up or the
-        # clamp cannot see the overflow it exists to catch.
-        if m in SSE_PSAT:
-            op, bits, helper = SSE_PSAT[m]
-            lane = "i" if "_i" in helper else "u"
-            xd, n = self._xi(d), 128 // bits
-            sets = " ".join(
-                "c->xmm[%d].%s%d[%d] = %s((int32_t)_d.%s%d[%d] %s (int32_t)_s.%s%d[%d]);"
-                % (xd, lane, bits, i, helper, lane, bits, i, op, lane, bits, i)
-                for i in range(n))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
-
-        # Packed compares write an all-ones or all-zeros mask per lane rather
-        # than setting flags, so the result can be ANDed as a branchless
-        # select. pcmpgt is signed; pcmpeq does not care.
-        if m in SSE_PCMP:
-            op, bits, sgn = SSE_PCMP[m]
-            xd, n = self._xi(d), 128 // bits
-            ones = "0x%X" % ((1 << bits) - 1)
-            sets = " ".join(
-                "c->xmm[%d].u%d[%d] = (_d.%s%d[%d] %s _s.%s%d[%d]) ? (uint%d_t)%su : 0u;"
-                % (xd, bits, i, sgn, bits, i, op, sgn, bits, i, bits, ones)
-                for i in range(n))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
-
-        if m == "pmullw":                      # low half of each product
-            xd = self._xi(d)
-            sets = " ".join(
-                "c->xmm[%d].u16[%d] = (uint16_t)((int32_t)_d.i16[%d] * (int32_t)_s.i16[%d]);"
-                % (xd, i, i, i) for i in range(8))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
-
-        if m == "pmaddwd":                     # two products summed per dword
-            xd = self._xi(d)
-            sets = " ".join(
-                "c->xmm[%d].i32[%d] = (int32_t)_d.i16[%d] * (int32_t)_s.i16[%d]"
-                " + (int32_t)_d.i16[%d] * (int32_t)_s.i16[%d];"
-                % (xd, i, 2 * i, 2 * i, 2 * i + 1, 2 * i + 1) for i in range(4))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
-
-        # Pack: two lanes narrow into one with saturation, destination first
-        # and source second, so one register ends up holding both halves.
-        if m in SSE_PACK:
-            bits, helper, sgn = SSE_PACK[m]
-            half, out = 128 // bits, bits // 2
-            xd = self._xi(d)
-            lane = "u" if "_u" in helper else "i"
-            sets = " ".join(
-                "c->xmm[%d].%s%d[%d] = %s((int32_t)%s.%s%d[%d]);"
-                % (xd, lane, out, j + (half if src == "_s" else 0), helper,
-                   src, sgn, bits, j)
-                for src in ("_d", "_s") for j in range(half))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
-
-        # Unpack: interleave one half of each operand, so two registers of
-        # narrow lanes become one of wide ones. Through a temporary, because
-        # the destination lanes move.
-        if m in SSE_PUNPCK:
-            bits, hi = SSE_PUNPCK[m]
-            n = 128 // bits
-            base = n // 2 if hi else 0
-            xd = self._xi(d)
-            sets = " ".join(
-                "_t.u%d[%d] = _d.u%d[%d]; _t.u%d[%d] = _s.u%d[%d];"
-                % (bits, 2 * i, bits, base + i, bits, 2 * i + 1, bits, base + i)
-                for i in range(n // 2))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; XMM _t;"
-                    f" {sets} c->xmm[{xd}] = _t; }}"]
-
-        # The mask moves: one sign bit per lane, gathered into a GPR. This is
-        # how SSE code asks "did any lane compare true" without branching per
-        # lane, so it is nearly always right after one of the compares above.
         if m in ("pmovmskb", "movmskps", "movmskpd"):
-            lane, n = {"pmovmskb": ("u8", 16), "movmskps": ("u32", 4),
-                       "movmskpd": ("u64", 2)}[m]
-            top = {"u8": 7, "u32": 31, "u64": 63}[lane]
             xs = self._xm(insn, s)
-            bits = " | ".join("(uint32_t)((_s.%s[%d] >> %d) & 1u) << %d"
-                              % (lane, i, top, i) for i in range(n))
-            return [f"{{ XMM _s = {xs}; {self.dst_write(insn, d, bits)} }}"]
+            if m == "pmovmskb":
+                return [self.dst_write(insn, d, f"(uint32_t)_mm_movemask_epi8((__m128i){xs})")]
+            elif m == "movmskps":
+                return [self.dst_write(insn, d, f"(uint32_t)_mm_movemask_ps((__m128){xs})")]
+            else:
+                return [self.dst_write(insn, d, f"(uint32_t)_mm_movemask_pd((__m128d){xs})")]
 
-        # pshuflw/pshufhw shuffle one half by an immediate and copy the other.
         if m in ("pshuflw", "pshufhw"):
             imm = ops[2].imm if len(ops) > 2 else 0
-            hi = m == "pshufhw"
-            xd, base = self._xi(d), 4 if m == "pshufhw" else 0
-            keep = 1 if not hi else 0
-            sets = " ".join(
-                "c->xmm[%d].u16[%d] = _s.u16[%d];"
-                % (xd, base + i, base + ((imm >> (2 * i)) & 3)) for i in range(4))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" c->xmm[{xd}].u64[{keep}] = _s.u64[{keep}]; {sets} }}"]
-
-        if m == "cvtdq2pd":                    # two int32 lanes to two doubles
             xd = self._xi(d)
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" c->xmm[{xd}].f64[0] = (double)_s.i32[0];"
-                    f" c->xmm[{xd}].f64[1] = (double)_s.i32[1]; }}"]
+            fn = "_mm_shufflehi_epi16" if m == "pshufhw" else "_mm_shufflelo_epi16"
+            return [f"c->xmm[{xd}] = (XMM){fn}((__m128i){self._xm(insn, s)}, {imm & 0xFF});"]
 
-        # movlps/movlpd/movhps/movhpd: one 64-bit lane to or from memory. The
-        # register-to-register encodings are movhlps and movlhps, which are
-        # different instructions and not these.
+        if m == "cvtdq2pd":
+            xd = self._xi(d)
+            return [f"c->xmm[{xd}] = xmm_cvtdq2pd({self._xm(insn, s)});"]
+
         if m in ("movlps", "movlpd", "movhps", "movhpd"):
-            # movhps/movhpd: the 'h' is m[3]. Indexing m[4] (the 'p') made every
-            # one of them move the LOW quadword (scripts/difftest_cpu.py).
             lane = 1 if m.startswith("movh") else 0
             if self._is_xmm(d):
-                return [f"c->xmm[{self._xi(d)}].u64[{lane}] ="
-                        f" rd64({self.addr_expr(insn, s)});"]
-            return [f"wr64({self.addr_expr(insn, d)},"
-                    f" c->xmm[{self._xi(s)}].u64[{lane}]);"]
+                return [f"c->xmm[{self._xi(d)}] = xmm_set_qword(c->xmm[{self._xi(d)}], {lane}, rd64({self.addr_expr(insn, s)}));"]
+            return [f"wr64({self.addr_expr(insn, d)}, xmm_get_qword(c->xmm[{self._xi(s)}], {lane}));"]
 
-        # ---- packed shifts ----
-        #
-        # `psllq xmm3, 0x20` in MachStorm's own code at 0x008f3a21. Every lane
-        # of the register moves by the same count, and the count is either an
-        # immediate or the low quadword of the source - never per-lane, which
-        # is what makes one rule cover the family.
-        #
-        # x86 saturates rather than wrapping: a count at or past the lane width
-        # zeroes the lane, where C's shift operator would be undefined. That is
-        # not an edge case here, it is how SSE code clears a register. The
-        # arithmetic forms saturate to the sign bit instead, so the guard is
-        # written as a count clamp rather than a zero.
         if m in SSE_SHIFT:
-            lane, bits, arith = SSE_SHIFT[m]
             xd = self._xi(d)
             if s.type == X86_OP_IMM:
-                cnt = "unsigned _n = %uu;" % (s.imm & 0xFF)
+                return [f"c->xmm[{xd}] = xmm_{m}_imm(c->xmm[{xd}], {s.imm & 0xFF}u);"]
             else:
-                cnt = ("XMM _s = %s;"
-                       " unsigned _n = _s.u64[0] > 255u ? 255u"
-                       " : (unsigned)_s.u64[0];" % self._xm(insn, s))
-            n = 128 // bits
-            if arith:
-                body = ("for (_i = 0; _i < %d; _i++)"
-                        " c->xmm[%d].i%d[_i] >>= (_n > %du ? %du : _n);"
-                        % (n, xd, bits, bits - 1, bits - 1))
-            else:
-                body = ("for (_i = 0; _i < %d; _i++)"
-                        " c->xmm[%d].u%d[_i] = _n > %du ? 0"
-                        " : (uint%d_t)(c->xmm[%d].u%d[_i] %s _n);"
-                        % (n, xd, bits, bits - 1, bits, xd, bits, lane))
-            return [f"{{ {cnt} int _i; {body} }}"]
+                return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {self._xm(insn, s)});"]
 
-        # pslldq/psrldq move the whole register by a byte count. Unlike every
-        # other shift here they have no lanes at all, and the count is always
-        # an immediate.
         if m in ("pslldq", "psrldq"):
             xd = self._xi(d)
             k = min(s.imm & 0xFF, 16)
-            if m == "pslldq":
-                pick = "(_i >= %d) ? c->xmm[%d].u8[_i - %d] : 0" % (k, xd, k)
-            else:
-                pick = "(_i + %d < 16) ? c->xmm[%d].u8[_i + %d] : 0" % (k, xd, k)
-            return [f"{{ XMM _t; int _i;"
-                    f" for (_i = 0; _i < 16; _i++) _t.u8[_i] = {pick};"
-                    f" c->xmm[{xd}] = _t; }}"]
+            return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {k}u);"]
 
-        # shuf*/pshuf*: lanes chosen by an immediate.
-        #
-        # The first instruction MachStorm reaches in its OWN code rather than
-        # its C runtime - `shufps xmm1, xmm0, 0x55` at 0x0070d974 - and the
-        # one a 3D game uses most, because broadcasting one component of a
-        # vector across a register is how everything from a dot product to a
-        # matrix multiply is written.
-        #
-        # shufps takes its low two lanes from the destination and its high two
-        # from the source; pshufd takes all four from the source. Both read
-        # the destination, so both need the temporary.
         if m in ("shufps", "shufpd", "pshufd"):
             imm = ops[2].imm if len(ops) > 2 else 0
             xd = self._xi(d)
             if m == "shufpd":
-                sets = ("c->xmm[%d].f64[0] = _d.f64[%d];"
-                        " c->xmm[%d].f64[1] = _s.f64[%d];"
-                        % (xd, imm & 1, xd, (imm >> 1) & 1))
+                return [f"c->xmm[{xd}] = xmm_shufpd(c->xmm[{xd}], {self._xm(insn, s)}, {imm & 3});"]
             else:
-                # One shuffle (cpu.h XMM_SHUF4, lanes 0-3 = destination, 4-7 = source).
                 sel = [(imm >> (2 * i)) & 3 for i in range(4)]
                 idx = ([sel[0], sel[1], 4 + sel[2], 4 + sel[3]] if m == "shufps"
                        else [4 + k for k in sel])
                 return [f"{{ XMM _s = {self._xm(insn, s)};"
                         f" c->xmm[{xd}] = XMM_SHUF4(c->xmm[{xd}], _s, {idx[0]}, {idx[1]}, {idx[2]}, {idx[3]}); }}"]
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
 
         # ---- packed arithmetic ----
-        #
-        # Only the scalar forms were here, which is what a game that uses SSE
-        # for one float at a time needs. MachStorm's C runtime does two at
-        # once - `mulpd xmm2, xmm1` inside its own floating point formatting -
-        # so the packed forms have to exist as well. Both lanes, or all four,
-        # through a temporary for the same reason unpck needs one: the
-        # destination is an input and may be the source.
         if m[:-2] in SSE_ARITH and m[-2:] in ("ps", "pd"):
-            # One vector operation (cpu.h xmm_mulps & co.): the lane-by-lane form
-            # compiled to four mulss per mulps in RE5's matrix code.
             xd = self._xi(d)
             return [f"c->xmm[{xd}] = xmm_{m}(c->xmm[{xd}], {self._xm(insn, s)});"]
         if m in ("sqrtps", "sqrtpd"):
-            wide = m == "sqrtpd"
-            lane, n, fn = ("f64", 2, "sqrt") if wide else ("f32", 4, "sqrtf")
-            sets = " ".join(
-                "c->xmm[%d].%s[%d] = %s(_s.%s[%d]);"
-                % (self._xi(d), lane, i, fn, lane, i)
-                for i in range(n)
-            )
-            return [f"{{ XMM _s = {self._xm(insn, s)}; {sets} }}"]
+            fn = "_mm_sqrt_pd" if m == "sqrtpd" else "_mm_sqrt_ps"
+            ty = "(__m128d)" if m == "sqrtpd" else "(__m128)"
+            return [f"c->xmm[{self._xi(d)}] = (XMM){fn}({ty}{self._xm(insn, s)});"]
         if m in ("minps", "maxps", "minpd", "maxpd"):
-            wide = m.endswith("pd")
-            lane, n = ("f64", 2) if wide else ("f32", 4)
-            fn = f"sse_{m[:3]}{'d' if wide else 'f'}"
-            sets = " ".join(
-                "c->xmm[%d].%s[%d] = %s(_d.%s[%d], _s.%s[%d]);"
-                % (self._xi(d), lane, i, fn, lane, i, lane, i)
-                for i in range(n)
-            )
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{self._xi(d)}]; {sets} }}"]
+            return [f"c->xmm[{self._xi(d)}] = xmm_{m}(c->xmm[{self._xi(d)}], {self._xm(insn, s)});"]
 
         # ---- scalar arithmetic ----
         if m[:-2] in SSE_ARITH and m[-2:] in ("ss", "sd"):
             wide = m[-2:] == "sd"
-            rd_ = self._sd if wide else self._ss
-            return [f"{rd_(insn, d)} = {rd_(insn, d)} {SSE_ARITH[m[:-2]]} {rd_(insn, s)};"]
+            xd = self._xi(d)
+            if not wide:
+                op = SSE_ARITH[m[:-2]]
+                return [f"c->xmm[{xd}][0] = c->xmm[{xd}][0] {op} {self._ss(insn, s)};"]
+            else:
+                fn = f"xmm_{m[:-2]}sd"
+                return [f"c->xmm[{xd}] = {fn}(c->xmm[{xd}], {self._sd(insn, s)});"]
         if m in ("sqrtss", "sqrtsd"):
-            wide = m == "sqrtsd"
-            rd_ = self._sd if wide else self._ss
-            fn = "sqrt" if wide else "sqrtf"
-            return [f"{rd_(insn, d)} = {fn}({rd_(insn, s)});"]
+            xd = self._xi(d)
+            if m == "sqrtss":
+                return [f"c->xmm[{xd}][0] = sqrtf({self._ss(insn, s)});"]
+            else:
+                return [f"c->xmm[{xd}] = xmm_sqrtsd(c->xmm[{xd}], {self._sd(insn, s)});"]
         if m in ("minss", "maxss", "minsd", "maxsd"):
-            wide = m.endswith("sd")
-            rd_ = self._sd if wide else self._ss
-            fn = f"sse_{m[:3]}{'d' if wide else 'f'}"
-            return [f"{rd_(insn, d)} = {fn}({rd_(insn, d)}, {rd_(insn, s)});"]
-        # Recíproca aproximada: o mesmo modelo do lift32_sse.py, o valor exato
-        # (o hardware dá ~12 bits; quem usa costuma refinar com Newton-Raphson).
+            xd = self._xi(d)
+            if m.endswith("ss"):
+                fn = "sse_minf" if m.startswith("min") else "sse_maxf"
+                return [f"c->xmm[{xd}][0] = {fn}(c->xmm[{xd}][0], {self._ss(insn, s)});"]
+            else:
+                fn = "xmm_minsd" if m.startswith("min") else "xmm_maxsd"
+                return [f"c->xmm[{xd}] = {fn}(c->xmm[{xd}], {self._sd(insn, s)});"]
         if m in ("rcpss", "rsqrtss"):
             fn = "1.0f / " if m == "rcpss" else "1.0f / sqrtf"
-            return [f"{self._ss(insn, d)} = {fn}({self._ss(insn, s)});"]
-
-        # ---- packed arithmetic, lane by lane ----
-        if m[:-2] in SSE_ARITH and m[-2:] in ("ps", "pd"):
-            wide = m[-2:] == "pd"
-            n, lanes, fld = self._xi(d), (2 if wide else 4), ("f64" if wide else "f32")
-            op = SSE_ARITH[m[:-2]]
-            return ["{ XMM _s = %s; for (int _i = 0; _i < %d; _i++)"
-                    " c->xmm[%d].%s[_i] = c->xmm[%d].%s[_i] %s _s.%s[_i]; }"
-                    % (self._xm(insn, s), lanes, n, fld, n, fld, op, fld)]
-        if m in ("minps", "maxps", "minpd", "maxpd"):
-            wide = m.endswith("pd")
-            n, lanes, fld = self._xi(d), (2 if wide else 4), ("f64" if wide else "f32")
-            fn = "sse_%s%s" % (m[:3], "d" if wide else "f")
-            return ["{ XMM _s = %s; for (int _i = 0; _i < %d; _i++)"
-                    " c->xmm[%d].%s[_i] = %s(c->xmm[%d].%s[_i], _s.%s[_i]); }"
-                    % (self._xm(insn, s), lanes, n, fld, fn, n, fld, fld)]
-        if m in ("sqrtps",):
-            n = self._xi(d)
-            return ["{ XMM _s = %s; for (int _i = 0; _i < 4; _i++)"
-                    " c->xmm[%d].f32[_i] = sqrtf(_s.f32[_i]); }"
-                    % (self._xm(insn, s), n)]
+            return [f"c->xmm[{self._xi(d)}][0] = {fn}({self._ss(insn, s)});"]
         if m in ("rcpps", "rsqrtps"):
-            fn = "1.0f / " if m == "rcpps" else "1.0f / sqrtf"
-            return ["{ XMM _s = %s; for (int _i = 0; _i < 4; _i++)"
-                    " c->xmm[%d].f32[_i] = %s(_s.f32[_i]); }"
-                    % (self._xm(insn, s), self._xi(d), fn)]
-
-        # ---- lane shuffles ----
-        # Every one of these reads the destination while writing it, so the
-        # destination has to be copied first. Writing lane 0 before reading
-        # lane 2 for lane 1 is the classic way to get this subtly wrong.
-        if m == "shufps":
-            n = self._xi(d)
-            imm = insn.operands[2].imm & 0xFF
-            sel = [(imm >> 0) & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3]
-            return ["{ XMM _d = c->xmm[%d], _s = %s;"
-                    " c->xmm[%d].f32[0] = _d.f32[%d]; c->xmm[%d].f32[1] = _d.f32[%d];"
-                    " c->xmm[%d].f32[2] = _s.f32[%d]; c->xmm[%d].f32[3] = _s.f32[%d]; }"
-                    % (n, self._xm(insn, s), n, sel[0], n, sel[1], n, sel[2], n, sel[3])]
-        if m in ("unpcklps", "unpckhps"):
-            n = self._xi(d)
-            lo = m == "unpcklps"
-            a, b = (0, 1) if lo else (2, 3)
-            return ["{ XMM _d = c->xmm[%d], _s = %s;"
-                    " c->xmm[%d].f32[0] = _d.f32[%d]; c->xmm[%d].f32[1] = _s.f32[%d];"
-                    " c->xmm[%d].f32[2] = _d.f32[%d]; c->xmm[%d].f32[3] = _s.f32[%d]; }"
-                    % (n, self._xm(insn, s), n, a, n, a, n, b, n, b)]
+            fn = "_mm_rcp_ps" if m == "rcpps" else "_mm_rsqrt_ps"
+            return [f"c->xmm[{self._xi(d)}] = (XMM){fn}((__m128){self._xm(insn, s)});"]
 
         # ---- compares that set flags ----
         if m in ("ucomiss", "comiss", "ucomisd", "comisd"):
-            rd_ = self._sd if m.endswith("sd") else self._ss
-            return [f"sse_compare(c, {rd_(insn, d)}, {rd_(insn, s)});"]
+            wide = m.endswith("sd")
+            d_val = f"xmm_get_sd(c->xmm[{self._xi(d)}])" if wide else f"c->xmm[{self._xi(d)}][0]"
+            s_val = self._sd(insn, s) if wide else self._ss(insn, s)
+            return [f"sse_compare(c, {d_val}, {s_val});"]
 
         # ---- compares that write a mask ----
         mm = SSE_CMP_RE.match(m)
         if mm and mm.group(2) in ("ps", "pd"):
-            # The packed forms. Same predicates, every lane, and the same
-            # reason for writing them through C's NaN rule rather than a
-            # bitwise test: an unordered compare has to answer false.
-            pred, wide = mm.group(1), mm.group(2) == "pd"
-            lane, n = ("f64", 2) if wide else ("f32", 4)
-            ints = "u64" if wide else "u32"
-            ones = "~(uint64_t)0" if wide else "0xFFFFFFFFu"
-            xd = self._xi(d)
-            sets = " ".join(
-                "{ %s _a = _d.%s[%d], _b = _s.%s[%d];"
-                " c->xmm[%d].%s[%d] = %s ? %s : 0; }"
-                % ("double" if wide else "float", lane, i, lane, i,
-                   xd, ints, i, SSE_CMP_PRED[pred], ones)
-                for i in range(n))
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
+            pred_idx = list(SSE_CMP_PRED.keys()).index(mm.group(1))
+            wide = mm.group(2) == "pd"
+            fn = "xmm_cmp_pd" if wide else "xmm_cmp_ps"
+            return [f"c->xmm[{self._xi(d)}] = {fn}(c->xmm[{self._xi(d)}], {self._xm(insn, s)}, {pred_idx});"]
         if mm:
-            pred, width = mm.group(1), mm.group(2)
-            wide = width == "sd"
-            rd_ = self._sd if wide else self._ss
-            ctype = "double" if wide else "float"
-            lane = f"c->xmm[{self._xi(d)}].u64[0]" if wide else f"c->xmm[{self._xi(d)}].u32[0]"
-            ones = "~(uint64_t)0" if wide else "0xFFFFFFFFu"
-            zero = "(uint64_t)0" if wide else "0u"
-            return [f"{{ {ctype} _a = {rd_(insn, d)}, _b = {rd_(insn, s)};"
-                    f" {lane} = {SSE_CMP_PRED[pred]} ? {ones} : {zero}; }}"]
+            pred_idx = list(SSE_CMP_PRED.keys()).index(mm.group(1))
+            wide = mm.group(2) == "sd"
+            fn = "xmm_cmp_sd" if wide else "xmm_cmp_ss"
+            d_val = f"xmm_get_sd(c->xmm[{self._xi(d)}])" if wide else f"c->xmm[{self._xi(d)}][0]"
+            s_val = self._sd(insn, s) if wide else self._ss(insn, s)
+            return [f"c->xmm[{self._xi(d)}] = {fn}(c->xmm[{self._xi(d)}], {d_val}, {s_val}, {pred_idx});"]
 
         # ---- conversions ----
-        if m in ("cvtsi2ss", "cvtsi2sd"):          # int32 -> float, low lane only
-            lane = self._sd if m.endswith("sd") else self._ss
-            return [f"{lane(insn, d)} = (int32_t)({self.src(insn, s)});"]
-        if m in ("cvttss2si", "cvttsd2si"):        # float -> int32, truncating
-            rd_ = self._sd if m.startswith("cvttsd") else self._ss
-            return [self.dst_write(insn, d, f"sse_cvtt_i32({rd_(insn, s)})")]
-        if m in ("cvtss2si", "cvtsd2si"):          # float -> int32, to nearest
-            rd_ = self._sd if m.startswith("cvtsd") else self._ss
-            return [self.dst_write(insn, d, f"sse_cvtt_i32(nearbyint({rd_(insn, s)}))")]
+        if m == "cvtsi2ss":
+            return [f"c->xmm[{self._xi(d)}][0] = (float)(int32_t)({self.src(insn, s)});"]
+        if m == "cvtsi2sd":
+            return [f"c->xmm[{self._xi(d)}] = xmm_cvtsi2sd(c->xmm[{self._xi(d)}], (int32_t)({self.src(insn, s)}));"]
+        if m in ("cvttss2si", "cvtss2si"):
+            fn = "sse_cvtt_i32" if m.startswith("cvtt") else "sse_cvtt_i32(nearbyintf"
+            tail = ")" if m.startswith("cvtt") else "))"
+            return [self.dst_write(insn, d, f"{fn}({self._ss(insn, s)}{tail}")]
+        if m in ("cvttsd2si", "cvtsd2si"):
+            fn = "sse_cvtt_i32" if m.startswith("cvtt") else "sse_cvtt_i32(nearbyint"
+            tail = ")" if m.startswith("cvtt") else "))"
+            return [self.dst_write(insn, d, f"{fn}({self._sd(insn, s)}{tail}")]
         if m == "cvtss2sd":
-            return [f"c->xmm[{self._xi(d)}].f64[0] = {self._ss(insn, s)};"]
+            return [f"c->xmm[{self._xi(d)}] = xmm_cvtss2sd(c->xmm[{self._xi(d)}], {self._ss(insn, s)});"]
         if m == "cvtsd2ss":
-            return [f"c->xmm[{self._xi(d)}].f32[0] = (float)({self._sd(insn, s)});"]
-
-        # ---- packed conversions ----
-        #
-        # All four lanes, which is what a compiler emits for a float4 cast and
-        # what the scalar forms above deliberately do not do. cvtps2dq rounds
-        # to nearest (the default mode; the game never changes MXCSR) and
-        # cvttps2dq truncates - the extra `t` is the whole difference and
-        # getting it backwards is a silently wrong coordinate.
+            return [f"c->xmm[{self._xi(d)}][0] = (float)({self._sd(insn, s)});"]
         if m in ("cvtdq2ps", "cvtps2dq", "cvttps2dq"):
-            n, i = self._xi(d), None
-            src = f"_s"
-            body = []
-            for i in range(4):
-                if m == "cvtdq2ps":
-                    body.append(f"c->xmm[{n}].f32[{i}] = (float)_s.i32[{i}];")
-                elif m == "cvttps2dq":
-                    body.append(f"c->xmm[{n}].i32[{i}] = sse_cvtt_i32(_s.f32[{i}]);")
-                else:
-                    body.append(f"c->xmm[{n}].i32[{i}] = "
-                                f"sse_cvtt_i32(nearbyintf(_s.f32[{i}]));")
-            return [f"{{ XMM _s = {self._xm(insn, s)}; " + " ".join(body) + " }"]
-
-        # ---- the two that change lane width ----
-        #
-        # cvtps2pd reads TWO floats - the low 64 bits - and writes two doubles.
-        # That asymmetry is the whole reason it needs its own case: reading the
-        # source with _xm() would fetch sixteen bytes for an eight-byte
-        # operand, which is a fault the moment the operand sits in the last
-        # eight bytes of a page. So the memory form reads exactly the two
-        # floats it is entitled to.
-        #
-        # Both read the source into locals before writing the destination,
-        # because `cvtps2pd xmm0, xmm0` is real code and the lanes overlap.
+            return [f"c->xmm[{self._xi(d)}] = xmm_{m}({self._xm(insn, s)});"]
         if m == "cvtps2pd":
             n = self._xi(d)
             if self._is_xmm(s):
                 j = self._xi(s)
-                src = f"c->xmm[{j}].f32[0], _b = c->xmm[{j}].f32[1]"
-                return [f"{{ float _a = {src};"
-                        f" c->xmm[{n}].f64[0] = _a; c->xmm[{n}].f64[1] = _b; }}"]
+                return [f"c->xmm[{n}] = xmm_cvtps2pd(c->xmm[{j}][0], c->xmm[{j}][1]);"]
             return [f"{{ uint32_t _p = {self.addr_expr(insn, s)};"
-                    f" float _a = rdf32(_p), _b = rdf32(_p + 4u);"
-                    f" c->xmm[{n}].f64[0] = _a; c->xmm[{n}].f64[1] = _b; }}"]
-
-        # cvtpd2ps is the other way: two doubles in, two floats into the low 64
-        # bits, and the top 64 bits ZEROED - which is architectural, not tidy,
-        # and code that then reads lane 2 or 3 depends on it.
+                    f" c->xmm[{n}] = xmm_cvtps2pd(rdss(_p), rdss(_p + 4u)); }}"]
         if m == "cvtpd2ps":
-            n = self._xi(d)
-            return [f"{{ XMM _s = {self._xm(insn, s)};"
-                    f" c->xmm[{n}].f32[0] = (float)_s.f64[0];"
-                    f" c->xmm[{n}].f32[1] = (float)_s.f64[1];"
-                    f" c->xmm[{n}].i32[2] = 0; c->xmm[{n}].i32[3] = 0; }}"]
+            return [f"c->xmm[{self._xi(d)}] = xmm_cvtpd2ps({self._xm(insn, s)});"]
 
         return [_todo(insn.address, f"sse {m} {insn.op_str}")]
 

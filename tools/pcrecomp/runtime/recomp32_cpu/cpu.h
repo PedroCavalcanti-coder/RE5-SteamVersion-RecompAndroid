@@ -48,24 +48,33 @@ static __inline void pcrecomp_writefsdword(unsigned long off, unsigned long v)
  * genuinely IS 32-bit, and computing `addss` in double rounds once where the
  * hardware rounds twice. The results differ in the low bits, and in a game
  * that feeds them to a coordinate transform the difference is visible. */
+#if defined(__GNUC__) || defined(__clang__)
+typedef float    xv4f  __attribute__((vector_size(16)));
+typedef double   xv2d  __attribute__((vector_size(16)));
+typedef uint8_t  xv16b __attribute__((vector_size(16)));
+typedef uint16_t xv8w  __attribute__((vector_size(16)));
+typedef uint32_t xv4d  __attribute__((vector_size(16)));
+typedef uint64_t xv2q  __attribute__((vector_size(16)));
+typedef int32_t  xv4i  __attribute__((vector_size(16)));
+typedef int16_t  xv8i  __attribute__((vector_size(16)));
+typedef int8_t   xv16i __attribute__((vector_size(16)));
+typedef int64_t  xv2qi __attribute__((vector_size(16)));
+
+typedef xv4f XMM;
+#else
 typedef union {
     float    f32[4];
     double   f64[2];
     uint32_t u32[4];
     uint64_t u64[2];
     int32_t  i32[4];
-    /* The word lanes pextrw and pinsrw address. Expressing those two through
-     * u32 and a shift works and reads like arithmetic; a lane array says what
-     * the instruction says. */
     uint16_t u16[8];
     int16_t  i16[8];
-    /* The byte lanes pslldq and psrldq shift through. Those two move the whole
-     * register by a byte count, not each lane by a bit count, so they are the
-     * one SSE shift that cannot be written in terms of any wider lane. */
     uint8_t  u8[16];
     int8_t   i8[16];
     int64_t  i64[2];
 } XMM;
+#endif
 
 typedef struct {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
@@ -702,6 +711,7 @@ static inline void   wri64(uint32_t a, double v) { v = nearbyint(v); int64_t i =
  * not applied: the host's own code assumes round-to-nearest. */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <xmmintrin.h>
+#include <emmintrin.h>
 static inline void cpu_ldmxcsr(CPU *c, uint32_t v) {
     c->mxcsr = v;
     _mm_setcsr((_mm_getcsr() & ~0x8040u) | (v & 0x8040u));
@@ -774,35 +784,193 @@ static inline void   wrxm(uint32_t a, XMM    v) { memcpy((void *)(uintptr_t)a, &
  * (+ - * /, wrapping integer +/-, bitwise, shuffles); min/max keep their own NaN
  * rule elsewhere. memcpy in and out: no alignment or aliasing assumption on XMM. */
 #if defined(__GNUC__) || defined(__clang__)
-typedef float    xv4f __attribute__((vector_size(16)));
-typedef double   xv2d __attribute__((vector_size(16)));
-typedef uint8_t  xv16b __attribute__((vector_size(16)));
-typedef uint16_t xv8w __attribute__((vector_size(16)));
-typedef uint32_t xv4d __attribute__((vector_size(16)));
-typedef uint64_t xv2q __attribute__((vector_size(16)));
-typedef int32_t  xv4i __attribute__((vector_size(16)));
-#define XMM_VOP(name, vt, expr) \
-    static inline XMM name(XMM a, XMM b) { vt x, y; memcpy(&x, &a, 16); memcpy(&y, &b, 16); x = (expr); memcpy(&a, &x, 16); return a; }
-XMM_VOP(xmm_addps, xv4f, x + y) XMM_VOP(xmm_subps, xv4f, x - y)
-XMM_VOP(xmm_mulps, xv4f, x * y) XMM_VOP(xmm_divps, xv4f, x / y)
-XMM_VOP(xmm_addpd, xv2d, x + y) XMM_VOP(xmm_subpd, xv2d, x - y)
-XMM_VOP(xmm_mulpd, xv2d, x * y) XMM_VOP(xmm_divpd, xv2d, x / y)
-XMM_VOP(xmm_paddb, xv16b, x + y) XMM_VOP(xmm_psubb, xv16b, x - y)
-XMM_VOP(xmm_paddw, xv8w, x + y)  XMM_VOP(xmm_psubw, xv8w, x - y)
-XMM_VOP(xmm_paddd, xv4d, x + y)  XMM_VOP(xmm_psubd, xv4d, x - y)
-XMM_VOP(xmm_paddq, xv2q, x + y)  XMM_VOP(xmm_psubq, xv2q, x - y)
-XMM_VOP(xmm_and, xv2q, x & y) XMM_VOP(xmm_or, xv2q, x | y)
-XMM_VOP(xmm_xor, xv2q, x ^ y) XMM_VOP(xmm_andn, xv2q, ~x & y)
-/* shufps/unpck*ps: result lane k = lane idx[k] of (d ++ s), idx in 0..7. */
+static inline float  sse_minf(float  d, float  s) { return (d < s) ? d : s; }
+static inline float  sse_maxf(float  d, float  s) { return (d > s) ? d : s; }
+static inline double sse_mind(double d, double s) { return (d < s) ? d : s; }
+static inline double sse_maxd(double d, double s) { return (d > s) ? d : s; }
+
+static inline XMM sse_load_ss(float v) { return (XMM){v, 0.0f, 0.0f, 0.0f}; }
+static inline XMM sse_load_sd(double v) { return (XMM)(xv2d){v, 0.0}; }
+static inline double xmm_get_sd(XMM v) { return ((xv2d)v)[0]; }
+static inline XMM xmm_movsd_reg(XMM d, XMM s) { xv2d vd = (xv2d)d, vs = (xv2d)s; vd[0] = vs[0]; return (XMM)vd; }
+
+static inline XMM xmm_addsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] += s; return (XMM)v; }
+static inline XMM xmm_subsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] -= s; return (XMM)v; }
+static inline XMM xmm_mulsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] *= s; return (XMM)v; }
+static inline XMM xmm_divsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] /= s; return (XMM)v; }
+static inline XMM xmm_sqrtsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] = sqrt(s); return (XMM)v; }
+static inline XMM xmm_minsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] = sse_mind(v[0], s); return (XMM)v; }
+static inline XMM xmm_maxsd(XMM d, double s) { xv2d v = (xv2d)d; v[0] = sse_maxd(v[0], s); return (XMM)v; }
+static inline XMM xmm_cvtsi2sd(XMM d, int32_t s) { xv2d v = (xv2d)d; v[0] = (double)s; return (XMM)v; }
+static inline XMM xmm_cvtss2sd(XMM d, float s) { xv2d v = (xv2d)d; v[0] = (double)s; return (XMM)v; }
+
+static inline XMM xmm_from_u32(uint32_t v) { return (XMM)(xv4d){v, 0, 0, 0}; }
+static inline uint32_t xmm_to_u32(XMM v) { return ((xv4d)v)[0]; }
+static inline XMM xmm_from_u64(uint64_t v) { return (XMM)(xv2q){v, 0}; }
+static inline uint64_t xmm_to_u64(XMM v) { return ((xv2q)v)[0]; }
+static inline uint64_t xmm_get_qword(XMM v, int lane) { return ((xv2q)v)[lane]; }
+static inline XMM xmm_set_qword(XMM d, int lane, uint64_t v) { xv2q q = (xv2q)d; q[lane] = v; return (XMM)q; }
+static inline XMM xmm_pinsrw(XMM d, int i, uint16_t v) { xv8w w = (xv8w)d; w[i & 7] = v; return (XMM)w; }
+
+static inline XMM xmm_addps(XMM a, XMM b) { return a + b; }
+static inline XMM xmm_subps(XMM a, XMM b) { return a - b; }
+static inline XMM xmm_mulps(XMM a, XMM b) { return a * b; }
+static inline XMM xmm_divps(XMM a, XMM b) { return a / b; }
+
+static inline XMM xmm_addpd(XMM a, XMM b) { return (XMM)((xv2d)a + (xv2d)b); }
+static inline XMM xmm_subpd(XMM a, XMM b) { return (XMM)((xv2d)a - (xv2d)b); }
+static inline XMM xmm_mulpd(XMM a, XMM b) { return (XMM)((xv2d)a * (xv2d)b); }
+static inline XMM xmm_divpd(XMM a, XMM b) { return (XMM)((xv2d)a / (xv2d)b); }
+
+static inline XMM xmm_paddb(XMM a, XMM b) { return (XMM)((xv16b)a + (xv16b)b); }
+static inline XMM xmm_psubb(XMM a, XMM b) { return (XMM)((xv16b)a - (xv16b)b); }
+static inline XMM xmm_paddw(XMM a, XMM b) { return (XMM)((xv8w)a + (xv8w)b); }
+static inline XMM xmm_psubw(XMM a, XMM b) { return (XMM)((xv8w)a - (xv8w)b); }
+static inline XMM xmm_paddd(XMM a, XMM b) { return (XMM)((xv4d)a + (xv4d)b); }
+static inline XMM xmm_psubd(XMM a, XMM b) { return (XMM)((xv4d)a - (xv4d)b); }
+static inline XMM xmm_paddq(XMM a, XMM b) { return (XMM)((xv2q)a + (xv2q)b); }
+static inline XMM xmm_psubq(XMM a, XMM b) { return (XMM)((xv2q)a - (xv2q)b); }
+
+static inline XMM xmm_and(XMM a, XMM b) { return (XMM)((xv2q)a & (xv2q)b); }
+static inline XMM xmm_or(XMM a, XMM b) { return (XMM)((xv2q)a | (xv2q)b); }
+static inline XMM xmm_xor(XMM a, XMM b) { return (XMM)((xv2q)a ^ (xv2q)b); }
+static inline XMM xmm_andn(XMM a, XMM b) { return (XMM)(~(xv2q)a & (xv2q)b); }
+
 #if defined(__clang__)
-#define XMM_SHUF4(d, s, i0, i1, i2, i3) __extension__({ XMM _r; xv4d _x, _y, _z; \
-    memcpy(&_x, &(d), 16); memcpy(&_y, &(s), 16); \
-    _z = __builtin_shufflevector(_x, _y, i0, i1, i2, i3); memcpy(&_r, &_z, 16); _r; })
+#define XMM_SHUF4(d, s, i0, i1, i2, i3) \
+    ((XMM)__builtin_shufflevector((xv4d)(d), (xv4d)(s), (i0), (i1), (i2), (i3)))
 #else
-#define XMM_SHUF4(d, s, i0, i1, i2, i3) __extension__({ XMM _r; xv4d _x, _y, _z; \
-    memcpy(&_x, &(d), 16); memcpy(&_y, &(s), 16); \
-    _z = __builtin_shuffle(_x, _y, (xv4d){i0, i1, i2, i3}); memcpy(&_r, &_z, 16); _r; })
+#define XMM_SHUF4(d, s, i0, i1, i2, i3) \
+    ((XMM)__builtin_shuffle((xv4d)(d), (xv4d)(s), (xv4d){(i0), (i1), (i2), (i3)}))
 #endif
+
+static inline XMM xmm_shufpd(XMM d, XMM s, int imm) {
+    xv2d vd = (xv2d)d, vs = (xv2d)s;
+    return (XMM)(xv2d){ vd[imm & 1], vs[(imm >> 1) & 1] };
+}
+static inline XMM xmm_unpcklpd(XMM d, XMM s) { xv2q qd = (xv2q)d, qs = (xv2q)s; return (XMM)(xv2q){qd[0], qs[0]}; }
+static inline XMM xmm_unpckhpd(XMM d, XMM s) { xv2q qd = (xv2q)d, qs = (xv2q)s; return (XMM)(xv2q){qd[1], qs[1]}; }
+
+static inline XMM xmm_minps(XMM a, XMM b) { return (XMM)_mm_min_ps((__m128)a, (__m128)b); }
+static inline XMM xmm_maxps(XMM a, XMM b) { return (XMM)_mm_max_ps((__m128)a, (__m128)b); }
+static inline XMM xmm_minpd(XMM a, XMM b) { return (XMM)_mm_min_pd((__m128d)a, (__m128d)b); }
+static inline XMM xmm_maxpd(XMM a, XMM b) { return (XMM)_mm_max_pd((__m128d)a, (__m128d)b); }
+
+static inline XMM xmm_pmaxsw(XMM a, XMM b) { return (XMM)_mm_max_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_pminsw(XMM a, XMM b) { return (XMM)_mm_min_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_pmaxub(XMM a, XMM b) { return (XMM)_mm_max_epu8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_pminub(XMM a, XMM b) { return (XMM)_mm_min_epu8((__m128i)a, (__m128i)b); }
+
+static inline XMM xmm_paddsb(XMM a, XMM b) { return (XMM)_mm_adds_epi8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_paddsw(XMM a, XMM b) { return (XMM)_mm_adds_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_psubsb(XMM a, XMM b) { return (XMM)_mm_subs_epi8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_psubsw(XMM a, XMM b) { return (XMM)_mm_subs_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_paddusb(XMM a, XMM b) { return (XMM)_mm_adds_epu8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_paddusw(XMM a, XMM b) { return (XMM)_mm_adds_epu16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_psubusb(XMM a, XMM b) { return (XMM)_mm_subs_epu8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_psubusw(XMM a, XMM b) { return (XMM)_mm_subs_epu16((__m128i)a, (__m128i)b); }
+
+static inline XMM xmm_pcmpeqb(XMM a, XMM b) { return (XMM)((xv16i)a == (xv16i)b); }
+static inline XMM xmm_pcmpeqw(XMM a, XMM b) { return (XMM)((xv8i)a == (xv8i)b); }
+static inline XMM xmm_pcmpeqd(XMM a, XMM b) { return (XMM)((xv4i)a == (xv4i)b); }
+static inline XMM xmm_pcmpgtb(XMM a, XMM b) { return (XMM)((xv16i)a > (xv16i)b); }
+static inline XMM xmm_pcmpgtw(XMM a, XMM b) { return (XMM)((xv8i)a > (xv8i)b); }
+static inline XMM xmm_pcmpgtd(XMM a, XMM b) { return (XMM)((xv4i)a > (xv4i)b); }
+
+static inline XMM xmm_pmullw(XMM a, XMM b) { return (XMM)_mm_mullo_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_pmaddwd(XMM a, XMM b) { return (XMM)_mm_madd_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_packsswb(XMM a, XMM b) { return (XMM)_mm_packs_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_packuswb(XMM a, XMM b) { return (XMM)_mm_packus_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_packssdw(XMM a, XMM b) { return (XMM)_mm_packs_epi32((__m128i)a, (__m128i)b); }
+
+static inline XMM xmm_punpcklbw(XMM a, XMM b) { return (XMM)_mm_unpacklo_epi8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpcklwd(XMM a, XMM b) { return (XMM)_mm_unpacklo_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpckldq(XMM a, XMM b) { return (XMM)_mm_unpacklo_epi32((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpcklqdq(XMM a, XMM b) { return (XMM)_mm_unpacklo_epi64((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpckhbw(XMM a, XMM b) { return (XMM)_mm_unpackhi_epi8((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpckhwd(XMM a, XMM b) { return (XMM)_mm_unpackhi_epi16((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpckhdq(XMM a, XMM b) { return (XMM)_mm_unpackhi_epi32((__m128i)a, (__m128i)b); }
+static inline XMM xmm_punpckhqdq(XMM a, XMM b) { return (XMM)_mm_unpackhi_epi64((__m128i)a, (__m128i)b); }
+
+static inline XMM xmm_cvtdq2ps(XMM a) { return __builtin_convertvector((xv4i)a, xv4f); }
+static inline XMM xmm_cvttps2dq(XMM a) { return (XMM)__builtin_convertvector(a, xv4i); }
+static inline XMM xmm_cvtps2dq(XMM a) { return (XMM)_mm_cvtps_epi32((__m128)a); }
+static inline XMM xmm_cvtdq2pd(XMM a) { return (XMM)_mm_cvtepi32_pd((__m128i)a); }
+static inline XMM xmm_cvtps2pd(float a, float b) { return (XMM)(xv2d){(double)a, (double)b}; }
+static inline XMM xmm_cvtpd2ps(XMM a) { xv2d d = (xv2d)a; return (XMM){(float)d[0], (float)d[1], 0.0f, 0.0f}; }
+
+static inline XMM xmm_psllw(XMM a, XMM c) { return (XMM)_mm_sll_epi16((__m128i)a, (__m128i)c); }
+static inline XMM xmm_pslld(XMM a, XMM c) { return (XMM)_mm_sll_epi32((__m128i)a, (__m128i)c); }
+static inline XMM xmm_psllq(XMM a, XMM c) { return (XMM)_mm_sll_epi64((__m128i)a, (__m128i)c); }
+static inline XMM xmm_psraw(XMM a, XMM c) { return (XMM)_mm_sra_epi16((__m128i)a, (__m128i)c); }
+static inline XMM xmm_psrad(XMM a, XMM c) { return (XMM)_mm_sra_epi32((__m128i)a, (__m128i)c); }
+static inline XMM xmm_psrlw(XMM a, XMM c) { return (XMM)_mm_srl_epi16((__m128i)a, (__m128i)c); }
+static inline XMM xmm_psrld(XMM a, XMM c) { return (XMM)_mm_srl_epi32((__m128i)a, (__m128i)c); }
+static inline XMM xmm_psrlq(XMM a, XMM c) { return (XMM)_mm_srl_epi64((__m128i)a, (__m128i)c); }
+
+static inline XMM xmm_psllw_imm(XMM a, unsigned n) { return (XMM)_mm_slli_epi16((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_pslld_imm(XMM a, unsigned n) { return (XMM)_mm_slli_epi32((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_psllq_imm(XMM a, unsigned n) { return (XMM)_mm_slli_epi64((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_psraw_imm(XMM a, unsigned n) { return (XMM)_mm_srai_epi16((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_psrad_imm(XMM a, unsigned n) { return (XMM)_mm_srai_epi32((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_psrlw_imm(XMM a, unsigned n) { return (XMM)_mm_srli_epi16((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_psrld_imm(XMM a, unsigned n) { return (XMM)_mm_srli_epi32((__m128i)a, n > 255 ? 255 : n); }
+static inline XMM xmm_psrlq_imm(XMM a, unsigned n) { return (XMM)_mm_srli_epi64((__m128i)a, n > 255 ? 255 : n); }
+
+static inline XMM xmm_pslldq(XMM a, unsigned k) {
+    if (k >= 16) return (XMM)(xv4d){0, 0, 0, 0};
+    uint8_t t[16] = {0};
+    memcpy(t + k, &a, 16 - k);
+    XMM r; memcpy(&r, t, 16); return r;
+}
+static inline XMM xmm_psrldq(XMM a, unsigned k) {
+    if (k >= 16) return (XMM)(xv4d){0, 0, 0, 0};
+    uint8_t t[16] = {0};
+    memcpy(t, (const uint8_t *)&a + k, 16 - k);
+    XMM r; memcpy(&r, t, 16); return r;
+}
+
+static inline XMM xmm_cmp_ss(XMM d, float a, float b, int pred) {
+    int cond = 0;
+    switch (pred) {
+        case 0: cond = (a == b); break;
+        case 1: cond = (a < b); break;
+        case 2: cond = (a <= b); break;
+        case 3: cond = (a != a || b != b); break;
+        case 4: cond = (a != b); break;
+        case 5: cond = !(a < b); break;
+        case 6: cond = !(a <= b); break;
+        case 7: cond = !(a != a || b != b); break;
+    }
+    xv4d v = (xv4d)d;
+    v[0] = cond ? 0xFFFFFFFFu : 0u;
+    return (XMM)v;
+}
+
+static inline XMM xmm_cmp_sd(XMM d, double a, double b, int pred) {
+    int cond = 0;
+    switch (pred) {
+        case 0: cond = (a == b); break;
+        case 1: cond = (a < b); break;
+        case 2: cond = (a <= b); break;
+        case 3: cond = (a != a || b != b); break;
+        case 4: cond = (a != b); break;
+        case 5: cond = !(a < b); break;
+        case 6: cond = !(a <= b); break;
+        case 7: cond = !(a != a || b != b); break;
+    }
+    xv2q v = (xv2q)d;
+    v[0] = cond ? ~(uint64_t)0 : 0u;
+    return (XMM)v;
+}
+
+static inline XMM xmm_cmp_ps(XMM a, XMM b, int pred) {
+    return (XMM)_mm_cmp_ps((__m128)a, (__m128)b, pred);
+}
+
+static inline XMM xmm_cmp_pd(XMM a, XMM b, int pred) {
+    return (XMM)_mm_cmp_pd((__m128d)a, (__m128d)b, pred);
+}
 #else
 #define XMM_LOP(name, fld, n, op) \
     static inline XMM name(XMM a, XMM b) { for (int i = 0; i < n; i++) a.fld[i] = a.fld[i] op b.fld[i]; return a; }
@@ -818,10 +986,9 @@ static inline XMM xmm_shuf4(XMM d, XMM s, int i0, int i1, int i2, int i3) {
     return r;
 }
 #define XMM_SHUF4(d, s, i0, i1, i2, i3) xmm_shuf4((d), (s), i0, i1, i2, i3)
-#endif
-
 static inline void sse_load_ss(XMM *d, float  v) { d->u64[0] = 0; d->u64[1] = 0; d->f32[0] = v; }
 static inline void sse_load_sd(XMM *d, double v) { d->u64[0] = 0; d->u64[1] = 0; d->f64[0] = v; }
+#endif
 
 /* UCOMISS/COMISS/UCOMISD/COMISD: the comparison lands in ZF/PF/CF, and clears
  * OF/SF/AF. An unordered compare - either operand NaN - sets all three, which
@@ -843,10 +1010,12 @@ static inline void sse_compare(CPU *c, double a, double b) {
  * shape, C's own "any compare with NaN is false" rule delivers both for free.
  * Writing it the other way round, `(src < dst) ? src : dst`, looks identical
  * and is wrong on both. */
+#if !defined(__GNUC__) && !defined(__clang__)
 static inline float  sse_minf(float  d, float  s) { return (d < s) ? d : s; }
 static inline float  sse_maxf(float  d, float  s) { return (d > s) ? d : s; }
 static inline double sse_mind(double d, double s) { return (d < s) ? d : s; }
 static inline double sse_maxd(double d, double s) { return (d > s) ? d : s; }
+#endif
 
 /* CVTTSS2SI and friends yield the "integer indefinite" value when the source
  * does not fit in 32 bits, where the equivalent C cast is undefined behaviour
