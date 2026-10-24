@@ -35,12 +35,16 @@
 #endif
 
 #include "re5/runtime.h"
+#include "re5/steam_lan.h"
 
 #define APP_ID       21690u
 #define STEAM_ID_LO  0x00000001u   /* conta 1 */
 #define STEAM_ID_HI  0x01100001u   /* universo público, individual, instância 1 */
 #define PERSONA_NAME "Player"
 #define VT_SIZE      80u
+
+static uint64_t g_next_call_id = 1000;
+static uint64_t next_call_id(void) { return ++g_next_call_id; }
 
 /* ---- memória do guest para objetos, strings e dados de callback ---- */
 
@@ -172,6 +176,49 @@ static void call_method(uint32_t obj, uint32_t slot, int argc, const uint32_t *a
 static void s_RunCallbacks(CPU *c)
 {
     (void)c;
+    steam_lan_poll();
+    re5_lan_event evt;
+    while (steam_lan_pop_event(&evt)) {
+        switch (evt.type) {
+        case RE5_LAN_EVT_LOBBY_CREATED: {
+            uint32_t d[4] = {evt.param1, 0, (uint32_t)evt.lobby_id, (uint32_t)(evt.lobby_id >> 32)};
+            post_callback(513, d, sizeof d, evt.call_id);
+            break;
+        }
+        case RE5_LAN_EVT_LOBBY_ENTERED: {
+            uint32_t d[5] = {(uint32_t)evt.lobby_id, (uint32_t)(evt.lobby_id >> 32), 0, 0, evt.param1};
+            post_callback(504, d, sizeof d, evt.call_id);
+            break;
+        }
+        case RE5_LAN_EVT_LOBBY_MATCH_LIST: {
+            uint32_t d[1] = {evt.param1};
+            post_callback(510, d, sizeof d, evt.call_id);
+            break;
+        }
+        case RE5_LAN_EVT_LOBBY_CHAT_UPDATE: {
+            uint32_t d[8] = {
+                (uint32_t)evt.lobby_id, (uint32_t)(evt.lobby_id >> 32),
+                (uint32_t)evt.user_id,  (uint32_t)(evt.user_id >> 32),
+                (uint32_t)evt.user_id,  (uint32_t)(evt.user_id >> 32),
+                evt.param1, 0
+            };
+            post_callback(506, d, sizeof d, 0);
+            break;
+        }
+        case RE5_LAN_EVT_LOBBY_DATA_UPDATE: {
+            uint32_t d[6] = {
+                (uint32_t)evt.lobby_id, (uint32_t)(evt.lobby_id >> 32),
+                (uint32_t)evt.user_id,  (uint32_t)(evt.user_id >> 32),
+                evt.param1 & 0xFF, 0
+            };
+            post_callback(505, d, sizeof d, 0);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
     uint32_t n = g_npending;
     pending batch[MAX_PENDING];
     memcpy(batch, g_pending, n * sizeof batch[0]);
@@ -248,24 +295,34 @@ static void s_IsSteamRunning(CPU *c) { c->eax = 1; }
 
 static void s_Init(CPU *c)
 {
-    RE5_INFO("steam_api", "SteamAPI_Init: Steam offline (app %u, usuário '%s')", APP_ID, PERSONA_NAME);
+    steam_lan_init();
+    RE5_INFO("steam_api", "SteamAPI_Init: Steam LAN (app %u, usuario '%s', SteamID %llu, porta %u)",
+             APP_ID, steam_lan_get_local_name(), (unsigned long long)steam_lan_get_local_steam_id(), steam_lan_get_p2p_port());
     c->eax = 1;
 }
 
-static void s_Shutdown(CPU *c) { (void)c; }
+static void s_Shutdown(CPU *c)
+{
+    (void)c;
+    steam_lan_shutdown();
+}
 
 /* ---- ISteamUser017 ---- */
 
 static void u_GetHSteamUser(CPU *c) { c->eax = 1; }
 static void u_BLoggedOn(CPU *c) { ret_bool(c, 1); }
-static void u_GetSteamID(CPU *c) { ret_steamid(c, STEAM_ID_LO, STEAM_ID_HI); }
+static void u_GetSteamID(CPU *c)
+{
+    uint64_t id = steam_lan_get_local_steam_id();
+    ret_steamid(c, (uint32_t)id, (uint32_t)(id >> 32));
+}
 static void u_GetPlayerSteamLevel(CPU *c) { c->eax = 0; }
 
 static void u_GetUserDataFolder(CPU *c)
 {
     uint32_t buf = re5_arg(c, 0), n = re5_arg(c, 1);
     char path[128];
-    snprintf(path, sizeof path, "C:\\Program Files (x86)\\Steam\\userdata\\%u\\%u\\local", STEAM_ID_LO, APP_ID);
+    snprintf(path, sizeof path, "C:\\Program Files (x86)\\Steam\\userdata\\%u\\%u\\local", (uint32_t)steam_lan_get_local_steam_id(), APP_ID);
     ret_bool(c, 0);
     if (strlen(path) + 1 > n) return;
     memcpy(re5_g2h(buf), path, strlen(path) + 1);
@@ -504,9 +561,13 @@ static const method k_stats[] = {
 
 static void f_GetPersonaName(CPU *c)
 {
-    static uint32_t s;
-    if (!s) s = gstr(PERSONA_NAME);
-    c->eax = s;
+    c->eax = gstr(steam_lan_get_local_name());
+}
+
+static void f_GetFriendPersonaName(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    c->eax = gstr(steam_lan_get_peer_name(id));
 }
 
 static void f_GetPersonaState(CPU *c) { c->eax = 1; }   /* k_EPersonaStateOnline */
@@ -515,6 +576,7 @@ static const method k_friends[] = {
     {0, "GetPersonaName", f_GetPersonaName, 0},
     {2, "GetPersonaState", f_GetPersonaState, 0},
     {3, "GetFriendCount", t_Zero, 4},
+    {7, "GetFriendPersonaName", f_GetFriendPersonaName, 8},
     {22, "ActivateGameOverlay", t_Nothing, 4},
     {37, "SetRichPresence", a_True, 8},
     {38, "ClearRichPresence", t_Nothing, 0},
@@ -630,39 +692,73 @@ static const method k_remote[] = {
     {0, NULL, NULL, 0},
 };
 
-/* ---- ISteamNetworking005: P2P e sockets de uma Steam offline, sem nenhum par ----
- * O co-op (também com "Network Selection: LOCAL") consulta a fila P2P a cada quadro
- * (0x00414005: IsP2PPacketAvailable no canal 0x389) e abre/fecha sessões com o parceiro.
- * Offline não há par: nenhum pacote chega, envio e sessões falham, sockets não abrem.
- * Ordem da vtable: steam_api.h do SDK 1.30 (sem sobrecargas nesta interface). */
+/* ---- ISteamNetworking005: P2P e sockets em LAN ---- */
+
+static void n_SendP2PPacket(CPU *c)
+{
+    uint64_t remote_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    uint32_t data_va = re5_arg(c, 2);
+    uint32_t data_len = re5_arg(c, 3);
+    int send_type = (int)re5_arg(c, 4);
+    int channel = (int)re5_arg(c, 5);
+    ret_bool(c, steam_lan_send_p2p(remote_id, re5_g2h(data_va), data_len, send_type, channel));
+}
 
 static void n_IsP2PPacketAvailable(CPU *c)
 {
-    if (re5_arg(c, 0)) wr32(re5_arg(c, 0), 0);
-    ret_bool(c, 0);
+    uint32_t size_va = re5_arg(c, 0);
+    int channel = (int)re5_arg(c, 1);
+    uint32_t msg_sz = 0;
+    int ok = steam_lan_is_p2p_available(&msg_sz, channel);
+    if (size_va) wr32(size_va, msg_sz);
+    ret_bool(c, ok);
 }
 
 static void n_ReadP2PPacket(CPU *c)
 {
-    if (re5_arg(c, 2)) wr32(re5_arg(c, 2), 0);
-    ret_bool(c, 0);
+    uint32_t dest_va = re5_arg(c, 0);
+    uint32_t dest_len = re5_arg(c, 1);
+    uint32_t size_va = re5_arg(c, 2);
+    uint32_t remote_va = re5_arg(c, 3);
+    int channel = (int)re5_arg(c, 4);
+
+    uint32_t msg_sz = 0;
+    uint64_t remote_id = 0;
+    int ok = steam_lan_read_p2p(re5_g2h(dest_va), dest_len, &msg_sz, &remote_id, channel);
+    if (size_va) wr32(size_va, msg_sz);
+    if (remote_va) {
+        wr32(remote_va, (uint32_t)remote_id);
+        wr32(remote_va + 4, (uint32_t)(remote_id >> 32));
+    }
+    ret_bool(c, ok);
 }
 
-/* GetP2PSessionState(CSteamID, P2PSessionState_t *): sem sessão; a estrutura (20 bytes) zerada. */
+static void n_AcceptP2PSessionWithUser(CPU *c)
+{
+    uint64_t remote_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    ret_bool(c, steam_lan_accept_p2p(remote_id));
+}
+
+static void n_CloseP2PSessionWithUser(CPU *c)
+{
+    uint64_t remote_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    ret_bool(c, steam_lan_close_p2p(remote_id));
+}
+
 static void n_GetP2PSessionState(CPU *c)
 {
+    uint64_t remote_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
     uint32_t st = re5_arg(c, 2);
-    if (st) memset(re5_g2h(st), 0, 20);
-    ret_bool(c, 0);
+    ret_bool(c, steam_lan_get_p2p_state(remote_id, st ? re5_g2h(st) : NULL));
 }
 
 static const method k_networking[] = {
-    {0, "SendP2PPacket", t_False, 24},             /* CSteamID, dados, tamanho, tipo, canal */
+    {0, "SendP2PPacket", n_SendP2PPacket, 24},
     {1, "IsP2PPacketAvailable", n_IsP2PPacketAvailable, 8},
     {2, "ReadP2PPacket", n_ReadP2PPacket, 20},
-    {3, "AcceptP2PSessionWithUser", t_False, 8},
-    {4, "CloseP2PSessionWithUser", t_False, 8},
-    {5, "CloseP2PChannelWithUser", t_False, 12},
+    {3, "AcceptP2PSessionWithUser", n_AcceptP2PSessionWithUser, 8},
+    {4, "CloseP2PSessionWithUser", n_CloseP2PSessionWithUser, 8},
+    {5, "CloseP2PChannelWithUser", a_True, 12},
     {6, "GetP2PSessionState", n_GetP2PSessionState, 12},
     {7, "AllowP2PPacketRelay", a_True, 4},
     {8, "CreateListenSocket", t_Zero, 16},         /* 0 = k_HSteamListenSocket_Invalid */
@@ -682,9 +778,130 @@ static const method k_networking[] = {
     {0, NULL, NULL, 0},
 };
 
-/* ---- interfaces sem nada implementado ainda (co-op online) ---- */
+/* ---- ISteamMatchmaking009 ---- */
 
-static const method k_none[] = {{0, NULL, NULL, 0}};
+static void m_RequestLobbyList(CPU *c)
+{
+    uint64_t call = next_call_id();
+    steam_lan_request_lobby_list(call);
+    ret_u64(c, call);
+}
+
+static void m_GetLobbyByIndex(CPU *c)
+{
+    int idx = (int)re5_arg(c, 1);
+    uint64_t id = steam_lan_get_lobby_by_index(idx);
+    ret_steamid(c, (uint32_t)id, (uint32_t)(id >> 32));
+}
+
+static void m_CreateLobby(CPU *c)
+{
+    uint32_t type = re5_arg(c, 0);
+    int max_members = (int)re5_arg(c, 1);
+    uint64_t call = next_call_id();
+    steam_lan_create_lobby(type, max_members, call);
+    ret_u64(c, call);
+}
+
+static void m_JoinLobby(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    uint64_t call = next_call_id();
+    steam_lan_join_lobby(id, call);
+    ret_u64(c, call);
+}
+
+static void m_LeaveLobby(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    steam_lan_leave_lobby(id);
+}
+
+static void m_GetNumLobbyMembers(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    c->eax = (uint32_t)steam_lan_get_num_lobby_members(id);
+}
+
+static void m_GetLobbyMemberByIndex(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 2) << 32 | re5_arg(c, 1);
+    int idx = (int)re5_arg(c, 3);
+    uint64_t member = steam_lan_get_lobby_member_by_index(id, idx);
+    ret_steamid(c, (uint32_t)member, (uint32_t)(member >> 32));
+}
+
+static void m_GetLobbyData(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    const char *key = re5_gstr(re5_arg(c, 2));
+    c->eax = gstr(steam_lan_get_lobby_data(id, key));
+}
+
+static void m_SetLobbyData(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    const char *key = re5_gstr(re5_arg(c, 2));
+    const char *val = re5_gstr(re5_arg(c, 3));
+    ret_bool(c, steam_lan_set_lobby_data(id, key, val));
+}
+
+static void m_GetLobbyMemberData(CPU *c)
+{
+    uint64_t lobby_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    uint64_t user_id  = (uint64_t)re5_arg(c, 3) << 32 | re5_arg(c, 2);
+    const char *key = re5_gstr(re5_arg(c, 4));
+    c->eax = gstr(steam_lan_get_lobby_member_data(lobby_id, user_id, key));
+}
+
+static void m_SetLobbyMemberData(CPU *c)
+{
+    uint64_t lobby_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    const char *key = re5_gstr(re5_arg(c, 2));
+    const char *val = re5_gstr(re5_arg(c, 3));
+    steam_lan_set_lobby_member_data(lobby_id, key, val);
+}
+
+static void m_SetLobbyJoinable(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    int joinable = (int)re5_arg(c, 2);
+    steam_lan_set_lobby_joinable(id, joinable);
+    ret_bool(c, 1);
+}
+
+static void m_GetLobbyOwner(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 2) << 32 | re5_arg(c, 1);
+    uint64_t owner = steam_lan_get_lobby_owner(id);
+    ret_steamid(c, (uint32_t)owner, (uint32_t)(owner >> 32));
+}
+
+static const method k_matchmaking[] = {
+    {0, "GetFavoriteGameCount", t_Zero, 0},
+    {4, "RequestLobbyList", m_RequestLobbyList, 0},
+    {5, "AddRequestLobbyListStringFilter", t_Nothing, 12},
+    {6, "AddRequestLobbyListNumericalFilter", t_Nothing, 12},
+    {7, "AddRequestLobbyListNearValueFilter", t_Nothing, 8},
+    {8, "AddRequestLobbyListFilterSlotsAvailable", t_Nothing, 4},
+    {9, "AddRequestLobbyListDistanceFilter", t_Nothing, 4},
+    {10, "AddRequestLobbyListResultCountFilter", t_Nothing, 4},
+    {12, "GetLobbyByIndex", m_GetLobbyByIndex, 8},
+    {13, "CreateLobby", m_CreateLobby, 8},
+    {14, "JoinLobby", m_JoinLobby, 8},
+    {15, "LeaveLobby", m_LeaveLobby, 8},
+    {16, "InviteUserToLobby", a_True, 16},
+    {17, "GetNumLobbyMembers", m_GetNumLobbyMembers, 8},
+    {18, "GetLobbyMemberByIndex", m_GetLobbyMemberByIndex, 16},
+    {19, "GetLobbyData", m_GetLobbyData, 12},
+    {20, "SetLobbyData", m_SetLobbyData, 16},
+    {24, "GetLobbyMemberData", m_GetLobbyMemberData, 20},
+    {25, "SetLobbyMemberData", m_SetLobbyMemberData, 16},
+    {28, "RequestLobbyData", a_True, 8},
+    {34, "SetLobbyJoinable", m_SetLobbyJoinable, 12},
+    {35, "GetLobbyOwner", m_GetLobbyOwner, 12},
+    {0, NULL, NULL, 0},
+};
 
 /* ISteamClient015: o jogo só instala o gancho de avisos (como o exemplo do SDK);
  * a Steam offline não tem avisos para mandar. */
@@ -700,7 +917,7 @@ static interface g_apps = {"ISteamApps006", k_apps, 0};
 static interface g_stats_if = {"ISteamUserStats011", k_stats, 0};
 static interface g_friends = {"ISteamFriends014", k_friends, 0};
 static interface g_remote = {"ISteamRemoteStorage012", k_remote, 0};
-static interface g_matchmaking = {"ISteamMatchmaking009", k_none, 0};
+static interface g_matchmaking = {"ISteamMatchmaking009", k_matchmaking, 0};
 static interface g_networking = {"ISteamNetworking005", k_networking, 0};
 static interface g_client = {"ISteamClient015", k_client, 0};
 

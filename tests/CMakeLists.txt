@@ -66,6 +66,11 @@ add_executable(test_steam_api unit/test_steam_api.c)
 target_link_libraries(test_steam_api PRIVATE re5_runtime)
 add_test(NAME steam_api COMMAND test_steam_api "${CMAKE_CURRENT_BINARY_DIR}/steam_fixture")
 
+add_executable(test_steam_lan unit/test_steam_lan.c)
+target_link_libraries(test_steam_lan PRIVATE re5_runtime)
+add_test(NAME steam_lan COMMAND test_steam_lan)
+add_test(NAME lan_coop COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_lan_coop.py" "$<TARGET_FILE:test_steam_lan>")
+
 if(NOT WIN32)
     add_executable(test_vfs unit/test_vfs.c)
     target_link_libraries(test_vfs PRIVATE re5_runtime)
