@@ -71,6 +71,7 @@ void        steam_lan_set_lobby_member_data(uint64_t lobby_id, const char *key, 
 int         steam_lan_join_lobby(uint64_t lobby_id, uint64_t call_id);
 void        steam_lan_leave_lobby(uint64_t lobby_id);
 void        steam_lan_set_lobby_joinable(uint64_t lobby_id, int joinable);
+int         steam_lan_get_lobby_member_limit(uint64_t lobby_id);
 
 /* ISteamNetworking005 */
 int         steam_lan_send_p2p(uint64_t remote_id, const void *data, uint32_t len, int send_type, int channel);

@@ -77,6 +77,18 @@ int main(int argc, char **argv)
     CHECK_EQ_U32(vcall(user, 2, 1, &sid), sid);       /* GetSteamID: ponteiro oculto */
     CHECK_EQ_U32(rd32(sid + 4), 0x01100001u);
 
+    /* ISteamUser017 voz e autenticação offline */
+    vcall(user, 7, 0, NULL);                           /* StartVoiceRecording */
+    vcall(user, 8, 0, NULL);                           /* StopVoiceRecording */
+    uint32_t pcbComp = gbuf(4), pcbUncomp = gbuf(4);
+    const uint32_t voice_args[3] = {pcbComp, pcbUncomp, 44100};
+    CHECK_EQ_U32(vcall(user, 9, 3, voice_args), 2);   /* k_EVoiceResultNotRecording */
+    CHECK_EQ_U32(rd32(pcbComp), 0);
+    CHECK_EQ_U32(rd32(pcbUncomp), 0);
+    CHECK_EQ_U32(vcall(user, 12, 0, NULL), 44100);     /* GetVoiceOptimalSampleRate */
+    CHECK_EQ_U32(vcall(user, 18, 0, NULL) & 0xFF, 0);  /* BIsBehindNAT */
+    CHECK_EQ_U32(vcall(user, 23, 0, NULL), 0);         /* GetPlayerSteamLevel */
+
     uint32_t utils = flat("SteamUtils", 0, NULL);
     CHECK_EQ_U32(vcall(utils, 9, 0, NULL), 21690);     /* GetAppID */
 
@@ -157,6 +169,14 @@ int main(int argc, char **argv)
         uint32_t send[6] = {1, 0x01100001u, g_scratch, 4, 2, 0};
         CHECK_EQ_U32(vcall(net, 0, 6, send) & 0xFF, 0); /* SendP2PPacket */
         CHECK_EQ_U32(vcall(net, 9, 5, send), 0);       /* CreateP2PConnectionSocket: inválido */
+    }
+
+    /* ISteamMatchmaking009 */
+    {
+        uint32_t mm = flat("SteamMatchmaking", 0, NULL);
+        CHECK(mm != 0);
+        uint32_t lobby_args[2] = {1, 0x01180000u};
+        CHECK_EQ_U32(vcall(mm, 32, 2, lobby_args), 2); /* GetLobbyMemberLimit padrão = 2 */
     }
     CHECK_DONE();
 }

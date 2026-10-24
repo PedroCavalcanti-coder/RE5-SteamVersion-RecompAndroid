@@ -868,6 +868,24 @@ int steam_lan_get_num_lobby_members(uint64_t lobby_id)
     return n;
 }
 
+int steam_lan_get_lobby_member_limit(uint64_t lobby_id)
+{
+    re5_mutex_lock(&g_mu);
+    int max = RE5_LAN_MAX_LOBBY_MEMBERS;
+    if (g_has_active_lobby && g_active_lobby.lobby_id == lobby_id) {
+        max = g_active_lobby.max_members ? g_active_lobby.max_members : RE5_LAN_MAX_LOBBY_MEMBERS;
+    } else {
+        for (int i = 0; i < g_num_lobbies; i++) {
+            if (g_lobbies[i].lobby_id == lobby_id) {
+                max = g_lobbies[i].max_members ? g_lobbies[i].max_members : RE5_LAN_MAX_LOBBY_MEMBERS;
+                break;
+            }
+        }
+    }
+    re5_mutex_unlock(&g_mu);
+    return max;
+}
+
 uint64_t steam_lan_get_lobby_member_by_index(uint64_t lobby_id, int idx)
 {
     re5_mutex_lock(&g_mu);

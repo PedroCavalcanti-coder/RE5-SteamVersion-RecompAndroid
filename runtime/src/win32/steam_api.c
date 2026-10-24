@@ -307,6 +307,10 @@ static void s_Shutdown(CPU *c)
     steam_lan_shutdown();
 }
 
+static void t_Nothing(CPU *c) { (void)c; }
+static void t_False(CPU *c) { ret_bool(c, 0); }
+static void t_Zero(CPU *c) { c->eax = 0; }
+
 /* ---- ISteamUser017 ---- */
 
 static void u_GetHSteamUser(CPU *c) { c->eax = 1; }
@@ -329,11 +333,90 @@ static void u_GetUserDataFolder(CPU *c)
     ret_bool(c, 1);
 }
 
+static void u_StartVoiceRecording(CPU *c)
+{
+    (void)c;
+}
+
+static void u_StopVoiceRecording(CPU *c)
+{
+    (void)c;
+}
+
+static void u_GetAvailableVoice(CPU *c)
+{
+    uint32_t pcbCompressed = re5_arg(c, 0);
+    uint32_t pcbUncompressed = re5_arg(c, 1);
+    if (pcbCompressed) wr32(pcbCompressed, 0);
+    if (pcbUncompressed) wr32(pcbUncompressed, 0);
+    c->eax = 2; /* k_EVoiceResultNotRecording */
+}
+
+static void u_GetVoice(CPU *c)
+{
+    uint32_t pnWritten = re5_arg(c, 3);
+    uint32_t pnUncompWritten = re5_arg(c, 7);
+    if (pnWritten) wr32(pnWritten, 0);
+    if (pnUncompWritten) wr32(pnUncompWritten, 0);
+    c->eax = 2; /* k_EVoiceResultNotRecording */
+}
+
+static void u_DecompressVoice(CPU *c)
+{
+    uint32_t pnWritten = re5_arg(c, 4);
+    if (pnWritten) wr32(pnWritten, 0);
+    c->eax = 3; /* k_EVoiceResultNoData */
+}
+
+static void u_GetVoiceOptimalSampleRate(CPU *c)
+{
+    c->eax = 44100;
+}
+
+static void u_GetAuthSessionTicket(CPU *c)
+{
+    uint32_t pTicket = re5_arg(c, 0);
+    uint32_t cbMax = re5_arg(c, 1);
+    uint32_t pcbTicket = re5_arg(c, 2);
+    if (pTicket && cbMax >= 4) wr32(pTicket, 0x12345678);
+    if (pcbTicket) wr32(pcbTicket, 4);
+    c->eax = 1; /* HAuthTicket válido */
+}
+
+static void u_BeginAuthSession(CPU *c)
+{
+    c->eax = 0; /* k_EBeginAuthSessionResultOK */
+}
+
+static void u_UserHasLicenseForApp(CPU *c)
+{
+    c->eax = 0; /* k_EUserHasLicenseResultHasLicense */
+}
+
 static const method k_user[] = {
     {0, "GetHSteamUser", u_GetHSteamUser, 0},
     {1, "BLoggedOn", u_BLoggedOn, 0},
     {2, "GetSteamID", u_GetSteamID, 4},
+    {3, "InitiateGameConnection", t_Zero, 28},
+    {4, "TerminateGameConnection", t_Nothing, 8},
+    {5, "TrackAppUsageEvent", t_Nothing, 16},
     {6, "GetUserDataFolder", u_GetUserDataFolder, 8},
+    {7, "StartVoiceRecording", u_StartVoiceRecording, 0},
+    {8, "StopVoiceRecording", u_StopVoiceRecording, 0},
+    {9, "GetAvailableVoice", u_GetAvailableVoice, 12},
+    {10, "GetVoice", u_GetVoice, 36},
+    {11, "DecompressVoice", u_DecompressVoice, 24},
+    {12, "GetVoiceOptimalSampleRate", u_GetVoiceOptimalSampleRate, 0},
+    {13, "GetAuthSessionTicket", u_GetAuthSessionTicket, 12},
+    {14, "BeginAuthSession", u_BeginAuthSession, 16},
+    {15, "EndAuthSession", t_Nothing, 8},
+    {16, "CancelAuthTicket", t_Nothing, 4},
+    {17, "UserHasLicenseForApp", u_UserHasLicenseForApp, 12},
+    {18, "BIsBehindNAT", t_False, 0},
+    {19, "AdvertiseGame", t_Nothing, 16},
+    {20, "RequestEncryptedAppTicket", t_Zero, 8},
+    {21, "GetEncryptedAppTicket", t_False, 12},
+    {22, "GetGameBadgeLevel", t_Zero, 8},
     {23, "GetPlayerSteamLevel", u_GetPlayerSteamLevel, 0},
     {0, NULL, NULL, 0},
 };
@@ -355,9 +438,6 @@ static void t_GetIPCountry(CPU *c)
 
 static void t_GetCurrentBatteryPower(CPU *c) { c->eax = 255; }   /* ligado na tomada */
 static void t_GetAppID(CPU *c) { c->eax = APP_ID; }
-static void t_Nothing(CPU *c) { (void)c; }
-static void t_False(CPU *c) { ret_bool(c, 0); }
-static void t_Zero(CPU *c) { c->eax = 0; }
 
 /* Toda SteamAPICall_t que o runtime cria já nasce concluída. */
 static void t_IsAPICallCompleted(CPU *c)
@@ -576,8 +656,10 @@ static const method k_friends[] = {
     {0, "GetPersonaName", f_GetPersonaName, 0},
     {2, "GetPersonaState", f_GetPersonaState, 0},
     {3, "GetFriendCount", t_Zero, 4},
+    {4, "GetFriendByIndex", t_Nothing, 12},
     {7, "GetFriendPersonaName", f_GetFriendPersonaName, 8},
     {22, "ActivateGameOverlay", t_Nothing, 4},
+    {23, "ActivateGameOverlayToUser", t_Nothing, 12},
     {37, "SetRichPresence", a_True, 8},
     {38, "ClearRichPresence", t_Nothing, 0},
     {0, NULL, NULL, 0},
@@ -877,6 +959,12 @@ static void m_GetLobbyOwner(CPU *c)
     ret_steamid(c, (uint32_t)owner, (uint32_t)(owner >> 32));
 }
 
+static void m_GetLobbyMemberLimit(CPU *c)
+{
+    uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
+    c->eax = (uint32_t)steam_lan_get_lobby_member_limit(id);
+}
+
 static const method k_matchmaking[] = {
     {0, "GetFavoriteGameCount", t_Zero, 0},
     {4, "RequestLobbyList", m_RequestLobbyList, 0},
@@ -886,6 +974,7 @@ static const method k_matchmaking[] = {
     {8, "AddRequestLobbyListFilterSlotsAvailable", t_Nothing, 4},
     {9, "AddRequestLobbyListDistanceFilter", t_Nothing, 4},
     {10, "AddRequestLobbyListResultCountFilter", t_Nothing, 4},
+    {11, "AddRequestLobbyListCompatibleMembersFilter", t_Nothing, 8},
     {12, "GetLobbyByIndex", m_GetLobbyByIndex, 8},
     {13, "CreateLobby", m_CreateLobby, 8},
     {14, "JoinLobby", m_JoinLobby, 8},
@@ -895,9 +984,14 @@ static const method k_matchmaking[] = {
     {18, "GetLobbyMemberByIndex", m_GetLobbyMemberByIndex, 16},
     {19, "GetLobbyData", m_GetLobbyData, 12},
     {20, "SetLobbyData", m_SetLobbyData, 16},
+    {21, "GetLobbyDataCount", t_Zero, 8},
     {24, "GetLobbyMemberData", m_GetLobbyMemberData, 20},
     {25, "SetLobbyMemberData", m_SetLobbyMemberData, 16},
+    {26, "SendLobbyChatMsg", a_True, 16},
     {28, "RequestLobbyData", a_True, 8},
+    {31, "SetLobbyMemberLimit", a_True, 12},
+    {32, "GetLobbyMemberLimit", m_GetLobbyMemberLimit, 8},
+    {33, "SetLobbyType", a_True, 12},
     {34, "SetLobbyJoinable", m_SetLobbyJoinable, 12},
     {35, "GetLobbyOwner", m_GetLobbyOwner, 12},
     {0, NULL, NULL, 0},
