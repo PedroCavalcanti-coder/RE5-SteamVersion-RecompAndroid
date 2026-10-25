@@ -227,5 +227,40 @@ int main(void)
     re5_user32_dik_state(dik);
     CHECK_EQ_U32(dik[0xD0], 0);
 
+    /* Cursos e Mouse: LoadCursorA (101, 102, 104), SetCursor, ShowCursor, ClipCursor, GetCursorPos */
+    uint32_t c101 = call("LoadCursorA", 2, 0x00400000u, 101u);
+    uint32_t c102 = call("LoadCursorA", 2, 0x00400000u, 102u);
+    uint32_t c104 = call("LoadCursorA", 2, 0x00400000u, 104u);
+    CHECK_EQ_U32(c101, 0x1D000065u);
+    CHECK_EQ_U32(c102, 0x1D000066u);
+    CHECK_EQ_U32(c104, 0x1D000068u);
+
+    /* SetCursor troca e devolve o anterior */
+    uint32_t prev_cur = call("SetCursor", 1, c101);
+    CHECK(prev_cur != 0);
+    CHECK_EQ_U32(call("SetCursor", 1, c102), c101);
+    CHECK_EQ_U32(call("SetCursor", 1, c104), c102);
+
+    /* ShowCursor incrementa/decrementa contador */
+    int32_t sc = (int32_t)call("ShowCursor", 1, 0u);   /* decrementa */
+    CHECK(sc < 0);
+    sc = (int32_t)call("ShowCursor", 1, 1u);          /* incrementa */
+    CHECK(sc >= 0);
+
+    /* SetCursorPos e GetCursorPos */
+    call("SetCursorPos", 2, 250u, 150u);
+    uint32_t pt_cur = gbuf(8);
+    CHECK_EQ_U32(call("GetCursorPos", 1, pt_cur), 1);
+    CHECK_EQ_U32(rd32(pt_cur), 250);
+    CHECK_EQ_U32(rd32(pt_cur + 4), 150);
+
+    /* ClipCursor: NULL solta, rect prende */
+    CHECK_EQ_U32(call("ClipCursor", 1, 0u), 1);
+    uint32_t clip_rc = gbuf(16);
+    wr32(clip_rc + 8, 100);
+    wr32(clip_rc + 12, 100);
+    CHECK_EQ_U32(call("ClipCursor", 1, clip_rc), 1);
+    CHECK_EQ_U32(call("ClipCursor", 1, 0u), 1);
+
     CHECK_DONE();
 }
