@@ -442,8 +442,10 @@ static void d_CreateDevice(CPU *c)
              (unsigned)pp.MultiSampleType, pp.EnableAutoDepthStencil ? "sim" : "não",
              (unsigned)pp.AutoDepthStencilFormat, pp.PresentationInterval, (uint32_t)hr);
     d9_out(out, SUCCEEDED(hr), dev, D9K_DEVICE);
-    if (SUCCEEDED(hr) && force_windowed()) re5_user32_set_fullscreen(rd32(ppva + PP_HWND) ? rd32(ppva + PP_HWND) : focus,
-                                                                   !rd32(ppva + 32));
+    uint32_t target_hwnd = rd32(ppva + PP_HWND) ? rd32(ppva + PP_HWND) : focus;
+    if (SUCCEEDED(hr) && force_windowed() && target_hwnd) {
+        re5_user32_set_fullscreen(target_hwnd, !rd32(ppva + 32), pp.BackBufferWidth, pp.BackBufferHeight);
+    }
     if (SUCCEEDED(hr)) {
         d9_obj *o = obj_of(rd32(out));
         o->focus_hwnd = focus;
@@ -487,7 +489,11 @@ static void d_Reset(CPU *c)
     HRESULT hr = dev->lpVtbl->Reset(dev, &pp);
     re5_d3d9_pp_to_guest(&pp, ppva);
     /* Tela cheia do guest = janela sem bordas do tamanho do monitor no host. */
-    if (SUCCEEDED(hr) && force_windowed() && rd32(ppva + PP_HWND)) re5_user32_set_fullscreen(rd32(ppva + PP_HWND), !rd32(ppva + 32));
+    d9_obj *o = self_obj(c, D9K_DEVICE);
+    uint32_t target_hwnd = rd32(ppva + PP_HWND) ? rd32(ppva + PP_HWND) : (o ? o->focus_hwnd : 0);
+    if (SUCCEEDED(hr) && force_windowed() && target_hwnd) {
+        re5_user32_set_fullscreen(target_hwnd, !rd32(ppva + 32), pp.BackBufferWidth, pp.BackBufferHeight);
+    }
     RE5_INFO("d3d9", "Reset: %ux%u formato %u, %s -> 0x%08X", pp.BackBufferWidth, pp.BackBufferHeight,
              (unsigned)pp.BackBufferFormat,
              rd32(ppva + 32) ? "janela" : force_windowed() ? "tela cheia (no host: janela)" : "tela cheia",

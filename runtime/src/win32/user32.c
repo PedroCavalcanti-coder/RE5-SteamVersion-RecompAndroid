@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_syswm.h>
 
 #include "re5/coldebug.h"
 #include "re5/runtime.h"
@@ -430,11 +431,29 @@ static void update_clip_grab(void);
 static int cursor_hidden(void);
 static void free_cursors(void);
 
+static volatile uint32_t g_fs_hwnd;
+static volatile int g_fs_want = -1, g_mouse_excl, g_rel_on;
+static int g_fs_active = 0;
+static uint32_t g_render_w = 0, g_render_h = 0;
+
+#if defined(RE5_HOST_WINDOWS)
+static HWND host_hwnd_from_sdl(SDL_Window *window)
+{
+    if (!window) return NULL;
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (SDL_GetWindowWMInfo(window, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS) {
+        return wm.info.win.window;
+    }
+    return NULL;
+}
+#endif
+
 static uint32_t pack16(int32_t lo, int32_t hi) { return ((uint32_t)(hi & 0xFFFF) << 16) | (uint32_t)(lo & 0xFFFF); }
 
 static void sync_sdl_geometry(window *w)
 {
-    if (!w->sdl) return;
+    if (!w->sdl || g_fs_active) return;
     int32_t cw, ch, ox, oy;
     client_size(w, &cw, &ch);
     client_origin(w, &ox, &oy);
@@ -823,7 +842,7 @@ static void u_SetWindowLongA(CPU *c)
     }
     c->eax = *field;
     *field = val;
-    if (idx == U32_GWL_STYLE && w->sdl) {
+    if (idx == U32_GWL_STYLE && w->sdl && !g_fs_active) {
         SDL_SetWindowBordered(w->sdl, (val & U32_WS_CAPTION) == U32_WS_CAPTION ? SDL_TRUE : SDL_FALSE);
         sync_sdl_geometry(w);
     }
@@ -1028,8 +1047,32 @@ static void on_window_event(const SDL_WindowEvent *e, window *w)
         RE5_INFO("user32", "janela 0x%X: o host pediu para fechar (SDL_WINDOWEVENT_CLOSE)", w->hwnd);
         send_msg(w, U32_WM_SYSCOMMAND, U32_SC_CLOSE, 0);
         break;
-    case SDL_WINDOWEVENT_FOCUS_GAINED: if (g_active != w->hwnd) activate(w, 1); break;
-    case SDL_WINDOWEVENT_FOCUS_LOST: if (g_active == w->hwnd) activate(w, 0); break;
+    case SDL_WINDOWEVENT_FOCUS_GAINED:
+        if (g_fs_active && w->sdl) {
+            SDL_SetWindowAlwaysOnTop(w->sdl, SDL_TRUE);
+#if defined(RE5_HOST_WINDOWS)
+            HWND h = host_hwnd_from_sdl(w->sdl);
+            if (h) {
+                SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                BringWindowToTop(h);
+                SetForegroundWindow(h);
+            }
+#endif
+        }
+        if (g_active != w->hwnd) activate(w, 1);
+        break;
+    case SDL_WINDOWEVENT_FOCUS_LOST:
+        if (g_fs_active && w->sdl) {
+            SDL_SetWindowAlwaysOnTop(w->sdl, SDL_FALSE);
+#if defined(RE5_HOST_WINDOWS)
+            HWND h = host_hwnd_from_sdl(w->sdl);
+            if (h) {
+                SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+#endif
+        }
+        if (g_active == w->hwnd) activate(w, 0);
+        break;
     case SDL_WINDOWEVENT_MOVED:
         frame_of(w->style, w->menu != 0, f);
         w->x = e->data1 - f[0];
@@ -1075,7 +1118,16 @@ void re5_user32_handle_event(const SDL_Event *e)
             client_origin(w, &ox, &oy);
             g_cursor_x = ox + ev.motion.x;
             g_cursor_y = oy + ev.motion.y;
-            post_msg(w->hwnd, U32_WM_MOUSEMOVE, mouse_keys(), pack16(ev.motion.x, ev.motion.y));
+            int32_t mx = ev.motion.x, my = ev.motion.y;
+            if (g_fs_active && g_render_w > 0 && g_render_h > 0 && w->sdl) {
+                int win_w = 0, win_h = 0;
+                SDL_GetWindowSize(w->sdl, &win_w, &win_h);
+                if (win_w > 0 && win_h > 0) {
+                    mx = (int32_t)((int64_t)mx * g_render_w / win_w);
+                    my = (int32_t)((int64_t)my * g_render_h / win_h);
+                }
+            }
+            post_msg(w->hwnd, U32_WM_MOUSEMOVE, mouse_keys(), pack16(mx, my));
         }
         break;
     case SDL_MOUSEBUTTONDOWN:
@@ -1086,14 +1138,34 @@ void re5_user32_handle_event(const SDL_Event *e)
                          : ev.button.button == SDL_BUTTON_RIGHT ? (down ? U32_WM_RBUTTONDOWN : U32_WM_RBUTTONUP)
                          : ev.button.button == SDL_BUTTON_MIDDLE ? (down ? U32_WM_MBUTTONDOWN : U32_WM_MBUTTONUP)
                          : 0;
-            if (msg) post_msg(w->hwnd, msg, mouse_keys(), pack16(ev.button.x, ev.button.y));
+            int32_t bx = ev.button.x, by = ev.button.y;
+            if (g_fs_active && g_render_w > 0 && g_render_h > 0 && w->sdl) {
+                int win_w = 0, win_h = 0;
+                SDL_GetWindowSize(w->sdl, &win_w, &win_h);
+                if (win_w > 0 && win_h > 0) {
+                    bx = (int32_t)((int64_t)bx * g_render_w / win_w);
+                    by = (int32_t)((int64_t)by * g_render_h / win_h);
+                }
+            }
+            if (msg) post_msg(w->hwnd, msg, mouse_keys(), pack16(bx, by));
         }
         break;
     case SDL_MOUSEWHEEL:
         g_mouse_dz += (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev.wheel.y : ev.wheel.y) * 120;
-        if ((w = find_sdl(ev.wheel.windowID)) != NULL)
+        if ((w = find_sdl(ev.wheel.windowID)) != NULL) {
+            int32_t wx = g_cursor_x, wy = g_cursor_y;
+            if (g_fs_active && g_render_w > 0 && g_render_h > 0 && w->sdl) {
+                int win_x = 0, win_y = 0, win_w = 0, win_h = 0;
+                SDL_GetWindowPosition(w->sdl, &win_x, &win_y);
+                SDL_GetWindowSize(w->sdl, &win_w, &win_h);
+                if (win_w > 0 && win_h > 0) {
+                    wx = (int32_t)((int64_t)(wx - win_x) * g_render_w / win_w);
+                    wy = (int32_t)((int64_t)(wy - win_y) * g_render_h / win_h);
+                }
+            }
             post_msg(w->hwnd, U32_WM_MOUSEWHEEL, mouse_keys() | (uint32_t)(ev.wheel.y * 120) << 16,
-                     pack16(g_cursor_x, g_cursor_y));   /* WM_MOUSEWHEEL leva coordenadas de tela */
+                     pack16(wx, wy));   /* WM_MOUSEWHEEL leva coordenadas */
+        }
         break;
     case SDL_WINDOWEVENT:
         on_window_event(&ev.window, find_sdl(ev.window.windowID));
@@ -1106,13 +1178,13 @@ void re5_user32_handle_event(const SDL_Event *e)
 /* ---- tela cheia sem bordas e mouse relativo ----
  * Pedidos de qualquer thread; aplicados por quem bombeia a fila (a thread dona
  * da janela), porque mudar a janela de outra thread pode travar no Windows. */
-static volatile uint32_t g_fs_hwnd;
-static volatile int g_fs_want = -1, g_mouse_excl, g_rel_on;
-
-void re5_user32_set_fullscreen(uint32_t hwnd, int on)
+void re5_user32_set_fullscreen(uint32_t hwnd, int on, uint32_t render_w, uint32_t render_h)
 {
     g_fs_hwnd = hwnd;
     g_fs_want = on != 0;
+    if (render_w > 0) g_render_w = render_w;
+    if (render_h > 0) g_render_h = render_h;
+    if (!g_sdl_ready) g_fs_active = on != 0;
 }
 
 void re5_user32_set_mouse_exclusive(int on) { g_mouse_excl = on != 0; }
@@ -1125,9 +1197,39 @@ static void apply_display_requests(void)
     if (fs >= 0) {
         g_fs_want = -1;
         window *w = find_window(g_fs_hwnd);
+        if (!w) {
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                if (g_windows[i].used && g_windows[i].sdl) { w = &g_windows[i]; break; }
+            }
+        }
         if (w && w->sdl) {
-            SDL_SetWindowFullscreen(w->sdl, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-            RE5_INFO("user32", "janela 0x%X: %s", w->hwnd, fs ? "tela cheia sem bordas" : "janela");
+            g_fs_active = fs != 0;
+            if (fs) {
+                SDL_SetWindowAlwaysOnTop(w->sdl, SDL_TRUE);
+                SDL_SetWindowFullscreen(w->sdl, SDL_WINDOW_FULLSCREEN_DESKTOP);
+                SDL_RaiseWindow(w->sdl);
+#if defined(RE5_HOST_WINDOWS)
+                HWND h = host_hwnd_from_sdl(w->sdl);
+                if (h) {
+                    SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                    BringWindowToTop(h);
+                    SetForegroundWindow(h);
+                }
+#endif
+            } else {
+                SDL_SetWindowFullscreen(w->sdl, 0);
+                SDL_SetWindowAlwaysOnTop(w->sdl, SDL_FALSE);
+#if defined(RE5_HOST_WINDOWS)
+                HWND h = host_hwnd_from_sdl(w->sdl);
+                if (h) {
+                    SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                }
+#endif
+                SDL_SetWindowBordered(w->sdl, (w->style & U32_WS_CAPTION) == U32_WS_CAPTION ? SDL_TRUE : SDL_FALSE);
+                sync_sdl_geometry(w);
+            }
+            RE5_INFO("user32", "janela 0x%X: %s (render %ux%u)", w->hwnd,
+                     fs ? "tela cheia sem bordas" : "janela", g_render_w, g_render_h);
         }
     }
     int rel = g_active && (g_mouse_excl || cursor_hidden());
@@ -1492,6 +1594,32 @@ static void u_GetCursorPos(CPU *c)
     if (g_sdl_ready && !g_rel_on) {
         SDL_GetGlobalMouseState(&x, &y);
     }
+    if (g_fs_active && g_render_w > 0 && g_render_h > 0) {
+        window *w = find_window(g_active);
+        if (!w) {
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                if (g_windows[i].used && (g_windows[i].sdl || !g_sdl_ready)) { w = &g_windows[i]; break; }
+            }
+        }
+        if (w) {
+            int win_x = 0, win_y = 0, win_w = 0, win_h = 0;
+            if (w->sdl) {
+                SDL_GetWindowPosition(w->sdl, &win_x, &win_y);
+                SDL_GetWindowSize(w->sdl, &win_w, &win_h);
+            } else {
+                win_x = w->x;
+                win_y = w->y;
+                win_w = w->w;
+                win_h = w->h;
+            }
+            if (win_w > 0 && win_h > 0) {
+                int32_t cx = x - win_x;
+                int32_t cy = y - win_y;
+                x = (int32_t)((int64_t)cx * g_render_w / win_w);
+                y = (int32_t)((int64_t)cy * g_render_h / win_h);
+            }
+        }
+    }
     wr32(pt, (uint32_t)x);
     wr32(pt + 4, (uint32_t)y);
     c->eax = 1;
@@ -1499,18 +1627,43 @@ static void u_GetCursorPos(CPU *c)
 
 static void u_SetCursorPos(CPU *c)
 {
-    g_cursor_x = (int32_t)re5_arg(c, 0);
-    g_cursor_y = (int32_t)re5_arg(c, 1);
+    int32_t x = (int32_t)re5_arg(c, 0);
+    int32_t y = (int32_t)re5_arg(c, 1);
     window *w = find_window(g_active);
     if (!w) {
         for (int i = 0; i < MAX_WINDOWS; i++) {
-            if (g_windows[i].used && g_windows[i].sdl) { w = &g_windows[i]; break; }
+            if (g_windows[i].used && (g_windows[i].sdl || !g_sdl_ready)) { w = &g_windows[i]; break; }
         }
     }
-    if (w && w->sdl) {
-        int32_t ox, oy;
-        client_origin(w, &ox, &oy);
-        SDL_WarpMouseInWindow(w->sdl, g_cursor_x - ox, g_cursor_y - oy);
+    if (g_fs_active && g_render_w > 0 && g_render_h > 0 && w) {
+        int win_x = 0, win_y = 0, win_w = 0, win_h = 0;
+        if (w->sdl) {
+            SDL_GetWindowPosition(w->sdl, &win_x, &win_y);
+            SDL_GetWindowSize(w->sdl, &win_w, &win_h);
+        } else {
+            win_x = w->x;
+            win_y = w->y;
+            win_w = w->w;
+            win_h = w->h;
+        }
+        if (win_w > 0 && win_h > 0) {
+            int32_t wx = (int32_t)((int64_t)x * win_w / g_render_w);
+            int32_t wy = (int32_t)((int64_t)y * win_h / g_render_h);
+            g_cursor_x = win_x + wx;
+            g_cursor_y = win_y + wy;
+            if (w->sdl) SDL_WarpMouseInWindow(w->sdl, wx, wy);
+        } else {
+            g_cursor_x = x;
+            g_cursor_y = y;
+        }
+    } else {
+        g_cursor_x = x;
+        g_cursor_y = y;
+        if (w && w->sdl) {
+            int32_t ox, oy;
+            client_origin(w, &ox, &oy);
+            SDL_WarpMouseInWindow(w->sdl, x - ox, y - oy);
+        }
     }
     c->eax = 1;
 }

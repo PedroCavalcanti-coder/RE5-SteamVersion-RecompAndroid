@@ -254,6 +254,18 @@ int main(void)
     CHECK_EQ_U32(rd32(pt_cur), 250);
     CHECK_EQ_U32(rd32(pt_cur + 4), 150);
 
+    /* Teste de tela cheia e escala de cursor (ex: monitor 1920x1080 com render 1280x720) */
+    uint32_t hwnd_fs = call("CreateWindowExA", 12, 0u, cls, gstr("RE5 FS"), 0x80880000u, 0u, 0u,
+                            1920u, 1080u, 0u, 0u, 0x00400000u, 0u);
+    CHECK(hwnd_fs != 0);
+    re5_user32_set_fullscreen(hwnd_fs, 1, 1280u, 720u);
+    call("SetCursorPos", 2, 640u, 360u); /* ponto central do render */
+    CHECK_EQ_U32(call("GetCursorPos", 1, pt_cur), 1);
+    CHECK_EQ_U32(rd32(pt_cur), 640);
+    CHECK_EQ_U32(rd32(pt_cur + 4), 360);
+    re5_user32_set_fullscreen(hwnd_fs, 0, 1280u, 720u);
+    call("DestroyWindow", 1, hwnd_fs);
+
     /* ClipCursor: NULL solta, rect prende */
     CHECK_EQ_U32(call("ClipCursor", 1, 0u), 1);
     uint32_t clip_rc = gbuf(16);

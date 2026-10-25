@@ -38,8 +38,9 @@ void re5_user32_post(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lpar
 
 /* Tela cheia do guest apresentada como janela sem bordas do tamanho do monitor
  * (SDL_WINDOW_FULLSCREEN_DESKTOP; o modo do monitor não muda). O d3d9 pede no
- * CreateDevice/Reset; a thread dona da janela aplica no próximo bombeamento. */
-void re5_user32_set_fullscreen(uint32_t hwnd, int on);
+ * CreateDevice/Reset com as dimensões lógicas do backbuffer; a thread dona da
+ * janela aplica no próximo bombeamento. */
+void re5_user32_set_fullscreen(uint32_t hwnd, int on, uint32_t render_w, uint32_t render_h);
 /* Mouse exclusivo do DirectInput adquirido (1) ou solto (0): com ele, ou com o
  * cursor escondido pelo jogo, o mouse do host fica em modo relativo (movimento
  * sem o limite da borda da tela). */
