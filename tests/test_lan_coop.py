@@ -21,6 +21,8 @@ def main():
     env_host['RE5_LAN_PORT'] = '27020'
     env_host['RE5_STEAM_ID'] = '101'
     env_host['RE5_LAN_DISCOVERY_PORT'] = '27015'
+    # A cliente some sem sair da sala; o host tem que notar em 1,5 s (padrão 15 s).
+    env_host['RE5_LAN_TIMEOUT_MS'] = '1500'
 
     env_client = os.environ.copy()
     env_client['RE5_PLAYER_NAME'] = 'Sheva'
@@ -35,8 +37,8 @@ def main():
     print("Iniciando Cliente 'Sheva'...")
     p_client = subprocess.Popen([exe_path, '--client'], env=env_client, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    out_client, err_client = p_client.communicate(timeout=10)
-    out_host, err_host = p_host.communicate(timeout=10)
+    out_client, err_client = p_client.communicate(timeout=20)
+    out_host, err_host = p_host.communicate(timeout=20)
 
     print("--- HOST STDOUT ---")
     print(out_host.decode('latin1', errors='ignore'))

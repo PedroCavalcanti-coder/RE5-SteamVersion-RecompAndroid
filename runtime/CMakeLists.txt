@@ -59,6 +59,7 @@ add_library(re5_runtime STATIC
     src/win32/advapi32.c
     src/win32/avifil32.c
     src/win32/coldebug.c
+    src/win32/lan_menu.c
     src/win32/d3d9.c
     src/win32/dinput8.c
     src/win32/dsound.c

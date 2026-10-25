@@ -47,6 +47,8 @@ typedef enum {
     RE5_LAN_EVT_LOBBY_CHAT_UPDATE,
     RE5_LAN_EVT_LOBBY_DATA_UPDATE,
     RE5_LAN_EVT_P2P_SESSION_REQUEST,
+    RE5_LAN_EVT_P2P_SESSION_FAIL,      /* param1 = EP2PSessionError */
+    RE5_LAN_EVT_PERSONA_CHANGE,        /* param1 = EPersonaChange */
 } re5_lan_event_type;
 
 typedef struct {
@@ -100,6 +102,35 @@ int         steam_lan_read_p2p(void *dest, uint32_t dest_len, uint32_t *msg_size
 int         steam_lan_accept_p2p(uint64_t remote_id);
 int         steam_lan_close_p2p(uint64_t remote_id);
 int         steam_lan_get_p2p_state(uint64_t remote_id, void *out_state);
+
+/* Perfil editável no jogo (menu LAN, lan_menu.c). Grava no arquivo de identidade,
+ * avisa os membros da sala e gera PersonaStateChange_t. 0 = nome vazio ou país inválido. */
+void        steam_lan_get_local_country(char out[4]);
+int         steam_lan_set_profile(const char *name, const char *country);
+/* IPs de hosts para procurar direto ("1.2.3.4,5.6.7.8"); devolve quantos valeram. */
+int         steam_lan_set_manual_hosts(const char *list);
+void        steam_lan_get_manual_hosts(char *out, size_t cap);
+
+typedef struct {
+    uint64_t steam_id;
+    char     name[RE5_LAN_MAX_NAME_LEN + 1];
+    char     country[4];
+    int32_t  rtt_ms;        /* -1: sem medida ainda */
+    uint32_t silent_ms;     /* desde o último pacote dele */
+    int      is_owner, is_local;
+} re5_lan_member_info;
+
+typedef struct {
+    uint64_t            local_id;
+    char                local_ip[16];
+    uint16_t            p2p_port;
+    int                 lobbies_seen;
+    int                 joining, in_lobby, is_host;
+    int                 member_count, max_members;
+    re5_lan_member_info members[RE5_LAN_MAX_LOBBY_MEMBERS];
+} re5_lan_status;
+
+void        steam_lan_get_status(re5_lan_status *st);
 
 /* Consumo de eventos na thread principal para disparo de callbacks */
 int         steam_lan_pop_event(re5_lan_event *evt);

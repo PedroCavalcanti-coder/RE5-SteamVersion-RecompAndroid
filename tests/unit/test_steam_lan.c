@@ -74,7 +74,9 @@ static const char *friend_name(uint64_t id)
     return re5_gstr(vcall(friends, 7, 2, a));
 }
 
-static uint32_t g_created_calls, g_enter_calls, g_chat_calls, g_data_calls, g_p2p_req_calls;
+static uint32_t g_created_calls, g_enter_calls, g_chat_calls, g_data_calls, g_p2p_req_calls, g_persona_calls, g_fail_calls;
+static uint64_t g_last_persona_user, g_last_fail_user;
+static uint32_t g_last_fail_err;
 static uint64_t g_last_lobby_created, g_last_enter_lobby;
 static uint32_t g_last_enter_resp;
 static uint64_t g_last_chat_user;
@@ -120,6 +122,24 @@ static void cb_p2p_req_run(CPU *c)
     g_last_p2p_req_user = (uint64_t)rd32(p + 4) << 32 | rd32(p);
 }
 
+/* PersonaStateChange_t: CSteamID +0, flags +8. */
+static void cb_persona_run(CPU *c)
+{
+    g_persona_calls++;
+    uint32_t p = re5_arg(c, 0);
+    g_last_persona_user = (uint64_t)rd32(p + 4) << 32 | rd32(p);
+    CHECK_EQ_U32(rd32(p + 8) & 1u, 1u); /* k_EPersonaChangeName */
+}
+
+/* P2PSessionConnectFail_t: CSteamID +0, erro (uint8) +8. */
+static void cb_fail_run(CPU *c)
+{
+    g_fail_calls++;
+    uint32_t p = re5_arg(c, 0);
+    g_last_fail_user = (uint64_t)rd32(p + 4) << 32 | rd32(p);
+    g_last_fail_err = rd8(p + 8);
+}
+
 static void cb_dummy(CPU *c) { (void)c; }
 
 static uint32_t register_cb(const char *name, re5_host_fn run, int id)
@@ -145,6 +165,8 @@ static void register_all(void)
     register_cb("Chat", cb_chat_run, 506);
     register_cb("Data", cb_data_run, 505);
     register_cb("P2PReq", cb_p2p_req_run, 1202);
+    register_cb("Persona", cb_persona_run, 304);
+    register_cb("P2PFail", cb_fail_run, 1203);
 }
 
 static int run_host_mode(void)
@@ -227,7 +249,43 @@ static int run_host_mode(void)
     const uint32_t s_args[6] = {(uint32_t)client_id, (uint32_t)(client_id >> 32), send_buf, (uint32_t)strlen(resp) + 1, 0, 0x389};
     CHECK_EQ_U32(vcall(net, 0, 6, s_args) & 0xFF, 1);
 
-    SDL_Delay(50);
+    /* Sheva troca nome e bandeira no menu LAN no meio da sala: o host recebe
+     * PersonaStateChange_t e passa a vê-la com o nome novo e o mesmo ID. */
+    for (int t = 0; t < 500 && !g_persona_calls; t++) {
+        SDL_Delay(10);
+        flat("SteamAPI_RunCallbacks", 0, NULL);
+    }
+    CHECK_EQ_U32(g_persona_calls, 1);
+    CHECK(g_last_persona_user == client_id);
+    CHECK(strcmp(friend_name(client_id), "Sheva Alomar #102") == 0);
+
+    /* Ping medido pelos keepalives e país dela no estado da sala. */
+    re5_lan_status st;
+    for (int t = 0; t < 300; t++) {
+        steam_lan_get_status(&st);
+        if (st.member_count == 2 && st.members[1].rtt_ms >= 0) break;
+        SDL_Delay(10);
+    }
+    CHECK(st.in_lobby && st.is_host);
+    CHECK_EQ_U32(st.member_count, 2);
+    CHECK(st.members[1].rtt_ms >= 0 && st.members[1].rtt_ms < 1000);
+    CHECK(strcmp(st.members[1].country, "ZA") == 0);
+    CHECK(strcmp(st.members[1].name, "Sheva Alomar") == 0);
+
+    /* Ela some sem sair da sala (app fechado, Wi-Fi caiu): depois do prazo, o jogo
+     * do host recebe "desconectou" e a falha da sessão P2P, como na Steam. */
+    for (int t = 0; t < 800 && !g_fail_calls; t++) {
+        SDL_Delay(10);
+        flat("SteamAPI_RunCallbacks", 0, NULL);
+    }
+    CHECK_EQ_U32(g_fail_calls, 1);
+    CHECK(g_last_fail_user == client_id);
+    CHECK_EQ_U32(g_last_fail_err, 4); /* k_EP2PSessionErrorTimeout */
+    CHECK_EQ_U32(g_chat_calls, 2);
+    CHECK(g_last_chat_user == client_id);
+    CHECK_EQ_U32(g_last_chat_state, 0x04); /* k_EChatMemberStateChangeDisconnected */
+    CHECK_EQ_U32(vcall(match, 17, 2, lobby_args), 1);
+
     vcall(match, 15, 2, lobby_args);
     flat("SteamAPI_Shutdown", 0, NULL);
     re5_thread_detach();
@@ -320,10 +378,19 @@ static int run_client_mode(void)
     }
     CHECK(got_resp);
 
-    SDL_Delay(20);
-    vcall(match, 15, 2, join_args);
-    flat("SteamAPI_Shutdown", 0, NULL);
-    re5_thread_detach();
+    CHECK(steam_lan_set_profile("Sheva Alomar", "za"));
+    flat("SteamAPI_RunCallbacks", 0, NULL);
+    CHECK_EQ_U32(g_persona_calls, 1); /* o próprio jogo também é avisado */
+    CHECK(g_last_persona_user == steam_lan_get_local_steam_id());
+    CHECK(strcmp(friend_name(steam_lan_get_local_steam_id()), "Sheva Alomar #102") == 0);
+
+    /* Fica na sala o bastante para o host medir o ping e então some sem LeaveLobby
+     * nem Shutdown: é o app do celular fechado à força. */
+    for (int t = 0; t < 250; t++) {
+        SDL_Delay(10);
+        flat("SteamAPI_RunCallbacks", 0, NULL);
+    }
+    CHECK_EQ_U32(g_fail_calls, 0);
     CHECK_DONE();
 }
 
@@ -351,6 +418,7 @@ static int run_identity_mode(const char *path)
     snprintf(want, sizeof want, "\nid=%u\n", (uint32_t)id - slot);
     CHECK(strstr(text, want) != NULL);
     CHECK(strstr(text, "\nnome=Jogador\n") != NULL);
+    CHECK(strstr(text, "\npais=BR\n") != NULL);   /* da localidade (LANG=pt_BR.UTF-8 no CTest) */
 
     char display[64];
     snprintf(display, sizeof display, "Jogador #%u", (uint32_t)id);
@@ -377,6 +445,7 @@ typedef struct {
     uint16_t member_count, max_members;
     char     owner_name[32];
     uint16_t data_count;
+    char     owner_country[4];
 } fake_beacon;
 typedef struct {
     uint64_t lobby_id;
@@ -418,6 +487,7 @@ static void fake_host_join(uint32_t match)
     b->member_count = 1;
     b->max_members = 2;
     snprintf(b->owner_name, sizeof b->owner_name, "Josh");
+    memcpy(b->owner_country, "ZA", 2);
     sendto(s, (const char *)buf, sizeof *h + sizeof *b, 0, (struct sockaddr *)&client, sizeof client);
 
     uint64_t lobby = 0;
@@ -489,7 +559,7 @@ int main(int argc, char **argv)
         FILE *f = fopen(argv[1], "w");
         CHECK(f != NULL);
         if (f) {
-            fputs("# comentario\nnome =  Leon#Kennedy  \nid=424242\n", f);
+            fputs("# comentario\nnome =  Leon#Kennedy  \nid=424242\npais= pt\nhosts=10.0.0.9\n", f);
             fclose(f);
         }
     }
@@ -504,6 +574,35 @@ int main(int argc, char **argv)
     if (argc > 1) {
         CHECK_EQ_U32((uint32_t)my_id, 424242u + slot);
         CHECK(strcmp(steam_lan_get_local_name(), "Leon_Kennedy") == 0);
+        char cc[4];
+        steam_lan_get_local_country(cc);
+        CHECK(strcmp(cc, "PT") == 0);
+        /* A bandeira que o jogo mostra: ISteamUtils007::GetIPCountry (slot 4). */
+        uint32_t utils = flat("SteamUtils", 0, NULL);
+        CHECK(strcmp(re5_gstr(vcall(utils, 4, 0, NULL)), "PT") == 0);
+        char hosts[64];
+        steam_lan_get_manual_hosts(hosts, sizeof hosts);
+        CHECK(strcmp(hosts, "10.0.0.9") == 0);
+
+        /* IPs digitados: os inválidos ficam de fora; tudo volta ao arquivo. */
+        CHECK_EQ_U32(steam_lan_set_manual_hosts("192.168.43.1, 999.1.1.1 ,abc,10.0.0.5"), 2);
+        steam_lan_get_manual_hosts(hosts, sizeof hosts);
+        CHECK(strcmp(hosts, "192.168.43.1,10.0.0.5") == 0);
+        CHECK(!steam_lan_set_profile("", "BR"));     /* nome vazio */
+        CHECK(!steam_lan_set_profile("Leon", "B1"));  /* país inválido */
+        CHECK(steam_lan_set_profile("Leon S. Kennedy", "us"));
+        CHECK(strcmp(re5_gstr(vcall(utils, 4, 0, NULL)), "US") == 0);
+        FILE *rf = fopen(argv[1], "r");
+        char text[1024] = "";
+        if (rf) {
+            text[fread(text, 1, sizeof text - 1, rf)] = 0;
+            fclose(rf);
+        }
+        CHECK(strstr(text, "\nnome=Leon S. Kennedy\n") != NULL);
+        CHECK(strstr(text, "\npais=US\n") != NULL);
+        CHECK(strstr(text, "\nhosts=192.168.43.1,10.0.0.5\n") != NULL);
+        CHECK(strstr(text, "\nid=424242\n") != NULL);
+        flat("SteamAPI_RunCallbacks", 0, NULL);
     }
 
     uint32_t friends = flat("SteamFriends", 0, NULL);
