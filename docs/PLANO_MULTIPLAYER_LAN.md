@@ -52,6 +52,16 @@ Atualmente, `runtime/src/win32/steam_api.c` implementa o Steamworks de forma 100
     - `RE5_STEAM_ID` (SteamID derivado do IP/porta ou gerado aleatoriamente)
   - Funções de consulta e atribuição de identidade no início de `SteamAPI_Init()`.
 
+- **Como ficou (identidade única)**:
+  - **ID**: seis dígitos (100000–999999), o *account id* do `CSteamID`. Gerado aleatório na
+    primeira execução e gravado no arquivo de identidade — `C:\Users\Player\re5_lan.ini` no VFS
+    (`<user_root>/drive_c/Users/Player/re5_lan.ini`), ou o caminho de `RE5_LAN_CONFIG`.
+    Uma 2ª instância no mesmo aparelho (porta P2P base + N) usa ID + N. `RE5_STEAM_ID` força um valor.
+  - **Nome**: chave `nome=` do mesmo arquivo (ou `RE5_PLAYER_NAME`), até 24 caracteres ASCII, sem `#`.
+  - **Na tela**: `GetPersonaName`/`GetFriendPersonaName` devolvem `"Nome #ID"` — quem procura salas
+    vê o nome e o ID do host; o host vê os de quem entrou.
+  - Cada pacote leva um *nonce* do processo: outro jogador com o mesmo ID gera um aviso no log.
+
 ### Etapa 2: Camada de Transporte de Rede do Host (`steam_lan`)
 - **Arquivos**: `runtime/include/re5/steam_lan.h` e `runtime/src/win32/steam_lan.c`.
 - **Implementação**:
@@ -90,6 +100,16 @@ Atualmente, `runtime/src/win32/steam_api.c` implementa o Steamworks de forma 100
     - Ambos disparam `LobbyChatUpdate_t` para notificar entrada/saída de membros.
   - `LeaveLobby(steamIDLobby)`:
     - Notifica o par da saída e limpa o estado do lobby.
+
+- **Aviso de entrada no host (corrigido)**: como na Steam, o criador recebe `LobbyCreated_t` **e**
+  `LobbyEnter_t` (+ `LobbyDataUpdate_t`). Sem o `LobbyEnter_t` o jogo do host não se considerava
+  dentro da sala e ignorava o `LobbyChatUpdate_t` de quem entrava. Quem entra recebe só
+  `LobbyEnter_t` (não um `LobbyChatUpdate_t` de si mesmo).
+- **Pedido de entrada confiável**: o cliente reenvia `JOIN_REQUEST` a cada 300 ms até a resposta;
+  sem resposta em 5 s, `LobbyEnter_t` com `k_EChatRoomEnterResponseError` e um aviso no log
+  (causa típica: firewall do host bloqueando UDP de entrada nas portas 27015–27031). O host trata
+  pedidos repetidos sem duplicar o membro e reenvia ao novo membro os dados de sala e os seus de membro.
+- **ID de lobby**: parte alta `0x01860000` (tipo chat, flags de lobby), como os lobbies da Steam.
 
 ### Etapa 4: Implementação de `ISteamNetworking005` (Transporte P2P de Gameplay)
 - **Métodos principais a implementar**:

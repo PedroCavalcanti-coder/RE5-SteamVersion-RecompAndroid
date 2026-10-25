@@ -3,14 +3,17 @@
  *
  * Implementa transporte UDP em broadcast e unicast direto entre nós LAN.
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <direct.h>
 typedef SOCKET hsock_t;
 #define HBAD_SOCK INVALID_SOCKET
 #else
@@ -29,6 +32,7 @@ typedef int hsock_t;
 #include "re5/runtime.h"
 #include "re5/steam_lan.h"
 #include "re5/thread.h"
+#include "re5/vfs.h"
 #include "../core/host_sync.h"
 
 #define RE5_LAN_MAGIC 0x35455221u /* "!RE5" */
@@ -51,6 +55,7 @@ typedef struct {
     uint8_t  flags;
     uint16_t port;
     uint64_t sender_steam_id;
+    uint32_t nonce;            /* aleatório por processo: separa o eco do nosso broadcast de outro jogador com o mesmo ID */
 } lan_hdr;
 
 typedef struct {
@@ -134,6 +139,21 @@ typedef struct lan_p2p_msg {
 #define MAX_PEERS 16
 #define MAX_EVENTS 64
 
+/* EChatRoomEnterResponse */
+#define ENTER_SUCCESS      1u
+#define ENTER_DOESNT_EXIST 2u
+#define ENTER_NOT_ALLOWED  3u
+#define ENTER_FULL         4u
+#define ENTER_ERROR        5u
+
+/* O pedido de entrada é UDP: repete até a resposta do host, desiste no prazo. */
+#define JOIN_RESEND_MS  300u
+#define JOIN_TIMEOUT_MS 5000u
+
+/* EChatMemberStateChange */
+#define MEMBER_ENTERED 0x01u
+#define MEMBER_LEFT    0x02u
+
 static re5_mutex g_mu;
 static int       g_initialized;
 static volatile int g_running;
@@ -161,7 +181,19 @@ static int           g_evt_head, g_evt_tail, g_evt_count;
 
 static uint64_t g_pending_search_call;
 static uint32_t g_pending_search_expire;
-static uint64_t g_join_call_id;
+
+static uint32_t g_nonce;
+static int      g_id_clash_warned;
+
+/* Entrada em andamento (lado do cliente). */
+static struct {
+    int                active;
+    uint64_t           lobby_id;
+    uint64_t           call_id;
+    struct sockaddr_in host;
+    uint32_t           next_send_ms;
+    uint32_t           deadline_ms;
+} g_join;
 
 static uint32_t get_ticks_ms(void)
 {
@@ -225,6 +257,18 @@ static void sock_fix_connreset(hsock_t s)
 #endif
 }
 
+static void sanitize_name(const char *in, char *out, size_t cap);
+
+static void fill_hdr(lan_hdr *h, uint8_t type)
+{
+    h->magic = RE5_LAN_MAGIC;
+    h->type = type;
+    h->flags = 0;
+    h->port = g_p2p_port;
+    h->sender_steam_id = g_local_steam_id;
+    h->nonce = g_nonce;
+}
+
 static void push_event(re5_lan_event_type type, uint64_t call_id, uint64_t lobby_id, uint64_t user_id, uint32_t p1, uint32_t p2)
 {
     if (g_evt_count >= MAX_EVENTS) return;
@@ -263,7 +307,8 @@ static void peer_update(uint64_t steam_id, const char *name, const struct sockad
         p->addr = *addr;
         p->last_seen_ms = get_ticks_ms();
         if (name && *name) snprintf(p->name, sizeof p->name, "%s", name);
-        else snprintf(p->name, sizeof p->name, "Player_%u", (uint32_t)steam_id);
+        else p->name[0] = 0;
+        p->p2p_session_requested = 0;
     }
 }
 
@@ -317,11 +362,7 @@ static size_t build_beacon_packet(uint8_t *buf, size_t max_len)
     if (max_len < sizeof(lan_hdr) + sizeof(lan_beacon_body)) return 0;
 
     lan_hdr *h = (lan_hdr *)buf;
-    h->magic = RE5_LAN_MAGIC;
-    h->type = PKT_BEACON;
-    h->flags = 0;
-    h->port = g_p2p_port;
-    h->sender_steam_id = g_local_steam_id;
+    fill_hdr(h, PKT_BEACON);
 
     lan_beacon_body *b = (lan_beacon_body *)(buf + sizeof(lan_hdr));
     b->lobby_id = g_active_lobby.lobby_id;
@@ -412,47 +453,103 @@ static void handle_ping(const lan_hdr *h, const struct sockaddr_in *from)
     }
 }
 
+static int member_index(const lan_lobby *lb, uint64_t steam_id)
+{
+    for (int i = 0; i < lb->member_count && i < RE5_LAN_MAX_LOBBY_MEMBERS; i++)
+        if (lb->members[i] == steam_id) return i;
+    return -1;
+}
+
+static void send_data_update(const struct sockaddr_in *dest, uint64_t lobby_id, uint64_t member_id, const lan_kv *kv)
+{
+    uint8_t buf[sizeof(lan_hdr) + sizeof(lan_data_update_body)];
+    fill_hdr((lan_hdr *)buf, PKT_DATA_UPDATE);
+    lan_data_update_body *du = (lan_data_update_body *)(buf + sizeof(lan_hdr));
+    memset(du, 0, sizeof *du);
+    du->lobby_id = lobby_id;
+    du->member_id = member_id;
+    snprintf(du->key, sizeof du->key, "%s", kv->key);
+    snprintf(du->val, sizeof du->val, "%s", kv->val);
+    send_raw_udp(g_p2p_sock, dest, buf, sizeof buf);
+}
+
+static void send_join_req(void)
+{
+    uint8_t buf[sizeof(lan_hdr) + sizeof(lan_join_req_body)];
+    fill_hdr((lan_hdr *)buf, PKT_JOIN_REQ);
+    lan_join_req_body *req = (lan_join_req_body *)(buf + sizeof(lan_hdr));
+    memset(req, 0, sizeof *req);
+    req->lobby_id = g_join.lobby_id;
+    snprintf(req->client_name, sizeof req->client_name, "%s", g_local_name);
+    send_raw_udp(g_p2p_sock, &g_join.host, buf, sizeof buf);
+}
+
+/* Host: alguém pediu para entrar. O pedido pode chegar repetido (o cliente
+ * reenvia até a resposta), então quem já é membro só recebe a confirmação de novo. */
 static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len, const struct sockaddr_in *from)
 {
     if (len < sizeof(lan_join_req_body)) return;
     const lan_join_req_body *req = (const lan_join_req_body *)payload;
+    char raw[sizeof req->client_name + 1], name[RE5_LAN_MAX_NAME_LEN + 1];
+    memcpy(raw, req->client_name, sizeof req->client_name);
+    raw[sizeof req->client_name] = 0;
+    sanitize_name(raw, name, sizeof name);
 
     struct sockaddr_in client_addr = *from;
     client_addr.sin_port = htons(h->port);
-    peer_update(h->sender_steam_id, req->client_name, &client_addr);
+    peer_update(h->sender_steam_id, name, &client_addr);
 
-    if (!g_has_active_lobby || g_active_lobby.lobby_id != req->lobby_id) return;
-    if (g_active_lobby.owner_id != g_local_steam_id) return;
-
-    uint32_t resp_code = 1; /* Success */
-    if (g_active_lobby.member_count >= g_active_lobby.max_members) {
-        resp_code = 4; /* Full */
+    uint32_t resp_code = ENTER_SUCCESS;
+    int is_new = 0;
+    if (!g_has_active_lobby || g_active_lobby.lobby_id != req->lobby_id || g_active_lobby.owner_id != g_local_steam_id) {
+        resp_code = ENTER_DOESNT_EXIST;
+    } else if (member_index(&g_active_lobby, h->sender_steam_id) >= 0) {
+        resp_code = ENTER_SUCCESS;
+    } else if (!g_active_lobby.joinable) {
+        resp_code = ENTER_NOT_ALLOWED;
+    } else if (g_active_lobby.member_count >= g_active_lobby.max_members) {
+        resp_code = ENTER_FULL;
     } else {
         int idx = g_active_lobby.member_count++;
         g_active_lobby.members[idx] = h->sender_steam_id;
-        snprintf(g_active_lobby.member_names[idx], sizeof g_active_lobby.member_names[idx], "%s", req->client_name);
-
-        push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, g_active_lobby.lobby_id, h->sender_steam_id, 0x01 /* Entered */, 0);
-        push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
-        lan_peer *p = peer_find(h->sender_steam_id);
-        if (p) p->p2p_session_requested = 1;
-        RE5_INFO("steam_lan", "Jogador '%s' (%llu) entrou no lobby", req->client_name, (unsigned long long)h->sender_steam_id);
+        snprintf(g_active_lobby.member_names[idx], sizeof g_active_lobby.member_names[idx], "%s", name);
+        g_active_lobby.member_data_count[idx] = 0;
+        is_new = 1;
     }
 
     uint8_t resp_buf[sizeof(lan_hdr) + sizeof(lan_join_resp_body)];
-    lan_hdr *rh = (lan_hdr *)resp_buf;
-    rh->magic = RE5_LAN_MAGIC;
-    rh->type = PKT_JOIN_RESP;
-    rh->flags = 0;
-    rh->port = g_p2p_port;
-    rh->sender_steam_id = g_local_steam_id;
-
+    fill_hdr((lan_hdr *)resp_buf, PKT_JOIN_RESP);
     lan_join_resp_body *rb = (lan_join_resp_body *)(resp_buf + sizeof(lan_hdr));
-    rb->lobby_id = g_active_lobby.lobby_id;
+    rb->lobby_id = req->lobby_id;
     rb->response_code = resp_code;
-    rb->member_count = g_active_lobby.member_count;
-
+    rb->member_count = g_has_active_lobby ? g_active_lobby.member_count : 0;
     send_raw_udp(g_p2p_sock, &client_addr, resp_buf, sizeof resp_buf);
+
+    if (resp_code != ENTER_SUCCESS) {
+        RE5_INFO("steam_lan", "Pedido de entrada de '%s #%u' recusado (codigo %u)", name, (uint32_t)h->sender_steam_id,
+                 resp_code);
+        return;
+    }
+
+    /* O cliente já tem os dados da sala (vieram no beacon), mas não os do host como
+     * membro (SetLobbyMemberData feito antes de ele chegar): manda tudo de novo. */
+    for (int i = 0; i < g_active_lobby.data_count; i++)
+        send_data_update(&client_addr, g_active_lobby.lobby_id, 0, &g_active_lobby.data[i]);
+    for (int k = 0; k < g_active_lobby.member_data_count[0]; k++)
+        send_data_update(&client_addr, g_active_lobby.lobby_id, g_local_steam_id, &g_active_lobby.member_data[0][k]);
+
+    if (!is_new) return;
+
+    /* É isto que avisa o jogo do host: LobbyChatUpdate_t (membro entrou), como a
+     * Steam faz para todos os que já estão na sala; e o pedido de sessão P2P. */
+    push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, g_active_lobby.lobby_id, h->sender_steam_id, MEMBER_ENTERED, 0);
+    lan_peer *p = peer_find(h->sender_steam_id);
+    if (p && !p->p2p_session_requested) {
+        p->p2p_session_requested = 1;
+        push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
+    }
+    RE5_INFO("steam_lan", "Jogador '%s #%u' entrou no lobby (%u/%u)", name, (uint32_t)h->sender_steam_id,
+             g_active_lobby.member_count, g_active_lobby.max_members);
 }
 
 static void handle_join_resp(const lan_hdr *h, const uint8_t *payload, size_t len, const struct sockaddr_in *from)
@@ -461,23 +558,52 @@ static void handle_join_resp(const lan_hdr *h, const uint8_t *payload, size_t le
     if (len < sizeof(lan_join_resp_body)) return;
     const lan_join_resp_body *resp = (const lan_join_resp_body *)payload;
 
-    if (!g_has_active_lobby || g_active_lobby.lobby_id != resp->lobby_id) return;
+    /* Respostas repetidas (um por pedido reenviado) depois da primeira: ignora. */
+    if (!g_join.active || g_join.lobby_id != resp->lobby_id || h->sender_steam_id != g_active_lobby.owner_id) return;
+    g_join.active = 0;
 
-    if (resp->response_code == 1) {
-        g_active_lobby.member_count = resp->member_count;
-        g_active_lobby.members[1] = g_local_steam_id;
-        snprintf(g_active_lobby.member_names[1], sizeof g_active_lobby.member_names[1], "%s", g_local_name);
+    if (resp->response_code == ENTER_SUCCESS) {
+        g_active_lobby.member_count = resp->member_count > 1 ? resp->member_count : 2;
+        if (g_active_lobby.member_count > RE5_LAN_MAX_LOBBY_MEMBERS) g_active_lobby.member_count = RE5_LAN_MAX_LOBBY_MEMBERS;
+        int me = g_active_lobby.member_count - 1;
+        g_active_lobby.members[me] = g_local_steam_id;
+        snprintf(g_active_lobby.member_names[me], sizeof g_active_lobby.member_names[me], "%s", g_local_name);
+        g_active_lobby.member_data_count[me] = 0;
 
-        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join_call_id, g_active_lobby.lobby_id, g_local_steam_id, 1 /* Success */, 0);
-        push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, g_active_lobby.lobby_id, g_local_steam_id, 0x01 /* Entered */, 0);
-        push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
+        /* Quem entra recebe só LobbyEnter_t (a Steam não manda LobbyChatUpdate_t de si mesmo). */
+        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join.call_id, g_active_lobby.lobby_id, g_local_steam_id, ENTER_SUCCESS, 0);
         lan_peer *p = peer_find(h->sender_steam_id);
-        if (p) p->p2p_session_requested = 1;
-        RE5_INFO("steam_lan", "Conectado ao lobby %llu com sucesso", (unsigned long long)resp->lobby_id);
+        if (p && !p->p2p_session_requested) {
+            p->p2p_session_requested = 1;
+            push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
+        }
+        RE5_INFO("steam_lan", "Conectado ao lobby de '%s #%u'", g_active_lobby.owner_name,
+                 (uint32_t)g_active_lobby.owner_id);
     } else {
-        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join_call_id, g_active_lobby.lobby_id, g_local_steam_id, resp->response_code, 0);
+        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join.call_id, g_active_lobby.lobby_id, g_local_steam_id,
+                   resp->response_code, 0);
         g_has_active_lobby = 0;
-        RE5_INFO("steam_lan", "Falha ao entrar no lobby: codigo %u", resp->response_code);
+        RE5_INFO("steam_lan", "Host recusou a entrada no lobby: codigo %u", resp->response_code);
+    }
+}
+
+/* Cliente: reenvia o pedido de entrada até a resposta; sem resposta no prazo,
+ * LobbyEnter_t com erro (senão o jogo esperaria para sempre). */
+static void join_tick(uint32_t now)
+{
+    if (!g_join.active) return;
+    if ((int32_t)(now - g_join.deadline_ms) >= 0) {
+        g_join.active = 0;
+        g_has_active_lobby = 0;
+        push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join.call_id, g_join.lobby_id, g_local_steam_id, ENTER_ERROR, 0);
+        RE5_WARN("steam_lan", "O host %s:%u nao respondeu ao pedido de entrada em %u ms "
+                 "(firewall bloqueando UDP de entrada no host?)",
+                 inet_ntoa(g_join.host.sin_addr), ntohs(g_join.host.sin_port), JOIN_TIMEOUT_MS);
+        return;
+    }
+    if ((int32_t)(now - g_join.next_send_ms) >= 0) {
+        send_join_req();
+        g_join.next_send_ms = now + JOIN_RESEND_MS;
     }
 }
 
@@ -494,16 +620,18 @@ static void handle_leave(const lan_hdr *h, const uint8_t *payload, size_t len)
             if (g_active_lobby.members[i] == h->sender_steam_id) {
                 for (int k = i; k + 1 < g_active_lobby.member_count && k + 1 < RE5_LAN_MAX_LOBBY_MEMBERS; k++) {
                     g_active_lobby.members[k] = g_active_lobby.members[k + 1];
-                    snprintf(g_active_lobby.member_names[k], sizeof g_active_lobby.member_names[k], "%s", g_active_lobby.member_names[k + 1]);
+                    memcpy(g_active_lobby.member_names[k], g_active_lobby.member_names[k + 1], sizeof g_active_lobby.member_names[k]);
+                    memcpy(g_active_lobby.member_data[k], g_active_lobby.member_data[k + 1], sizeof g_active_lobby.member_data[k]);
+                    g_active_lobby.member_data_count[k] = g_active_lobby.member_data_count[k + 1];
                 }
                 g_active_lobby.member_count--;
-                push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, lobby_id, h->sender_steam_id, 0x02 /* Left */, 0);
+                push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, lobby_id, h->sender_steam_id, MEMBER_LEFT, 0);
                 break;
             }
         }
     } else if (h->sender_steam_id == g_active_lobby.owner_id) {
         /* Host fechou o lobby */
-        push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, lobby_id, h->sender_steam_id, 0x02 /* Left */, 0);
+        push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, lobby_id, h->sender_steam_id, MEMBER_LEFT, 0);
         g_has_active_lobby = 0;
     }
 }
@@ -604,7 +732,17 @@ static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_i
     if (len < sizeof(lan_hdr)) return;
     const lan_hdr *h = (const lan_hdr *)buf;
     if (h->magic != RE5_LAN_MAGIC) return;
-    if (h->sender_steam_id == g_local_steam_id) return; /* nosso próprio pacote */
+    if (h->sender_steam_id == g_local_steam_id) {
+        /* Mesmo nonce: eco do nosso broadcast. Outro nonce: outro jogador com o
+         * nosso ID, e os dois se confundiriam em tudo (sala, P2P). */
+        if (h->nonce != g_nonce && !g_id_clash_warned) {
+            g_id_clash_warned = 1;
+            RE5_WARN("steam_lan", "Outro jogador em %s usa o mesmo ID #%u: apague o arquivo de identidade "
+                     "de um dos dois (ou defina RE5_STEAM_ID) para gerar um ID novo",
+                     inet_ntoa(from->sin_addr), (uint32_t)g_local_steam_id);
+        }
+        return;
+    }
 
     const uint8_t *payload = buf + sizeof(lan_hdr);
     size_t payload_len = len - sizeof(lan_hdr);
@@ -714,6 +852,7 @@ static void lan_worker(void *arg)
         check_pending_search();
 
         uint32_t now = get_ticks_ms();
+        join_tick(now);
         if (now - last_beacon_ms >= 1000) {
             broadcast_beacon();
             last_beacon_ms = now;
@@ -722,6 +861,163 @@ static void lan_worker(void *arg)
 
         re5_host_sleep_ms(5);
     }
+}
+
+/* ---- identidade: ID único e nome do jogador ---- */
+
+#define LAN_ID_FILE_GUEST "C:\\Users\\Player\\re5_lan.ini"
+#define LAN_DEFAULT_NAME  "Jogador"
+
+static uint32_t mix32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+/* Aleatório para o ID e o nonce; não precisa ser criptográfico. */
+static uint32_t lan_random(void)
+{
+    uint32_t r = 0;
+#if defined(_WIN32)
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    r = (uint32_t)qpc.QuadPart ^ (uint32_t)(qpc.QuadPart >> 32) ^ (GetCurrentProcessId() << 16);
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        if (fread(&r, sizeof r, 1, f) != 1) r = 0;
+        fclose(f);
+    }
+    if (!r) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        r = (uint32_t)ts.tv_nsec ^ ((uint32_t)getpid() << 16);
+    }
+#endif
+    static uint32_t s_ctr;
+    return mix32(r ^ (uint32_t)time(NULL) ^ (++s_ctr * 0x9E3779B9u));
+}
+
+/* Nome legível em qualquer fonte do jogo: ASCII imprimível, sem '#' (separa o ID),
+ * espaços das pontas removidos, no máximo RE5_LAN_MAX_NAME_LEN caracteres. */
+static void sanitize_name(const char *in, char *out, size_t cap)
+{
+    size_t n = 0;
+    while (*in == ' ' || *in == '\t') in++;
+    for (; *in && n + 1 < cap && n < RE5_LAN_MAX_NAME_LEN; in++) {
+        unsigned char ch = (unsigned char)*in;
+        if (ch == '\r' || ch == '\n') break;
+        out[n++] = (ch < 0x20 || ch >= 0x7F || ch == '#') ? '_' : (char)ch;
+    }
+    while (n && out[n - 1] == ' ') n--;
+    out[n] = 0;
+}
+
+static int identity_path(char *out, size_t cap)
+{
+    const char *env = getenv("RE5_LAN_CONFIG");
+    if (env && *env) return snprintf(out, cap, "%s", env) < (int)cap ? 0 : -1;
+    return re5_vfs_resolve(LAN_ID_FILE_GUEST, out, cap);
+}
+
+static void mkdir_parents(const char *path)
+{
+    char p[1024];
+    snprintf(p, sizeof p, "%s", path);
+    for (char *s = p + 1; *s; s++) {
+        if (*s != '/' && *s != '\\') continue;
+        char k = *s;
+        *s = 0;
+#if defined(_WIN32)
+        if (s[-1] != ':') _mkdir(p);
+#else
+        mkdir(p, 0755);
+#endif
+        *s = k;
+    }
+}
+
+/* Arquivo "chave=valor": id (6 dígitos) e nome. 1 = lido. */
+static int read_identity(const char *path, uint32_t *id, char *name, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || line[0] == ';' || !eq) continue;
+        *eq = 0;
+        char *key = line, *val = eq + 1;
+        while (*key == ' ' || *key == '\t') key++;
+        for (char *e = key + strlen(key); e > key && isspace((unsigned char)e[-1]); e--) e[-1] = 0;
+        if (strcmp(key, "id") == 0) {
+            unsigned long v = strtoul(val, NULL, 10);
+            if (v >= RE5_LAN_ID_MIN && v < RE5_LAN_ID_MIN + RE5_LAN_ID_SPAN) *id = (uint32_t)v;
+        } else if (strcmp(key, "nome") == 0 || strcmp(key, "name") == 0) {
+            sanitize_name(val, name, cap);
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+static void write_identity(const char *path, uint32_t id, const char *name)
+{
+    mkdir_parents(path);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        RE5_WARN("steam_lan", "Nao foi possivel gravar a identidade LAN em %s: o ID muda a cada execucao", path);
+        return;
+    }
+    fprintf(f, "# Identidade do jogador no multiplayer LAN do RE5.\n"
+               "# nome: o que os outros jogadores veem (ate %d caracteres, sem '#').\n"
+               "# id:   seu codigo unico na rede; nao copie este arquivo para outro aparelho.\n"
+               "#       Apague a linha para gerar um novo.\n"
+               "nome=%s\n"
+               "id=%u\n",
+            RE5_LAN_MAX_NAME_LEN, name, id);
+    fclose(f);
+}
+
+/* Prioridade: RE5_STEAM_ID / RE5_PLAYER_NAME > arquivo de identidade > gerado.
+ * Instâncias no mesmo aparelho dividem o arquivo, então a N-ésima (porta P2P
+ * base + N) soma N ao ID e cada uma continua com um ID próprio. */
+static void load_identity(uint16_t base_p2p)
+{
+    uint32_t slot = (uint32_t)(g_p2p_port - base_p2p);
+    uint32_t id = 0;
+    char name[RE5_LAN_MAX_NAME_LEN + 1] = "";
+
+    char path[1024];
+    int have_path = identity_path(path, sizeof path) == 0;
+    int read_ok = have_path && read_identity(path, &id, name, sizeof name);
+    if (have_path && (!read_ok || !id || !name[0])) {
+        if (!id) id = RE5_LAN_ID_MIN + lan_random() % RE5_LAN_ID_SPAN;
+        if (!name[0]) snprintf(name, sizeof name, "%s", LAN_DEFAULT_NAME);
+        write_identity(path, id, name);
+        RE5_INFO("steam_lan", "Identidade LAN criada em %s (edite 'nome' para mudar o nome)", path);
+    } else if (have_path) {
+        RE5_INFO("steam_lan", "Identidade LAN lida de %s", path);
+    }
+    if (!id) id = RE5_LAN_ID_MIN + lan_random() % RE5_LAN_ID_SPAN;
+    id = RE5_LAN_ID_MIN + (id - RE5_LAN_ID_MIN + slot) % RE5_LAN_ID_SPAN;
+
+    const char *env_id = getenv("RE5_STEAM_ID");
+    if (!env_id || !*env_id) env_id = getenv("RE5_LAN_STEAM_ID");
+    if (env_id && strtoul(env_id, NULL, 10) > 0) id = (uint32_t)strtoul(env_id, NULL, 10);
+
+    const char *env_name = getenv("RE5_PLAYER_NAME");
+    if (!env_name || !*env_name) env_name = getenv("RE5_LAN_NAME");
+    if (env_name && *env_name) sanitize_name(env_name, name, sizeof name);
+    if (!name[0]) snprintf(name, sizeof name, "%s", LAN_DEFAULT_NAME);
+
+    g_local_steam_id = ((uint64_t)RE5_LAN_STEAMID_USER_HI << 32) | id;
+    snprintf(g_local_name, sizeof g_local_name, "%s", name);
+    g_nonce = lan_random();
 }
 
 int steam_lan_init(void)
@@ -794,35 +1090,13 @@ int steam_lan_init(void)
     }
     g_p2p_port = bound_port;
 
-    /* Identidade SteamID */
-    uint32_t account_id = 1;
-    const char *env_id = getenv("RE5_STEAM_ID");
-    if (!env_id || !*env_id) env_id = getenv("RE5_LAN_STEAM_ID");
-    if (env_id && atoi(env_id) > 0) {
-        account_id = (uint32_t)atoi(env_id);
-    } else if (g_p2p_port >= RE5_LAN_DEFAULT_P2P_PORT) {
-        account_id = 1 + (g_p2p_port - RE5_LAN_DEFAULT_P2P_PORT);
-    } else {
-        account_id = (uint32_t)g_p2p_port;
-    }
-    g_local_steam_id = ((uint64_t)0x01100001u << 32) | account_id;
-
-    /* Nome do jogador */
-    const char *env_name = getenv("RE5_PLAYER_NAME");
-    if (!env_name || !*env_name) env_name = getenv("RE5_LAN_NAME");
-    if (env_name && *env_name) {
-        snprintf(g_local_name, sizeof g_local_name, "%s", env_name);
-    } else if (account_id == 1) {
-        snprintf(g_local_name, sizeof g_local_name, "Player 1");
-    } else {
-        snprintf(g_local_name, sizeof g_local_name, "Player %u", account_id);
-    }
+    load_identity(base_p2p);
 
     g_running = 1;
     g_initialized = 1;
 
-    RE5_INFO("steam_lan", "Subcamada LAN iniciada: SteamID %llu, Nome '%s', Porta P2P %u, Descoberta %u",
-             (unsigned long long)g_local_steam_id, g_local_name, g_p2p_port, g_discovery_port);
+    RE5_INFO("steam_lan", "Subcamada LAN iniciada: jogador '%s #%u' (SteamID %llu), porta P2P %u, descoberta %u",
+             g_local_name, (uint32_t)g_local_steam_id, (unsigned long long)g_local_steam_id, g_p2p_port, g_discovery_port);
 
     if (re5_host_thread_start(lan_worker, NULL, 1u << 20) != 0) {
         re5_fatal("steam_lan", "Falha ao iniciar thread de rede LAN");
@@ -865,6 +1139,7 @@ void steam_lan_poll(void)
     poll_sockets_once();
     re5_mutex_lock(&g_mu);
     check_pending_search();
+    join_tick(get_ticks_ms());
     re5_mutex_unlock(&g_mu);
 }
 
@@ -878,13 +1153,19 @@ const char *steam_lan_get_local_name(void)
     return g_local_name;
 }
 
-const char *steam_lan_get_peer_name(uint64_t steam_id)
+void steam_lan_get_display_name(uint64_t steam_id, char *out, size_t cap)
 {
+    if (!out || !cap) return;
     re5_mutex_lock(&g_mu);
-    lan_peer *p = peer_find(steam_id);
-    const char *name = p ? p->name : "Player";
+    const char *name = NULL;
+    if (steam_id == g_local_steam_id) {
+        name = g_local_name;
+    } else {
+        lan_peer *p = peer_find(steam_id);
+        if (p && p->name[0]) name = p->name;
+    }
+    snprintf(out, cap, "%s #%u", name ? name : "Jogador", (uint32_t)steam_id);
     re5_mutex_unlock(&g_mu);
-    return name;
 }
 
 uint16_t steam_lan_get_p2p_port(void)
@@ -899,7 +1180,7 @@ uint64_t steam_lan_create_lobby(uint32_t lobby_type, int max_members, uint64_t c
     (void)lobby_type;
     re5_mutex_lock(&g_mu);
 
-    uint64_t lobby_id = ((uint64_t)0x01180000u << 32) | (uint32_t)g_local_steam_id;
+    uint64_t lobby_id = ((uint64_t)RE5_LAN_STEAMID_LOBBY_HI << 32) | (uint32_t)g_local_steam_id;
     memset(&g_active_lobby, 0, sizeof g_active_lobby);
     g_active_lobby.lobby_id = lobby_id;
     g_active_lobby.owner_id = g_local_steam_id;
@@ -914,12 +1195,18 @@ uint64_t steam_lan_create_lobby(uint32_t lobby_type, int max_members, uint64_t c
     g_active_lobby.last_seen_ms = get_ticks_ms();
     g_has_active_lobby = 1;
 
+    /* Como a Steam: LobbyCreated_t (call result) e, para o próprio criador, LobbyEnter_t
+     * e LobbyDataUpdate_t. Sem o LobbyEnter_t o jogo do host não se considera dentro da
+     * sala e ignora o LobbyChatUpdate_t de quem entra depois. */
     push_event(RE5_LAN_EVT_LOBBY_CREATED, call_id, lobby_id, g_local_steam_id, 1 /* k_EResultOK */, 0);
+    push_event(RE5_LAN_EVT_LOBBY_ENTERED, 0, lobby_id, g_local_steam_id, ENTER_SUCCESS, 0);
+    push_event(RE5_LAN_EVT_LOBBY_DATA_UPDATE, 0, lobby_id, lobby_id, 1, 0);
 
     broadcast_beacon();
     re5_mutex_unlock(&g_mu);
 
-    RE5_INFO("steam_lan", "Lobby %llu criado pelo host '%s' (max %u membros)", (unsigned long long)lobby_id, g_local_name, g_active_lobby.max_members);
+    RE5_INFO("steam_lan", "Lobby %llu criado pelo host '%s #%u' (max %u membros)", (unsigned long long)lobby_id, g_local_name,
+             (uint32_t)g_local_steam_id, g_active_lobby.max_members);
     return lobby_id;
 }
 
@@ -929,11 +1216,7 @@ uint64_t steam_lan_request_lobby_list(uint64_t call_id)
 
     /* Envia PING broadcast para que hosts respondam imediatamente */
     lan_hdr ping;
-    ping.magic = RE5_LAN_MAGIC;
-    ping.type = PKT_PING;
-    ping.flags = 0;
-    ping.port = g_p2p_port;
-    ping.sender_steam_id = g_local_steam_id;
+    fill_hdr(&ping, PKT_PING);
     send_broadcast(&ping, sizeof ping);
 
     g_pending_search_call = call_id;
@@ -1080,11 +1363,7 @@ int steam_lan_set_lobby_data(uint64_t lobby_id, const char *key, const char *val
     /* Envia atualizacao unicast para outros membros */
     uint8_t buf[sizeof(lan_hdr) + sizeof(lan_data_update_body)];
     lan_hdr *h = (lan_hdr *)buf;
-    h->magic = RE5_LAN_MAGIC;
-    h->type = PKT_DATA_UPDATE;
-    h->flags = 0;
-    h->port = g_p2p_port;
-    h->sender_steam_id = g_local_steam_id;
+    fill_hdr(h, PKT_DATA_UPDATE);
 
     lan_data_update_body *du = (lan_data_update_body *)(buf + sizeof(lan_hdr));
     du->lobby_id = lobby_id;
@@ -1154,11 +1433,7 @@ void steam_lan_set_lobby_member_data(uint64_t lobby_id, const char *key, const c
 
         uint8_t buf[sizeof(lan_hdr) + sizeof(lan_data_update_body)];
         lan_hdr *h = (lan_hdr *)buf;
-        h->magic = RE5_LAN_MAGIC;
-        h->type = PKT_DATA_UPDATE;
-        h->flags = 0;
-        h->port = g_p2p_port;
-        h->sender_steam_id = g_local_steam_id;
+        fill_hdr(h, PKT_DATA_UPDATE);
 
         lan_data_update_body *du = (lan_data_update_body *)(buf + sizeof(lan_hdr));
         du->lobby_id = lobby_id;
@@ -1180,7 +1455,6 @@ void steam_lan_set_lobby_member_data(uint64_t lobby_id, const char *key, const c
 int steam_lan_join_lobby(uint64_t lobby_id, uint64_t call_id)
 {
     re5_mutex_lock(&g_mu);
-    g_join_call_id = call_id;
     lan_lobby *lb = NULL;
     for (int i = 0; i < g_num_lobbies; i++) {
         if (g_lobbies[i].lobby_id == lobby_id) {
@@ -1189,39 +1463,33 @@ int steam_lan_join_lobby(uint64_t lobby_id, uint64_t call_id)
         }
     }
     if (!lb) {
-        push_event(RE5_LAN_EVT_LOBBY_ENTERED, call_id, lobby_id, g_local_steam_id, 2 /* DoesntExist */, 0);
+        push_event(RE5_LAN_EVT_LOBBY_ENTERED, call_id, lobby_id, g_local_steam_id, ENTER_DOESNT_EXIST, 0);
         re5_mutex_unlock(&g_mu);
         return 0;
     }
 
     g_active_lobby = *lb;
     g_active_lobby.is_local = 0;
+    memset(g_active_lobby.member_data_count, 0, sizeof g_active_lobby.member_data_count);
     g_has_active_lobby = 1;
 
-    struct sockaddr_in host_addr;
-    memset(&host_addr, 0, sizeof host_addr);
-    host_addr.sin_family = AF_INET;
-    host_addr.sin_port = htons(lb->host_port);
-    host_addr.sin_addr = lb->host_ip;
+    memset(&g_join.host, 0, sizeof g_join.host);
+    g_join.host.sin_family = AF_INET;
+    g_join.host.sin_port = htons(lb->host_port);
+    g_join.host.sin_addr = lb->host_ip;
+    peer_update(lb->owner_id, lb->owner_name, &g_join.host);
 
-    peer_update(lb->owner_id, lb->owner_name, &host_addr);
+    uint32_t now = get_ticks_ms();
+    g_join.active = 1;
+    g_join.lobby_id = lobby_id;
+    g_join.call_id = call_id;
+    g_join.deadline_ms = now + JOIN_TIMEOUT_MS;
+    g_join.next_send_ms = now + JOIN_RESEND_MS;
+    send_join_req();
 
-    uint8_t buf[sizeof(lan_hdr) + sizeof(lan_join_req_body)];
-    lan_hdr *h = (lan_hdr *)buf;
-    h->magic = RE5_LAN_MAGIC;
-    h->type = PKT_JOIN_REQ;
-    h->flags = 0;
-    h->port = g_p2p_port;
-    h->sender_steam_id = g_local_steam_id;
-
-    lan_join_req_body *req = (lan_join_req_body *)(buf + sizeof(lan_hdr));
-    req->lobby_id = lobby_id;
-    snprintf(req->client_name, sizeof req->client_name, "%s", g_local_name);
-
-    send_raw_udp(g_p2p_sock, &host_addr, buf, sizeof buf);
+    RE5_INFO("steam_lan", "Pedindo para entrar no lobby de '%s #%u' (%s:%u)", lb->owner_name, (uint32_t)lb->owner_id,
+             inet_ntoa(lb->host_ip), lb->host_port);
     re5_mutex_unlock(&g_mu);
-
-    RE5_INFO("steam_lan", "Enviando requisicao de entrada para lobby %llu no host porta %u", (unsigned long long)lobby_id, lb->host_port);
     return 1;
 }
 
@@ -1232,14 +1500,11 @@ void steam_lan_leave_lobby(uint64_t lobby_id)
         re5_mutex_unlock(&g_mu);
         return;
     }
+    g_join.active = 0;
 
     uint8_t buf[sizeof(lan_hdr) + sizeof(uint64_t)];
     lan_hdr *h = (lan_hdr *)buf;
-    h->magic = RE5_LAN_MAGIC;
-    h->type = PKT_LEAVE;
-    h->flags = 0;
-    h->port = g_p2p_port;
-    h->sender_steam_id = g_local_steam_id;
+    fill_hdr(h, PKT_LEAVE);
     memcpy(buf + sizeof(lan_hdr), &lobby_id, sizeof lobby_id);
 
     for (int i = 0; i < g_active_lobby.member_count; i++) {
@@ -1277,11 +1542,7 @@ int steam_lan_send_p2p(uint64_t remote_id, const void *data, uint32_t len, int s
 
     uint8_t buf[RE5_LAN_MAX_PACKET_SIZE];
     lan_hdr *h = (lan_hdr *)buf;
-    h->magic = RE5_LAN_MAGIC;
-    h->type = PKT_P2P_DATA;
-    h->flags = 0;
-    h->port = g_p2p_port;
-    h->sender_steam_id = g_local_steam_id;
+    fill_hdr(h, PKT_P2P_DATA);
 
     lan_p2p_hdr *ph = (lan_p2p_hdr *)(buf + sizeof(lan_hdr));
     ph->channel = (uint16_t)channel;

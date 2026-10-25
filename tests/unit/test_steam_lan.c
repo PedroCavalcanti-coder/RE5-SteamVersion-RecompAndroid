@@ -1,10 +1,14 @@
 /*
  * test_steam_lan.c - Teste unitário da subcamada LAN (ISteamMatchmaking009 e ISteamNetworking005).
  *
- * Suporta três modos:
- *  - Padrão (sem argumentos): testa vtable, callbacks, metadados e loopback local;
- *  - --host: inicia como host "Chris", cria sala e aguarda Sheva para troca P2P;
- *  - --client: descobre o lobby do host via UDP, conecta e troca mensagens P2P no canal 0x389.
+ * Modos:
+ *  - Padrão (sem argumentos): identidade lida do arquivo (RE5_LAN_CONFIG), vtable,
+ *    callbacks, metadados, loopback local e o pedido de entrada reenviado a um
+ *    host que perde o primeiro pacote;
+ *  - --identity <arquivo>: arquivo de identidade ausente é criado com um ID novo;
+ *  - --host: host "Chris" cria a sala e tem que ser AVISADO (LobbyChatUpdate_t) da
+ *    entrada de Sheva, com nome e ID dela; depois troca P2P;
+ *  - --client: descobre o lobby do host via UDP, vê "Chris #101", entra e troca P2P no canal 0x389.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +18,10 @@
 #include <winsock2.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 #define SDL_MAIN_HANDLED
@@ -60,8 +66,19 @@ static uint32_t vcall(uint32_t obj, uint32_t slot, int n, const uint32_t *args)
     return re5_guest_call(T, rd32(rd32(obj) + 4 * slot), n, args);
 }
 
+/* ISteamFriends014::GetFriendPersonaName (slot 7). */
+static const char *friend_name(uint64_t id)
+{
+    uint32_t friends = flat("SteamFriends", 0, NULL);
+    const uint32_t a[2] = {(uint32_t)id, (uint32_t)(id >> 32)};
+    return re5_gstr(vcall(friends, 7, 2, a));
+}
+
 static uint32_t g_created_calls, g_enter_calls, g_chat_calls, g_data_calls, g_p2p_req_calls;
-static uint64_t g_last_lobby_created;
+static uint64_t g_last_lobby_created, g_last_enter_lobby;
+static uint32_t g_last_enter_resp;
+static uint64_t g_last_chat_user;
+static uint32_t g_last_chat_state;
 static uint64_t g_last_p2p_req_user;
 
 static void cb_created_run(CPU *c)
@@ -72,20 +89,27 @@ static void cb_created_run(CPU *c)
     g_last_lobby_created = (uint64_t)rd32(p + 12) << 32 | rd32(p + 8);
 }
 
+/* LobbyEnter_t: lobby +0, resposta +16. */
 static void cb_enter_run(CPU *c)
 {
     g_enter_calls++;
     uint32_t p = re5_arg(c, 0);
-    CHECK_EQ_U32(rd32(p + 16), 1); /* k_EChatRoomEnterResponseSuccess */
+    g_last_enter_lobby = (uint64_t)rd32(p + 4) << 32 | rd32(p);
+    g_last_enter_resp = rd32(p + 16);
 }
 
+/* LobbyChatUpdate_t: lobby +0, quem mudou +8, quem causou +16, estado +24. */
 static void cb_chat_run(CPU *c)
 {
     g_chat_calls++;
+    uint32_t p = re5_arg(c, 0);
+    g_last_chat_user = (uint64_t)rd32(p + 12) << 32 | rd32(p + 8);
+    g_last_chat_state = rd32(p + 24);
 }
 
 static void cb_data_run(CPU *c)
 {
+    (void)c;
     g_data_calls++;
 }
 
@@ -98,38 +122,82 @@ static void cb_p2p_req_run(CPU *c)
 
 static void cb_dummy(CPU *c) { (void)c; }
 
+static uint32_t register_cb(const char *name, re5_host_fn run, int id)
+{
+    char n[64];
+    uint32_t vt = gbuf(12), cb = gbuf(16);
+    snprintf(n, sizeof n, "teste!%sResult", name);
+    wr32(vt, re5_thunk_new(strdup(n), cb_dummy, 16, NULL));
+    snprintf(n, sizeof n, "teste!%sRun", name);
+    wr32(vt + 4, re5_thunk_new(strdup(n), run, 4, NULL));
+    snprintf(n, sizeof n, "teste!%sSize", name);
+    wr32(vt + 8, re5_thunk_new(strdup(n), cb_dummy, 0, NULL));
+    wr32(cb, vt);
+    const uint32_t reg[2] = {cb, (uint32_t)id};
+    flat("SteamAPI_RegisterCallback", 2, reg);
+    return cb;
+}
+
+static void register_all(void)
+{
+    register_cb("Created", cb_created_run, 513);
+    register_cb("Enter", cb_enter_run, 504);
+    register_cb("Chat", cb_chat_run, 506);
+    register_cb("Data", cb_data_run, 505);
+    register_cb("P2PReq", cb_p2p_req_run, 1202);
+}
+
 static int run_host_mode(void)
 {
     CHECK_EQ_U32(flat("SteamAPI_Init", 0, NULL) & 0xFF, 1);
+    register_all();
     uint32_t match = flat("SteamMatchmaking", 0, NULL);
     uint32_t net = flat("SteamNetworking", 0, NULL);
+
+    uint64_t my_id = steam_lan_get_local_steam_id();
+    CHECK_EQ_U32((uint32_t)my_id, 101);
+    CHECK(strcmp(friend_name(my_id), "Chris #101") == 0);
 
     const uint32_t create_args[2] = {2, 2};
     vcall(match, 13, 2, create_args);
     flat("SteamAPI_RunCallbacks", 0, NULL);
-
-    uint64_t my_id = steam_lan_get_local_steam_id();
-    uint64_t lobby_id = ((uint64_t)0x01180000u << 32) | (uint32_t)my_id;
+    CHECK_EQ_U32(g_created_calls, 1);
+    /* Como na Steam, o criador também recebe LobbyEnter_t: sem ele o jogo do host
+     * não se considera na sala e não reage a quem entra. */
+    CHECK_EQ_U32(g_enter_calls, 1);
+    CHECK_EQ_U32(g_last_enter_resp, 1);
+    uint64_t lobby_id = g_last_lobby_created;
+    CHECK(g_last_enter_lobby == lobby_id);
+    CHECK_EQ_U32((uint32_t)(lobby_id >> 32), RE5_LAN_STEAMID_LOBBY_HI);
 
     uint32_t k = gstr("Chapter"), v = gstr("1-1");
     const uint32_t set_args[4] = {(uint32_t)lobby_id, (uint32_t)(lobby_id >> 32), k, v};
     vcall(match, 20, 4, set_args);
+    /* Dado de membro do host antes de alguém entrar: tem que chegar ao cliente. */
+    uint32_t kc = gstr("Character"), vc = gstr("Chris");
+    const uint32_t set_mem_args[4] = {(uint32_t)lobby_id, (uint32_t)(lobby_id >> 32), kc, vc};
+    vcall(match, 25, 4, set_mem_args);
 
-    /* Espera o cliente conectar (até 5 segundos) */
-    uint64_t client_id = 0;
-    const uint32_t lobby_args[2] = {(uint32_t)lobby_id, (uint32_t)(lobby_id >> 32)};
-    for (int t = 0; t < 500; t++) {
+    /* O aviso de entrada: LobbyChatUpdate_t com o ID de Sheva e "entrou". */
+    for (int t = 0; t < 500 && !g_chat_calls; t++) {
         SDL_Delay(10);
         flat("SteamAPI_RunCallbacks", 0, NULL);
-        if (vcall(match, 17, 2, lobby_args) >= 2) {
-            uint32_t sid_va = gbuf(8);
-            const uint32_t get_mem_args[4] = {sid_va, (uint32_t)lobby_id, (uint32_t)(lobby_id >> 32), 1};
-            vcall(match, 18, 4, get_mem_args);
-            client_id = (uint64_t)rd32(sid_va + 4) << 32 | rd32(sid_va);
-            break;
-        }
     }
-    CHECK(client_id != 0);
+    CHECK_EQ_U32(g_chat_calls, 1);
+    CHECK_EQ_U32(g_last_chat_state, 0x01); /* k_EChatMemberStateChangeEntered */
+    uint64_t client_id = g_last_chat_user;
+    CHECK_EQ_U32((uint32_t)client_id, 102);
+    CHECK_EQ_U32((uint32_t)(client_id >> 32), RE5_LAN_STEAMID_USER_HI);
+    CHECK(strcmp(friend_name(client_id), "Sheva #102") == 0);
+    CHECK_EQ_U32(g_p2p_req_calls, 1);
+    CHECK(g_last_p2p_req_user == client_id);
+
+    const uint32_t lobby_args[2] = {(uint32_t)lobby_id, (uint32_t)(lobby_id >> 32)};
+    CHECK_EQ_U32(vcall(match, 17, 2, lobby_args), 2);
+    uint32_t sid_va = gbuf(8);
+    const uint32_t get_mem_args[4] = {sid_va, (uint32_t)lobby_id, (uint32_t)(lobby_id >> 32), 1};
+    vcall(match, 18, 4, get_mem_args);
+    CHECK(((uint64_t)rd32(sid_va + 4) << 32 | rd32(sid_va)) == client_id);
 
     /* Espera mensagem P2P do cliente */
     int got_msg = 0;
@@ -148,6 +216,9 @@ static int run_host_mode(void)
         }
     }
     CHECK(got_msg);
+    /* Pedidos de entrada repetidos não duplicam o membro nem o aviso. */
+    CHECK_EQ_U32(g_chat_calls, 1);
+    CHECK_EQ_U32(vcall(match, 17, 2, lobby_args), 2);
 
     /* Envia resposta P2P */
     const char resp[] = "HELLO_FROM_CHRIS";
@@ -161,55 +232,69 @@ static int run_host_mode(void)
     flat("SteamAPI_Shutdown", 0, NULL);
     re5_thread_detach();
     CHECK_DONE();
-    return 0;
 }
 
 static int run_client_mode(void)
 {
     CHECK_EQ_U32(flat("SteamAPI_Init", 0, NULL) & 0xFF, 1);
+    register_all();
     uint32_t match = flat("SteamMatchmaking", 0, NULL);
     uint32_t net = flat("SteamNetworking", 0, NULL);
 
-    /* Descobre o lobby via broadcast */
+    /* Descobre o lobby via broadcast; espera os metadados do host também. */
     uint64_t target_lobby = 0;
+    uint32_t k = gstr("Chapter");
     for (int t = 0; t < 500; t++) {
         vcall(match, 4, 0, NULL); /* RequestLobbyList */
         SDL_Delay(20);
         flat("SteamAPI_RunCallbacks", 0, NULL);
         if (steam_lan_get_lobby_count() > 0) {
-            target_lobby = steam_lan_get_lobby_by_index(0);
-            break;
+            uint64_t l = steam_lan_get_lobby_by_index(0);
+            const uint32_t get_args[3] = {(uint32_t)l, (uint32_t)(l >> 32), k};
+            if (strcmp(re5_gstr(vcall(match, 19, 3, get_args)), "1-1") == 0) {
+                target_lobby = l;
+                break;
+            }
         }
     }
     CHECK(target_lobby != 0);
+    CHECK_EQ_U32((uint32_t)(target_lobby >> 32), RE5_LAN_STEAMID_LOBBY_HI);
 
-    /* Verifica metadados */
-    uint32_t k = gstr("Chapter");
-    const uint32_t get_args[3] = {(uint32_t)target_lobby, (uint32_t)(target_lobby >> 32), k};
-    uint32_t res = vcall(match, 19, 3, get_args);
-    CHECK(strcmp(re5_gstr(res), "1-1") == 0);
+    /* Na lista, o dono da sala aparece com o nome que escolheu e o ID dele. */
+    uint32_t owner_va = gbuf(8);
+    const uint32_t get_owner_args[3] = {owner_va, (uint32_t)target_lobby, (uint32_t)(target_lobby >> 32)};
+    vcall(match, 35, 3, get_owner_args);
+    uint64_t host_id = (uint64_t)rd32(owner_va + 4) << 32 | rd32(owner_va);
+    CHECK_EQ_U32((uint32_t)host_id, 101);
+    CHECK(strcmp(friend_name(host_id), "Chris #101") == 0);
 
     /* Entra no lobby */
     const uint32_t join_args[2] = {(uint32_t)target_lobby, (uint32_t)(target_lobby >> 32)};
     vcall(match, 14, 2, join_args);
 
-    /* Aguarda confirmacao de entrada */
-    int joined = 0;
-    for (int t = 0; t < 500; t++) {
+    for (int t = 0; t < 500 && !g_enter_calls; t++) {
         SDL_Delay(10);
         flat("SteamAPI_RunCallbacks", 0, NULL);
-        if (vcall(match, 17, 2, join_args) >= 2) {
-            joined = 1;
-            break;
-        }
     }
-    CHECK(joined);
+    CHECK_EQ_U32(g_enter_calls, 1);
+    CHECK_EQ_U32(g_last_enter_resp, 1); /* k_EChatRoomEnterResponseSuccess */
+    CHECK(g_last_enter_lobby == target_lobby);
+    CHECK_EQ_U32(vcall(match, 17, 2, join_args), 2);
+    /* Quem entra não recebe LobbyChatUpdate_t de si mesmo. */
+    CHECK_EQ_U32(g_chat_calls, 0);
 
-    /* Envia mensagem P2P no canal 0x389 para o host */
-    uint32_t host_sid_va = gbuf(8);
-    const uint32_t get_owner_args[3] = {host_sid_va, (uint32_t)target_lobby, (uint32_t)(target_lobby >> 32)};
-    vcall(match, 35, 3, get_owner_args);
-    uint64_t host_id = (uint64_t)rd32(host_sid_va + 4) << 32 | rd32(host_sid_va);
+    /* Dado de membro que o host gravou antes da entrada. */
+    uint32_t kc = gstr("Character");
+    const char *hero = "";
+    for (int t = 0; t < 100; t++) {
+        const uint32_t a[5] = {(uint32_t)target_lobby, (uint32_t)(target_lobby >> 32), (uint32_t)host_id,
+                               (uint32_t)(host_id >> 32), kc};
+        hero = re5_gstr(vcall(match, 24, 5, a));
+        if (*hero) break;
+        SDL_Delay(10);
+        flat("SteamAPI_RunCallbacks", 0, NULL);
+    }
+    CHECK(strcmp(hero, "Chris") == 0);
 
     const char msg[] = "HELLO_FROM_SHEVA";
     uint32_t send_buf = gbuf((uint32_t)strlen(msg) + 1);
@@ -240,7 +325,152 @@ static int run_client_mode(void)
     flat("SteamAPI_Shutdown", 0, NULL);
     re5_thread_detach();
     CHECK_DONE();
-    return 0;
+}
+
+/* Arquivo de identidade ausente: criado com nome padrão e um ID de seis dígitos,
+ * que é o account id do CSteamID. */
+static int run_identity_mode(const char *path)
+{
+    remove(path);
+    CHECK_EQ_U32(flat("SteamAPI_Init", 0, NULL) & 0xFF, 1);
+    uint64_t id = steam_lan_get_local_steam_id();
+    CHECK_EQ_U32((uint32_t)(id >> 32), RE5_LAN_STEAMID_USER_HI);
+    CHECK((uint32_t)id >= RE5_LAN_ID_MIN && (uint32_t)id < RE5_LAN_ID_MIN + RE5_LAN_ID_SPAN);
+
+    FILE *f = fopen(path, "r");
+    CHECK(f != NULL);
+    char text[1024] = "";
+    if (f) {
+        size_t n = fread(text, 1, sizeof text - 1, f);
+        text[n] = 0;
+        fclose(f);
+    }
+    /* Outra instância na porta base (testes em paralelo) desloca o ID pelo slot. */
+    uint32_t slot = steam_lan_get_p2p_port() - 27016u;
+    char want[32];
+    snprintf(want, sizeof want, "\nid=%u\n", (uint32_t)id - slot);
+    CHECK(strstr(text, want) != NULL);
+    CHECK(strstr(text, "\nnome=Jogador\n") != NULL);
+
+    char display[64];
+    snprintf(display, sizeof display, "Jogador #%u", (uint32_t)id);
+    uint32_t friends = flat("SteamFriends", 0, NULL);
+    CHECK(strcmp(re5_gstr(vcall(friends, 0, 0, NULL)), display) == 0);
+
+    flat("SteamAPI_Shutdown", 0, NULL);
+    re5_thread_detach();
+    CHECK_DONE();
+}
+
+/* ---- host falso: perde o primeiro pedido de entrada ---- */
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint8_t  type, flags;
+    uint16_t port;
+    uint64_t sender;
+    uint32_t nonce;
+} fake_hdr;
+typedef struct {
+    uint64_t lobby_id, owner_id;
+    uint16_t member_count, max_members;
+    char     owner_name[32];
+    uint16_t data_count;
+} fake_beacon;
+typedef struct {
+    uint64_t lobby_id;
+    uint32_t response_code;
+    uint16_t member_count;
+} fake_join_resp;
+#pragma pack(pop)
+
+#define FAKE_HOST_ID    (((uint64_t)RE5_LAN_STEAMID_USER_HI << 32) | 555555u)
+#define FAKE_LOBBY_ID   (((uint64_t)RE5_LAN_STEAMID_LOBBY_HI << 32) | 555555u)
+
+static void fake_host_join(uint32_t match)
+{
+#if defined(_WIN32)
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+#else
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#endif
+    struct sockaddr_in me, client;
+    memset(&me, 0, sizeof me);
+    me.sin_family = AF_INET;
+    me.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(s, (struct sockaddr *)&me, sizeof me) == 0);
+    socklen_t ml = sizeof me;
+    getsockname(s, (struct sockaddr *)&me, &ml);
+    client = me;
+    client.sin_port = htons(steam_lan_get_p2p_port());
+
+    uint8_t buf[256];
+    fake_hdr *h = (fake_hdr *)buf;
+    *h = (fake_hdr){0x35455221u, 0x01 /* BEACON */, 0, ntohs(me.sin_port), FAKE_HOST_ID, 0xABCD};
+    fake_beacon *b = (fake_beacon *)(buf + sizeof *h);
+    memset(b, 0, sizeof *b);
+    b->lobby_id = FAKE_LOBBY_ID;
+    b->owner_id = FAKE_HOST_ID;
+    b->member_count = 1;
+    b->max_members = 2;
+    snprintf(b->owner_name, sizeof b->owner_name, "Josh");
+    sendto(s, (const char *)buf, sizeof *h + sizeof *b, 0, (struct sockaddr *)&client, sizeof client);
+
+    uint64_t lobby = 0;
+    for (int t = 0; t < 100 && !lobby; t++) {
+        SDL_Delay(5);
+        steam_lan_poll();
+        for (int i = 0; i < steam_lan_get_lobby_count(); i++)
+            if (steam_lan_get_lobby_by_index(i) == FAKE_LOBBY_ID) lobby = FAKE_LOBBY_ID;
+    }
+    CHECK(lobby == FAKE_LOBBY_ID);
+    CHECK(strcmp(friend_name(FAKE_HOST_ID), "Josh #555555") == 0);
+
+    g_enter_calls = 0;
+    const uint32_t join_args[2] = {(uint32_t)FAKE_LOBBY_ID, (uint32_t)(FAKE_LOBBY_ID >> 32)};
+    vcall(match, 14, 2, join_args);
+
+    /* Ignora o 1º pedido (pacote "perdido") e responde ao reenvio. */
+    int reqs = 0;
+    for (int t = 0; t < 400 && reqs < 2; t++) {
+        SDL_Delay(5);
+        int n = (int)recv(s, (char *)buf, sizeof buf, 0);
+        if (n >= (int)sizeof(fake_hdr) && ((fake_hdr *)buf)->type == 0x03 /* JOIN_REQ */) {
+            reqs++;
+            CHECK(((fake_hdr *)buf)->sender == steam_lan_get_local_steam_id());
+        }
+    }
+    CHECK_EQ_U32(reqs, 2);
+    CHECK_EQ_U32(g_enter_calls, 0);
+
+    *h = (fake_hdr){0x35455221u, 0x04 /* JOIN_RESP */, 0, ntohs(me.sin_port), FAKE_HOST_ID, 0xABCD};
+    fake_join_resp *r = (fake_join_resp *)(buf + sizeof *h);
+    *r = (fake_join_resp){FAKE_LOBBY_ID, 1, 2};
+    sendto(s, (const char *)buf, sizeof *h + sizeof *r, 0, (struct sockaddr *)&client, sizeof client);
+    /* Resposta atrasada de outro pedido: tem que ser ignorada. */
+    r->response_code = 4; /* Full */
+    sendto(s, (const char *)buf, sizeof *h + sizeof *r, 0, (struct sockaddr *)&client, sizeof client);
+
+    for (int t = 0; t < 100 && !g_enter_calls; t++) {
+        SDL_Delay(5);
+        flat("SteamAPI_RunCallbacks", 0, NULL);
+    }
+    SDL_Delay(20);
+    flat("SteamAPI_RunCallbacks", 0, NULL);
+    CHECK_EQ_U32(g_enter_calls, 1);
+    CHECK_EQ_U32(g_last_enter_resp, 1);
+    CHECK_EQ_U32(vcall(match, 17, 2, join_args), 2);
+
+    vcall(match, 15, 2, join_args);
+#if defined(_WIN32)
+    closesocket(s);
+#else
+    close(s);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -252,61 +482,45 @@ int main(int argc, char **argv)
 
     if (argc > 1 && strcmp(argv[1], "--host") == 0) return run_host_mode();
     if (argc > 1 && strcmp(argv[1], "--client") == 0) return run_client_mode();
+    if (argc > 2 && strcmp(argv[1], "--identity") == 0) return run_identity_mode(argv[2]);
+
+    /* Identidade vinda do arquivo: nome saneado ('#' separa o ID), ID de seis dígitos. */
+    if (argc > 1) {
+        FILE *f = fopen(argv[1], "w");
+        CHECK(f != NULL);
+        if (f) {
+            fputs("# comentario\nnome =  Leon#Kennedy  \nid=424242\n", f);
+            fclose(f);
+        }
+    }
 
     CHECK_EQ_U32(flat("SteamAPI_Init", 0, NULL) & 0xFF, 1);
 
     /* 1. Identidade */
     uint64_t my_id = steam_lan_get_local_steam_id();
-    CHECK((my_id >> 32) == 0x01100001u);
+    CHECK((my_id >> 32) == RE5_LAN_STEAMID_USER_HI);
     CHECK(steam_lan_get_p2p_port() >= 27016);
-    CHECK(strlen(steam_lan_get_local_name()) > 0);
+    uint32_t slot = steam_lan_get_p2p_port() - (getenv("RE5_LAN_PORT") ? (uint32_t)atoi(getenv("RE5_LAN_PORT")) : 27016u);
+    if (argc > 1) {
+        CHECK_EQ_U32((uint32_t)my_id, 424242u + slot);
+        CHECK(strcmp(steam_lan_get_local_name(), "Leon_Kennedy") == 0);
+    }
 
     uint32_t friends = flat("SteamFriends", 0, NULL);
     CHECK(friends != 0);
+    char display[64];
+    steam_lan_get_display_name(my_id, display, sizeof display);
     uint32_t name_va = vcall(friends, 0, 0, NULL);
-    CHECK(strcmp(re5_gstr(name_va), steam_lan_get_local_name()) == 0);
+    CHECK(strcmp(re5_gstr(name_va), display) == 0);
+    /* Mesmo texto, mesmo ponteiro: o nome não gasta a arena a cada chamada. */
+    CHECK_EQ_U32(vcall(friends, 0, 0, NULL), name_va);
+    CHECK(strcmp(friend_name(my_id), display) == 0);
+    /* Par desconhecido: nome genérico com o ID. */
+    CHECK(strcmp(friend_name(((uint64_t)RE5_LAN_STEAMID_USER_HI << 32) | 777777u), "Jogador #777777") == 0);
 
-    /* 2. Registro de callbacks do Steamworks:
-     *    LobbyCreated_t (513), LobbyEnter_t (504), LobbyChatUpdate_t (506), LobbyDataUpdate_t (505) */
-    uint32_t vt_created = gbuf(12), cb_created = gbuf(16);
-    wr32(vt_created, re5_thunk_new("teste!CreatedResult", cb_dummy, 16, NULL));
-    wr32(vt_created + 4, re5_thunk_new("teste!CreatedRun", cb_created_run, 4, NULL));
-    wr32(vt_created + 8, re5_thunk_new("teste!CreatedSize", cb_dummy, 0, NULL));
-    wr32(cb_created, vt_created);
-    const uint32_t reg_created[2] = {cb_created, 513};
-    flat("SteamAPI_RegisterCallback", 2, reg_created);
-
-    uint32_t vt_enter = gbuf(12), cb_enter = gbuf(16);
-    wr32(vt_enter, re5_thunk_new("teste!EnterResult", cb_dummy, 16, NULL));
-    wr32(vt_enter + 4, re5_thunk_new("teste!EnterRun", cb_enter_run, 4, NULL));
-    wr32(vt_enter + 8, re5_thunk_new("teste!EnterSize", cb_dummy, 0, NULL));
-    wr32(cb_enter, vt_enter);
-    const uint32_t reg_enter[2] = {cb_enter, 504};
-    flat("SteamAPI_RegisterCallback", 2, reg_enter);
-
-    uint32_t vt_chat = gbuf(12), cb_chat = gbuf(16);
-    wr32(vt_chat, re5_thunk_new("teste!ChatResult", cb_dummy, 16, NULL));
-    wr32(vt_chat + 4, re5_thunk_new("teste!ChatRun", cb_chat_run, 4, NULL));
-    wr32(vt_chat + 8, re5_thunk_new("teste!ChatSize", cb_dummy, 0, NULL));
-    wr32(cb_chat, vt_chat);
-    const uint32_t reg_chat[2] = {cb_chat, 506};
-    flat("SteamAPI_RegisterCallback", 2, reg_chat);
-
-    uint32_t vt_data = gbuf(12), cb_data = gbuf(16);
-    wr32(vt_data, re5_thunk_new("teste!DataResult", cb_dummy, 16, NULL));
-    wr32(vt_data + 4, re5_thunk_new("teste!DataRun", cb_data_run, 4, NULL));
-    wr32(vt_data + 8, re5_thunk_new("teste!DataSize", cb_dummy, 0, NULL));
-    wr32(cb_data, vt_data);
-    const uint32_t reg_data[2] = {cb_data, 505};
-    flat("SteamAPI_RegisterCallback", 2, reg_data);
-
-    uint32_t vt_p2p = gbuf(12), cb_p2p = gbuf(16);
-    wr32(vt_p2p, re5_thunk_new("teste!P2PReqResult", cb_dummy, 16, NULL));
-    wr32(vt_p2p + 4, re5_thunk_new("teste!P2PReqRun", cb_p2p_req_run, 4, NULL));
-    wr32(vt_p2p + 8, re5_thunk_new("teste!P2PReqSize", cb_dummy, 0, NULL));
-    wr32(cb_p2p, vt_p2p);
-    const uint32_t reg_p2p[2] = {cb_p2p, 1202};
-    flat("SteamAPI_RegisterCallback", 2, reg_p2p);
+    /* 2. Callbacks: LobbyCreated_t (513), LobbyEnter_t (504), LobbyChatUpdate_t (506),
+     *    LobbyDataUpdate_t (505), P2PSessionRequest_t (1202) */
+    register_all();
 
     /* 3. Criação de Lobby via ISteamMatchmaking009 (slot 13) */
     uint32_t match = flat("SteamMatchmaking", 0, NULL);
@@ -316,12 +530,14 @@ int main(int argc, char **argv)
     uint32_t call_id = vcall(match, 13, 2, create_args);
     CHECK(call_id != 0);
 
-    /* Despacha os callbacks pendentes */
     flat("SteamAPI_RunCallbacks", 0, NULL);
     CHECK_EQ_U32(g_created_calls, 1);
-    CHECK_EQ_U32(g_enter_calls, 0); /* Host não recebe LobbyEnter_t na criação */
+    CHECK_EQ_U32(g_enter_calls, 1); /* o criador também entra na sala */
+    CHECK_EQ_U32(g_data_calls, 1);
     CHECK(g_last_lobby_created != 0);
     uint64_t lobby_id = g_last_lobby_created;
+    CHECK(g_last_enter_lobby == lobby_id);
+    CHECK_EQ_U32((uint32_t)(lobby_id >> 32), RE5_LAN_STEAMID_LOBBY_HI);
 
     /* 4. Consulta ao estado do Lobby */
     const uint32_t lobby_args[2] = {(uint32_t)lobby_id, (uint32_t)(lobby_id >> 32)};
@@ -342,9 +558,10 @@ int main(int argc, char **argv)
     const uint32_t get_data_args[3] = {(uint32_t)lobby_id, (uint32_t)(lobby_id >> 32), k_chap};
     uint32_t res_val = vcall(match, 19, 3, get_data_args);
     CHECK(strcmp(re5_gstr(res_val), "1-1") == 0);
+    CHECK_EQ_U32(vcall(match, 19, 3, get_data_args), res_val);
 
     flat("SteamAPI_RunCallbacks", 0, NULL);
-    CHECK_EQ_U32(g_data_calls, 1);
+    CHECK_EQ_U32(g_data_calls, 2);
 
     /* 6. Metadados de Membro (SetLobbyMemberData / GetLobbyMemberData) */
     uint32_t k_hero = gstr("Character"), v_hero = gstr("Chris");
@@ -364,53 +581,14 @@ int main(int argc, char **argv)
     const uint32_t avail_args[2] = {sz_out, 0x389};
     CHECK_EQ_U32(vcall(net, 1, 2, avail_args) & 0xFF, 0); /* Inicialmente vazia */
 
-    const char test_payload[] = "RE5_LAN_COOP_PACKET_TEST";
-    uint32_t payload_len = (uint32_t)strlen(test_payload) + 1;
-
-    /* Envia pacote P2P para si mesmo (loopback) */
-    uint32_t send_buf = gbuf(payload_len);
-    memcpy(re5_g2h(send_buf), test_payload, payload_len);
-    const uint32_t send_args[6] = {(uint32_t)my_id, (uint32_t)(my_id >> 32), send_buf, payload_len, 0, 0x389};
-    (void)vcall(net, 0, 6, send_args);
-
-    /* Aguarda até 100 ms para recepção loopback pelo worker */
-    for (int t = 0; t < 20; t++) {
-        SDL_Delay(5);
-        steam_lan_poll();
-        if (steam_lan_is_p2p_available(NULL, 0x389)) break;
-    }
-
-    /* Se o loopback UDP recebeu o pacote, lê com ReadP2PPacket */
-    if (vcall(net, 1, 2, avail_args) & 0xFF) {
-        CHECK_EQ_U32(rd32(sz_out), payload_len);
-
-        uint32_t dest_buf = gbuf(1200);
-        uint32_t read_sz = gbuf(4);
-        uint32_t remote_sid = gbuf(8);
-        const uint32_t read_args[5] = {dest_buf, 1200, read_sz, remote_sid, 0x389};
-
-        CHECK_EQ_U32(vcall(net, 2, 5, read_args) & 0xFF, 1);
-        CHECK_EQ_U32(rd32(read_sz), payload_len);
-        CHECK(strcmp(re5_gstr(dest_buf), test_payload) == 0);
-
-        flat("SteamAPI_RunCallbacks", 0, NULL);
-        CHECK_EQ_U32(g_p2p_req_calls, 1);
-        CHECK(g_last_p2p_req_user == my_id);
-    }
-
     /* 8. Saída do Lobby */
     vcall(match, 15, 2, lobby_args);
     CHECK_EQ_U32(vcall(match, 17, 2, lobby_args), 0);
 
-    /* 9. Desregistro e Shutdown */
-    flat("SteamAPI_UnregisterCallback", 1, &cb_created);
-    flat("SteamAPI_UnregisterCallback", 1, &cb_enter);
-    flat("SteamAPI_UnregisterCallback", 1, &cb_chat);
-    flat("SteamAPI_UnregisterCallback", 1, &cb_data);
-    flat("SteamAPI_UnregisterCallback", 1, &cb_p2p);
+    /* 9. Entrada com o 1º pedido perdido: o cliente reenvia e só a 1ª resposta vale. */
+    fake_host_join(match);
 
     flat("SteamAPI_Shutdown", 0, NULL);
     re5_thread_detach();
     CHECK_DONE();
-    return 0;
 }
