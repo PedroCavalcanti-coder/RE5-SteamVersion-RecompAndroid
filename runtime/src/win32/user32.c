@@ -34,6 +34,7 @@
 #include "re5/coldebug.h"
 #include "re5/runtime.h"
 #include "re5/user32.h"
+#include "re5_cursors.h"
 
 #if defined(RE5_HOST_WINDOWS)
 #include <windows.h>
@@ -425,6 +426,9 @@ static void client_origin(const window *w, int32_t *ox, int32_t *oy)
 
 static uint32_t send_msg(window *w, uint32_t msg, uint32_t wparam, uint32_t lparam);
 static void activate(window *w, int on);
+static void update_clip_grab(void);
+static int cursor_hidden(void);
+static void free_cursors(void);
 
 static uint32_t pack16(int32_t lo, int32_t hi) { return ((uint32_t)(hi & 0xFFFF) << 16) | (uint32_t)(lo & 0xFFFF); }
 
@@ -457,6 +461,9 @@ static void destroy_window(window *w)
     memset(w, 0, sizeof *w);
     if (g_active == hwnd) g_active = 0;
     if (g_focus == hwnd) g_focus = 0;
+    int any_used = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (g_windows[i].used) any_used = 1;
+    if (!any_used) free_cursors();
 }
 
 static uint32_t default_proc(window *w, uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam)
@@ -629,6 +636,7 @@ static void activate(window *w, int on)
         if (g_active == w->hwnd) g_active = 0;
         if (g_focus == w->hwnd) g_focus = 0;
     }
+    update_clip_grab();
 }
 
 static void u_ShowWindow(CPU *c)
@@ -1127,6 +1135,7 @@ static void apply_display_requests(void)
         g_rel_on = rel;
         SDL_SetRelativeMouseMode(rel ? SDL_TRUE : SDL_FALSE);
     }
+    update_clip_grab();
 }
 
 static void pump(void)
@@ -1383,20 +1392,83 @@ static void u_EndPaint(CPU *c) { c->eax = 1; }
 #define U32_ICON_BASE   0x1C000000u
 #define U32_CURSOR_BASE 0x1D000000u
 
-/* Ícones e cursores não têm imagem no host: o handle só precisa ser estável e
- * diferente por recurso (IDC_ARROW, IDI_APPLICATION, ícone do executável). */
+/* Ícones e cursores: carregamos as formas estilizadas do RE5 (101 normal, 102 hover verde)
+ * sobrepondo como SDL_Cursor com hotspot em (0, 0). */
 static void u_LoadIcon(CPU *c) { c->eax = U32_ICON_BASE | (re5_arg(c, 1) & 0xFFFFu); }
 static void u_LoadCursorA(CPU *c) { c->eax = U32_CURSOR_BASE | (re5_arg(c, 1) & 0xFFFFu); }
 static void u_DestroyIcon(CPU *c) { c->eax = 1; }
 
 static uint32_t g_cursor = U32_CURSOR_BASE | 32512u;   /* IDC_ARROW */
 static int32_t g_cursor_count;                          /* contador do ShowCursor: começa em 0 com mouse */
+static int g_clip_wanted;
+static SDL_Cursor *g_cursor_sdl_sys_arrow;
+static SDL_Cursor *g_cursor_sdl_101;
+static SDL_Cursor *g_cursor_sdl_102;
 
-static int cursor_hidden(void) { return !g_cursor || g_cursor_count < 0; }
+static SDL_Cursor *create_color_cursor(const uint32_t *pixels, int w, int h, int hot_x, int hot_y)
+{
+    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormatFrom(
+        (void *)pixels, w, h, 32, w * 4, SDL_PIXELFORMAT_ARGB8888);
+    if (!surf) return NULL;
+    SDL_Cursor *cur = SDL_CreateColorCursor(surf, hot_x, hot_y);
+    SDL_FreeSurface(surf);
+    return cur;
+}
+
+static void ensure_cursors(void)
+{
+    if (!g_sdl_ready || g_cursor_sdl_101) return;
+    g_cursor_sdl_sys_arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
+    g_cursor_sdl_101 = create_color_cursor(k_cursor_re5_arrow, 32, 32, 0, 0);
+    g_cursor_sdl_102 = create_color_cursor(k_cursor_re5_hover, 32, 32, 0, 0);
+}
+
+static void free_cursors(void)
+{
+    if (g_cursor_sdl_101) { SDL_FreeCursor(g_cursor_sdl_101); g_cursor_sdl_101 = NULL; }
+    if (g_cursor_sdl_102) { SDL_FreeCursor(g_cursor_sdl_102); g_cursor_sdl_102 = NULL; }
+    if (g_cursor_sdl_sys_arrow) { SDL_FreeCursor(g_cursor_sdl_sys_arrow); g_cursor_sdl_sys_arrow = NULL; }
+}
+
+static int cursor_hidden(void)
+{
+    return !g_cursor || g_cursor == (U32_CURSOR_BASE | 104u) || g_cursor_count < 0;
+}
+
+static void update_clip_grab(void)
+{
+    window *w = find_window(g_active);
+    if (!w) {
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            if (g_windows[i].used && g_windows[i].sdl) { w = &g_windows[i]; break; }
+        }
+    }
+    if (!w || !w->sdl) return;
+
+    /* No jogo original, quando o mouse está visível (menus, pause, inventário),
+     * ele consegue sair dos limites da tela para clicar em outros programas.
+     * Só confina à janela quando o jogo pediu ClipCursor E o cursor está escondido (gameplay). */
+    int should_grab = g_clip_wanted && cursor_hidden();
+    SDL_SetWindowGrab(w->sdl, should_grab ? SDL_TRUE : SDL_FALSE);
+}
 
 static void apply_cursor(void)
 {
-    if (g_sdl_ready) SDL_ShowCursor(g_cursor && g_cursor_count >= 0 ? SDL_ENABLE : SDL_DISABLE);
+    if (!g_sdl_ready) return;
+    ensure_cursors();
+    int hidden = cursor_hidden();
+    SDL_ShowCursor(hidden ? SDL_DISABLE : SDL_ENABLE);
+    if (!hidden) {
+        uint32_t id = g_cursor & 0xFFFFu;
+        if (id == 102u && g_cursor_sdl_102) {
+            SDL_SetCursor(g_cursor_sdl_102);
+        } else if ((id == 101u || id == 32512u) && g_cursor_sdl_101) {
+            SDL_SetCursor(g_cursor_sdl_101);
+        } else if (g_cursor_sdl_sys_arrow) {
+            SDL_SetCursor(g_cursor_sdl_sys_arrow);
+        }
+    }
+    update_clip_grab();
 }
 
 static void u_SetCursor(CPU *c)
@@ -1416,8 +1488,12 @@ static void u_ShowCursor(CPU *c)
 static void u_GetCursorPos(CPU *c)
 {
     uint32_t pt = re5_arg(c, 0);
-    wr32(pt, (uint32_t)g_cursor_x);
-    wr32(pt + 4, (uint32_t)g_cursor_y);
+    int x = g_cursor_x, y = g_cursor_y;
+    if (g_sdl_ready && !g_rel_on) {
+        SDL_GetGlobalMouseState(&x, &y);
+    }
+    wr32(pt, (uint32_t)x);
+    wr32(pt + 4, (uint32_t)y);
     c->eax = 1;
 }
 
@@ -1426,6 +1502,11 @@ static void u_SetCursorPos(CPU *c)
     g_cursor_x = (int32_t)re5_arg(c, 0);
     g_cursor_y = (int32_t)re5_arg(c, 1);
     window *w = find_window(g_active);
+    if (!w) {
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            if (g_windows[i].used && g_windows[i].sdl) { w = &g_windows[i]; break; }
+        }
+    }
     if (w && w->sdl) {
         int32_t ox, oy;
         client_origin(w, &ox, &oy);
@@ -1438,8 +1519,8 @@ static void u_SetCursorPos(CPU *c)
  * área cliente inteira); NULL solta. */
 static void u_ClipCursor(CPU *c)
 {
-    window *w = find_window(g_active);
-    if (w && w->sdl) SDL_SetWindowGrab(w->sdl, re5_arg(c, 0) ? SDL_TRUE : SDL_FALSE);
+    g_clip_wanted = re5_arg(c, 0) != 0;
+    update_clip_grab();
     c->eax = 1;
 }
 
