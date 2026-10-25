@@ -25,6 +25,18 @@ extern "C" {
 #define RE5_LAN_MAX_VAL_LEN            128
 #define RE5_LAN_MAX_DATA_ENTRIES       32
 #define RE5_LAN_MAX_PACKET_SIZE        1400
+#define RE5_LAN_MAX_NAME_LEN           24   /* nome escolhido pelo jogador, sem o ID */
+#define RE5_LAN_MAX_DISPLAY_LEN        40   /* "Nome #123456" */
+
+/* Parte alta dos CSteamID: individual (universo público, tipo 1, instância 1) e
+ * lobby (tipo 8 = chat, instância com k_EChatInstanceFlagLobby|MMSLobby). */
+#define RE5_LAN_STEAMID_USER_HI        0x01100001u
+#define RE5_LAN_STEAMID_LOBBY_HI       0x01860000u
+
+/* Faixa do ID de jogador (account id do CSteamID): seis dígitos, fácil de ler
+ * na tela e de conferir entre dois aparelhos. */
+#define RE5_LAN_ID_MIN                 100000u
+#define RE5_LAN_ID_SPAN                900000u
 
 /* Tipos de eventos postados para o steam_api despachar em RunCallbacks */
 typedef enum {
@@ -51,11 +63,18 @@ int  steam_lan_init(void);
 void steam_lan_shutdown(void);
 void steam_lan_poll(void);
 
-/* Identidade da instância */
+/* Identidade da instância.
+ * O ID (account id do CSteamID) vem de RE5_STEAM_ID ou do arquivo de identidade
+ * (RE5_LAN_CONFIG, ou C:\\Users\\Player\\re5_lan.ini no VFS), gerado aleatório e
+ * gravado na primeira execução; uma 2ª instância no mesmo aparelho soma 1.
+ * O nome vem de RE5_PLAYER_NAME ou da chave "nome" do mesmo arquivo. */
 uint64_t    steam_lan_get_local_steam_id(void);
 const char *steam_lan_get_local_name(void);
-const char *steam_lan_get_peer_name(uint64_t steam_id);
 uint16_t    steam_lan_get_p2p_port(void);
+
+/* Nome como os jogadores o veem: "Nome #ID". Para um par ainda desconhecido,
+ * "Jogador #ID". Copia para `out` (a tabela de pares muda na thread de rede). */
+void        steam_lan_get_display_name(uint64_t steam_id, char *out, size_t cap);
 
 /* ISteamMatchmaking009 */
 uint64_t    steam_lan_create_lobby(uint32_t lobby_type, int max_members, uint64_t call_id);

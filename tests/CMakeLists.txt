@@ -68,7 +68,13 @@ add_test(NAME steam_api COMMAND test_steam_api "${CMAKE_CURRENT_BINARY_DIR}/stea
 
 add_executable(test_steam_lan unit/test_steam_lan.c)
 target_link_libraries(test_steam_lan PRIVATE re5_runtime)
-add_test(NAME steam_lan COMMAND test_steam_lan)
+set(RE5_LAN_ID_TEST "${CMAKE_CURRENT_BINARY_DIR}/lan_identity/re5_lan.ini")
+set(RE5_LAN_ID_NEW "${CMAKE_CURRENT_BINARY_DIR}/lan_identity_new/sub/re5_lan.ini")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/lan_identity")
+add_test(NAME steam_lan COMMAND test_steam_lan "${RE5_LAN_ID_TEST}")
+set_tests_properties(steam_lan PROPERTIES ENVIRONMENT "RE5_LAN_CONFIG=${RE5_LAN_ID_TEST}")
+add_test(NAME steam_lan_identity COMMAND test_steam_lan --identity "${RE5_LAN_ID_NEW}")
+set_tests_properties(steam_lan_identity PROPERTIES ENVIRONMENT "RE5_LAN_CONFIG=${RE5_LAN_ID_NEW}")
 add_test(NAME lan_coop COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_lan_coop.py" "$<TARGET_FILE:test_steam_lan>")
 
 if(NOT WIN32)

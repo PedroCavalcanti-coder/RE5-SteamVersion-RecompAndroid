@@ -21,8 +21,9 @@
  *     guarda; o que o "Steam" responde (estatísticas recebidas/gravadas...) entra
  *     numa fila entregue em SteamAPI_RunCallbacks, chamando o Run do objeto.
  *
- * O usuário é um jogador fixo e logado ("Player"), como os emuladores offline
- * fazem: o jogo segue o caminho normal sem rede. Arquivos da nuvem
+ * O usuário é um jogador logado com identidade da rede local (steam_lan.c: ID
+ * único de seis dígitos e o nome que o jogador escolheu); matchmaking e P2P
+ * vão por UDP na LAN. Arquivos da nuvem
  * (ISteamRemoteStorage) ficam na pasta do usuário do runtime.
  */
 #include <stdio.h>
@@ -38,9 +39,6 @@
 #include "re5/steam_lan.h"
 
 #define APP_ID       21690u
-#define STEAM_ID_LO  0x00000001u   /* conta 1 */
-#define STEAM_ID_HI  0x01100001u   /* universo público, individual, instância 1 */
-#define PERSONA_NAME "Player"
 #define VT_SIZE      80u
 
 static uint64_t g_next_call_id = 1000;
@@ -68,6 +66,27 @@ static uint32_t gstr(const char *s)
     uint32_t n = (uint32_t)strlen(s) + 1, va = galloc(n);
     memcpy(re5_g2h(va), s, n);
     return va;
+}
+
+/* Strings devolvidas a cada chamada (GetLobbyData, nomes): a arena não devolve
+ * memória, então cada texto distinto ganha uma cópia só, reaproveitada depois.
+ * O ponteiro fica estável, como o da Steam para o nome do jogador. */
+#define MAX_ISTR 1024
+static struct { char *host; uint32_t va; } g_istr[MAX_ISTR];
+static uint32_t g_nistr;
+
+static uint32_t gstr_intern(const char *s)
+{
+    for (uint32_t i = 0; i < g_nistr; i++)
+        if (strcmp(g_istr[i].host, s) == 0) return g_istr[i].va;
+    if (g_nistr == MAX_ISTR) re5_fatal("steam_api", "mais de %d textos distintos devolvidos ao jogo", MAX_ISTR);
+    size_t n = strlen(s) + 1;
+    char *h = malloc(n);
+    if (!h) re5_fatal("steam_api", "sem memória do host");
+    memcpy(h, s, n);
+    g_istr[g_nistr].host = h;
+    g_istr[g_nistr].va = gstr(s);
+    return g_istr[g_nistr++].va;
 }
 
 /* ---- interfaces ---- */
@@ -141,18 +160,24 @@ typedef struct { uint32_t obj; uint64_t call; } call_result;
 static call_result g_results[MAX_CB];
 static uint32_t g_nresults;
 
-typedef struct { int id; uint32_t data, size; uint64_t call; } pending;
+#define MAX_CB_DATA 64
+typedef struct { int id; uint32_t size; uint64_t call; uint8_t data[MAX_CB_DATA]; } pending;
 #define MAX_PENDING 64
 static pending g_pending[MAX_PENDING];
 static uint32_t g_npending;
 
-/* Enfileira um resultado do "Steam". call != 0: resposta de uma SteamAPICall_t. */
+/* Enfileira um resultado do "Steam". call != 0: resposta de uma SteamAPICall_t.
+ * Os dados ficam no host até a entrega: na arena cada callback seria memória
+ * perdida, e o co-op gera callbacks sem parar. */
 static void post_callback(int id, const void *data, uint32_t size, uint64_t call)
 {
     if (g_npending == MAX_PENDING) re5_fatal("steam_api", "fila de callbacks cheia (o jogo não chama RunCallbacks)");
-    uint32_t va = galloc(size);
-    memcpy(re5_g2h(va), data, size);
-    g_pending[g_npending++] = (pending){id, va, size, call};
+    if (size > MAX_CB_DATA) re5_fatal("steam_api", "callback %d com %u bytes (máximo %u)", id, size, MAX_CB_DATA);
+    pending *p = &g_pending[g_npending++];
+    p->id = id;
+    p->size = size;
+    p->call = call;
+    memcpy(p->data, data, size);
 }
 
 /* thiscall do guest: this em ecx, argumentos na pilha. */
@@ -186,7 +211,8 @@ static void s_RunCallbacks(CPU *c)
             break;
         }
         case RE5_LAN_EVT_LOBBY_ENTERED: {
-            uint32_t d[5] = {(uint32_t)evt.lobby_id, (uint32_t)(evt.lobby_id >> 32), 0, 0, evt.param1};
+            /* LobbyEnter_t (pack 8 no Windows): lobby, permissões, bLocked, resposta em +16; 24 bytes. */
+            uint32_t d[6] = {(uint32_t)evt.lobby_id, (uint32_t)(evt.lobby_id >> 32), 0, 0, evt.param1, 0};
             post_callback(504, d, sizeof d, evt.call_id);
             break;
         }
@@ -228,24 +254,33 @@ static void s_RunCallbacks(CPU *c)
     pending batch[MAX_PENDING];
     memcpy(batch, g_pending, n * sizeof batch[0]);
     g_npending = 0;
+    /* Um buffer do guest por entrega (o Run de um callback pode chamar RunCallbacks). */
+    static uint32_t s_cbbuf[4];
+    static uint32_t s_depth;
+    if (s_depth == 4) re5_fatal("steam_api", "SteamAPI_RunCallbacks aninhado demais");
+    if (!s_cbbuf[s_depth]) s_cbbuf[s_depth] = galloc(MAX_CB_DATA);
+    uint32_t va = s_cbbuf[s_depth++];
     for (uint32_t i = 0; i < n; i++) {
         pending *p = &batch[i];
+        memcpy(re5_g2h(va), p->data, p->size);
+        const uint32_t pdata = va;
         if (p->call) {
             for (uint32_t k = 0; k < g_nresults; k++) {
                 if (g_results[k].call != p->call) continue;
                 uint32_t obj = g_results[k].obj;
                 g_results[k] = g_results[--g_nresults];
                 wr8(obj + CB_FLAGS, rd8(obj + CB_FLAGS) & (uint8_t)~K_FLAG_REGISTERED);
-                const uint32_t a[4] = {p->data, 0 /* bIOFailure */, (uint32_t)p->call, (uint32_t)(p->call >> 32)};
+                const uint32_t a[4] = {pdata, 0 /* bIOFailure */, (uint32_t)p->call, (uint32_t)(p->call >> 32)};
                 call_method(obj, CB_RUN_RESULT, 4, a);
                 break;
             }
         }
         for (uint32_t k = 0; k < g_ncallbacks; k++) {
             uint32_t obj = g_callbacks[k];
-            if ((int32_t)rd32(obj + CB_ID) == p->id) call_method(obj, CB_RUN, 1, &p->data);
+            if ((int32_t)rd32(obj + CB_ID) == p->id) call_method(obj, CB_RUN, 1, &pdata);
         }
     }
+    s_depth--;
 }
 
 static void s_RegisterCallback(CPU *c)
@@ -462,7 +497,7 @@ static void t_GetAPICallResult(CPU *c)
     for (uint32_t i = 0; i < g_npending; i++) {
         pending *p = &g_pending[i];
         if (p->call != call || p->id != expected) continue;
-        memcpy(re5_g2h(out), re5_g2h(p->data), p->size < cub ? p->size : cub);
+        memcpy(re5_g2h(out), p->data, p->size < cub ? p->size : cub);
         if (failed) wr8(failed, 0);
         g_pending[i] = g_pending[--g_npending];
         ret_bool(c, 1);
@@ -569,7 +604,8 @@ static uint64_t game_id(void) { return APP_ID; }
 /* UserStatsReceived_t (1101): uint64 m_nGameID, EResult m_eResult, CSteamID m_steamIDUser. */
 static void s_RequestCurrentStats(CPU *c)
 {
-    uint32_t d[6] = {(uint32_t)game_id(), 0, 1 /* k_EResultOK */, 0, STEAM_ID_LO, STEAM_ID_HI};
+    uint64_t me = steam_lan_get_local_steam_id();
+    uint32_t d[6] = {(uint32_t)game_id(), 0, 1 /* k_EResultOK */, 0, (uint32_t)me, (uint32_t)(me >> 32)};
     post_callback(1101, d, sizeof d, 0);
     ret_bool(c, 1);
 }
@@ -644,15 +680,21 @@ static const method k_stats[] = {
 
 /* ---- ISteamFriends014 ---- */
 
+/* Nomes como "Nome #ID": o ID único de cada jogador aparece onde o jogo mostra o
+ * nome (lista de salas, tela de parceiro), e dois "Jogador" na mesma rede se distinguem. */
 static void f_GetPersonaName(CPU *c)
 {
-    c->eax = gstr(steam_lan_get_local_name());
+    char name[RE5_LAN_MAX_DISPLAY_LEN];
+    steam_lan_get_display_name(steam_lan_get_local_steam_id(), name, sizeof name);
+    c->eax = gstr_intern(name);
 }
 
 static void f_GetFriendPersonaName(CPU *c)
 {
     uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
-    c->eax = gstr(steam_lan_get_peer_name(id));
+    char name[RE5_LAN_MAX_DISPLAY_LEN];
+    steam_lan_get_display_name(id, name, sizeof name);
+    c->eax = gstr_intern(name);
 }
 
 static void f_GetPersonaState(CPU *c) { c->eax = 1; }   /* k_EPersonaStateOnline */
@@ -922,7 +964,7 @@ static void m_GetLobbyData(CPU *c)
 {
     uint64_t id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
     const char *key = re5_gstr(re5_arg(c, 2));
-    c->eax = gstr(steam_lan_get_lobby_data(id, key));
+    c->eax = gstr_intern(steam_lan_get_lobby_data(id, key));
 }
 
 static void m_SetLobbyData(CPU *c)
@@ -938,7 +980,7 @@ static void m_GetLobbyMemberData(CPU *c)
     uint64_t lobby_id = (uint64_t)re5_arg(c, 1) << 32 | re5_arg(c, 0);
     uint64_t user_id  = (uint64_t)re5_arg(c, 3) << 32 | re5_arg(c, 2);
     const char *key = re5_gstr(re5_arg(c, 4));
-    c->eax = gstr(steam_lan_get_lobby_member_data(lobby_id, user_id, key));
+    c->eax = gstr_intern(steam_lan_get_lobby_member_data(lobby_id, user_id, key));
 }
 
 static void m_SetLobbyMemberData(CPU *c)
