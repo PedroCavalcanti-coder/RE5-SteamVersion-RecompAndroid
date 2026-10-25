@@ -33,6 +33,7 @@
 #include <SDL2/SDL_syswm.h>
 
 #include "re5/coldebug.h"
+#include "re5/lan_menu.h"
 #include "re5/runtime.h"
 #include "re5/user32.h"
 #include "re5_cursors.h"
@@ -1094,6 +1095,7 @@ void re5_user32_handle_event(const SDL_Event *e)
 {
     const SDL_Event ev = *e;
     window *w = NULL;
+    if (re5_lan_menu_event(e)) return;   /* menu LAN aberto (F12 / três dedos): a entrada é dele */
     switch (ev.type) {
     case SDL_KEYDOWN:
     case SDL_KEYUP:

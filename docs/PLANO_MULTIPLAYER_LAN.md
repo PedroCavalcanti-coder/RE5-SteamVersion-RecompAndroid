@@ -62,6 +62,15 @@ Atualmente, `runtime/src/win32/steam_api.c` implementa o Steamworks de forma 100
     vê o nome e o ID do host; o host vê os de quem entrou.
   - Cada pacote leva um *nonce* do processo: outro jogador com o mesmo ID gera um aviso no log.
 
+- **Menu de perfil dentro do jogo** (`runtime/src/win32/lan_menu.c`): **F12** ou **toque com três
+  dedos** abre um painel desenhado por cima do quadro (como o `coldebug`) para editar o **nome**, o
+  **país** (a bandeira: `ISteamUtils::GetIPCountry` devolve o código do perfil) e os **IPs de host**.
+  Mostra o ID e o IP do aparelho e os membros da sala com país, ping e tempo sem resposta.
+  Salvar grava em `re5_lan.ini`, avisa o parceiro (`PKT_PROFILE`) e gera `PersonaStateChange_t`.
+  Com o menu aberto, teclado/mouse/toque vão para ele. Fonte: `lan_font.h`, gerada por
+  `scripts/gen_lan_font.py` da DejaVu Sans Mono.
+- **País padrão**: chave `pais=` do arquivo, `RE5_COUNTRY`, ou a localidade do sistema (`pt_BR` -> BR).
+
 ### Etapa 2: Camada de Transporte de Rede do Host (`steam_lan`)
 - **Arquivos**: `runtime/include/re5/steam_lan.h` e `runtime/src/win32/steam_lan.c`.
 - **Implementação**:
@@ -110,6 +119,17 @@ Atualmente, `runtime/src/win32/steam_api.c` implementa o Steamworks de forma 100
   (causa típica: firewall do host bloqueando UDP de entrada nas portas 27015–27031). O host trata
   pedidos repetidos sem duplicar o membro e reenvia ao novo membro os dados de sala e os seus de membro.
 - **ID de lobby**: parte alta `0x01860000` (tipo chat, flags de lobby), como os lobbies da Steam.
+
+- **Celular**:
+  - *Queda do parceiro*: membros da sala trocam `PKT_KEEPALIVE` a cada 1 s. Sem notícia por 15 s
+    (`RE5_LAN_TIMEOUT_MS`), o jogo recebe `LobbyChatUpdate_t` "desconectou" e
+    `P2PSessionConnectFail_t` (timeout), em vez de esperar para sempre por um app fechado ou um Wi-Fi caído.
+  - *Ping*: o keepalive ecoa o tempo do outro lado; o menu mostra o RTT de cada membro.
+  - *Troca de IP*: o endereço do parceiro segue o que chega no keepalive (DHCP/roaming).
+  - *Hotspot*: além de 255.255.255.255, o beacon/PING vai para o broadcast de cada interface
+    (`getifaddrs`), que é o que funciona com um celular servindo de roteador.
+  - *Rede sem broadcast*: `hosts=` no arquivo, `RE5_LAN_HOSTS` ou o campo "IP do host" do menu:
+    o PING vai direto para esses IPs.
 
 ### Etapa 4: Implementação de `ISteamNetworking005` (Transporte P2P de Gameplay)
 - **Métodos principais a implementar**:

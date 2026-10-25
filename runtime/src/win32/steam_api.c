@@ -245,6 +245,18 @@ static void s_RunCallbacks(CPU *c)
             post_callback(1202, d, sizeof d, 0);
             break;
         }
+        case RE5_LAN_EVT_P2P_SESSION_FAIL: {
+            /* P2PSessionConnectFail_t: CSteamID, uint8 m_eP2PSessionError (16 bytes com pack 8). */
+            uint32_t d[4] = {(uint32_t)evt.user_id, (uint32_t)(evt.user_id >> 32), evt.param1 & 0xFF, 0};
+            post_callback(1203, d, sizeof d, 0);
+            break;
+        }
+        case RE5_LAN_EVT_PERSONA_CHANGE: {
+            /* PersonaStateChange_t: uint64 m_ulSteamID, int m_nChangeFlags. */
+            uint32_t d[4] = {(uint32_t)evt.user_id, (uint32_t)(evt.user_id >> 32), evt.param1, 0};
+            post_callback(304, d, sizeof d, 0);
+            break;
+        }
         default:
             break;
         }
@@ -469,11 +481,13 @@ static void t_SecondsSinceActive(CPU *c) { c->eax = (uint32_t)time(NULL) - g_sta
 static void t_GetConnectedUniverse(CPU *c) { c->eax = 1; }   /* k_EUniversePublic */
 static void t_GetServerRealTime(CPU *c) { c->eax = (uint32_t)time(NULL); }
 
+/* País do jogador (a bandeira que o jogo mostra): o do perfil LAN, editável no
+ * menu LAN (F12 / três dedos) ou pela chave "pais" do arquivo de identidade. */
 static void t_GetIPCountry(CPU *c)
 {
-    static uint32_t s;
-    if (!s) s = gstr("US");
-    c->eax = s;
+    char cc[4];
+    steam_lan_get_local_country(cc);
+    c->eax = gstr_intern(cc);
 }
 
 static void t_GetCurrentBatteryPower(CPU *c) { c->eax = 255; }   /* ligado na tomada */

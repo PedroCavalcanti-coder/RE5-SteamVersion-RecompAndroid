@@ -29,6 +29,7 @@
 #include <SDL2/SDL.h>
 
 #include "re5/coldebug.h"
+#include "re5/lan_menu.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/user32.h"
 #include "kernel32_internal.h"
@@ -596,6 +597,7 @@ static void d_Present(CPU *c)
     const RGNDATA *dirty = d9_ptr(re5_arg(c, 4));
     HRESULT hr;
     re5_coldebug_draw(dev);
+    re5_lan_menu_draw(dev);
     if (shot_wanted(g_presents + 1)) shot(dev, g_presents + 1);
     re5_dump_at_present(g_presents + 1);
     re5_capture_at_present(g_presents + 1);

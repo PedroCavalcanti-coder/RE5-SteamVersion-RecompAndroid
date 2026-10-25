@@ -24,6 +24,8 @@ typedef SOCKET hsock_t;
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <unistd.h>
 typedef int hsock_t;
 #define HBAD_SOCK (-1)
@@ -44,6 +46,8 @@ enum {
     PKT_JOIN_RESP        = 0x04,
     PKT_LEAVE            = 0x05,
     PKT_DATA_UPDATE      = 0x06,
+    PKT_PROFILE          = 0x07,   /* nome/país mudaram no meio da partida */
+    PKT_KEEPALIVE        = 0x08,   /* entre membros da sala: queda do parceiro e ping */
     PKT_P2P_DATA         = 0x10,
     PKT_P2P_ACK          = 0x11,
 };
@@ -65,12 +69,28 @@ typedef struct {
     uint16_t max_members;
     char     owner_name[32];
     uint16_t data_count;
+    char     owner_country[4];
 } lan_beacon_body;
 
 typedef struct {
     uint64_t lobby_id;
     char     client_name[32];
+    char     client_country[4];
 } lan_join_req_body;
+
+typedef struct {
+    char name[32];
+    char country[4];
+} lan_profile_body;
+
+/* Ping sem relógio comum: cada um ecoa o último t_send que recebeu e há quanto
+ * tempo o segura; quem recebe o eco tira RTT = agora - echo - hold. */
+typedef struct {
+    uint64_t lobby_id;
+    uint32_t t_send;
+    uint32_t echo;
+    uint32_t echo_hold;
+} lan_keepalive_body;
 
 typedef struct {
     uint64_t lobby_id;
@@ -104,9 +124,13 @@ typedef struct {
 typedef struct {
     uint64_t           steam_id;
     char               name[32];
+    char               country[4];
     struct sockaddr_in addr;
     uint32_t           last_seen_ms;
     int                p2p_session_requested;
+    int32_t            rtt_ms;          /* -1: ainda sem medida */
+    uint32_t           ka_their_t;      /* último t_send recebido dele (0: nenhum) */
+    uint32_t           ka_their_at;     /* quando chegou, no nosso relógio */
 } lan_peer;
 
 typedef struct {
@@ -138,6 +162,14 @@ typedef struct lan_p2p_msg {
 
 #define MAX_PEERS 16
 #define MAX_EVENTS 64
+#define MAX_IFACES 8
+#define MAX_MANUAL_HOSTS 4
+
+/* Celular: Wi-Fi que cai, app em segundo plano. Sem notícia de um membro da sala
+ * por este tempo, ele "desconectou" (o jogo deixa de esperar por ele). */
+#define KEEPALIVE_MS      1000u
+#define MEMBER_TIMEOUT_MS 15000u   /* RE5_LAN_TIMEOUT_MS muda (Wi-Fi ruim: mais; testes: menos) */
+#define IFACE_REFRESH_MS  5000u
 
 /* EChatRoomEnterResponse */
 #define ENTER_SUCCESS      1u
@@ -151,8 +183,11 @@ typedef struct lan_p2p_msg {
 #define JOIN_TIMEOUT_MS 5000u
 
 /* EChatMemberStateChange */
-#define MEMBER_ENTERED 0x01u
-#define MEMBER_LEFT    0x02u
+#define MEMBER_ENTERED      0x01u
+#define MEMBER_LEFT         0x02u
+#define MEMBER_DISCONNECTED 0x04u
+
+#define P2P_ERROR_TIMEOUT 4u   /* k_EP2PSessionErrorTimeout */
 
 static re5_mutex g_mu;
 static int       g_initialized;
@@ -184,6 +219,22 @@ static uint32_t g_pending_search_expire;
 
 static uint32_t g_nonce;
 static int      g_id_clash_warned;
+
+static uint32_t g_member_timeout_ms = MEMBER_TIMEOUT_MS;
+static uint32_t g_file_id;                  /* ID gravado no arquivo (sem o deslocamento da instância) */
+static char     g_local_country[4] = "US";
+static char     g_identity_path[1024];
+
+/* Endereços de broadcast de cada interface (Wi-Fi, hotspot do celular...): no
+ * Android o 255.255.255.255 muitas vezes sai pela interface errada ou nem sai. */
+static struct in_addr g_iface_bcast[MAX_IFACES];
+static int            g_n_iface;
+static char           g_local_ip[16] = "?";
+static uint32_t       g_iface_at;
+
+/* Hosts digitados pelo jogador (rede sem broadcast): recebem o PING direto. */
+static struct in_addr g_manual_hosts[MAX_MANUAL_HOSTS];
+static int            g_n_manual;
 
 /* Entrada em andamento (lado do cliente). */
 static struct {
@@ -258,6 +309,7 @@ static void sock_fix_connreset(hsock_t s)
 }
 
 static void sanitize_name(const char *in, char *out, size_t cap);
+static lan_peer *peer_find(uint64_t steam_id);
 
 static void fill_hdr(lan_hdr *h, uint8_t type)
 {
@@ -308,8 +360,18 @@ static void peer_update(uint64_t steam_id, const char *name, const struct sockad
         p->last_seen_ms = get_ticks_ms();
         if (name && *name) snprintf(p->name, sizeof p->name, "%s", name);
         else p->name[0] = 0;
+        p->country[0] = 0;
         p->p2p_session_requested = 0;
+        p->rtt_ms = -1;
+        p->ka_their_t = 0;
     }
+}
+
+static void peer_set_country(uint64_t steam_id, const char *cc)
+{
+    lan_peer *p = peer_find(steam_id);
+    if (!p || !cc || !cc[0]) return;
+    snprintf(p->country, sizeof p->country, "%.2s", cc);
 }
 
 static lan_peer *peer_find(uint64_t steam_id)
@@ -337,6 +399,23 @@ static void send_broadcast(const void *data, size_t len)
     /* Envia também explicitamente em 127.0.0.1:27015 para recepção loopback */
     bcast.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     send_raw_udp(g_disc_sock, &bcast, data, len);
+
+    /* Broadcast dirigido de cada interface (192.168.43.255 no hotspot etc.). */
+    for (int i = 0; i < g_n_iface; i++) {
+        bcast.sin_addr = g_iface_bcast[i];
+        send_raw_udp(g_disc_sock, &bcast, data, len);
+    }
+    /* Hosts digitados: direto na descoberta e nas primeiras portas P2P. */
+    for (int i = 0; i < g_n_manual; i++) {
+        bcast.sin_addr = g_manual_hosts[i];
+        bcast.sin_port = htons(g_discovery_port);
+        send_raw_udp(g_p2p_sock, &bcast, data, len);
+        for (uint16_t p = RE5_LAN_DEFAULT_P2P_PORT; p < RE5_LAN_DEFAULT_P2P_PORT + 4; p++) {
+            bcast.sin_port = htons(p);
+            send_raw_udp(g_p2p_sock, &bcast, data, len);
+        }
+    }
+    bcast.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     /* Envia também para as portas P2P locais em loopback (instâncias no mesmo PC) */
     for (uint16_t p = RE5_LAN_DEFAULT_P2P_PORT; p < RE5_LAN_DEFAULT_P2P_PORT + 16; p++) {
@@ -371,6 +450,8 @@ static size_t build_beacon_packet(uint8_t *buf, size_t max_len)
     b->max_members = g_active_lobby.max_members;
     snprintf(b->owner_name, sizeof b->owner_name, "%s", g_active_lobby.owner_name);
     b->data_count = (uint16_t)g_active_lobby.data_count;
+    memset(b->owner_country, 0, sizeof b->owner_country);
+    memcpy(b->owner_country, g_local_country, 2);
 
     size_t off = sizeof(lan_hdr) + sizeof(lan_beacon_body);
     for (int i = 0; i < g_active_lobby.data_count && off + sizeof(lan_kv) <= max_len; i++) {
@@ -394,7 +475,13 @@ static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, 
 
     struct sockaddr_in peer_p2p = *from;
     peer_p2p.sin_port = htons(h->port);
-    peer_update(h->sender_steam_id, b->owner_name, &peer_p2p);
+    char owner_name[RE5_LAN_MAX_NAME_LEN + 1], raw[sizeof b->owner_name + 1];
+    memcpy(raw, b->owner_name, sizeof b->owner_name);
+    raw[sizeof b->owner_name] = 0;
+    sanitize_name(raw, owner_name, sizeof owner_name);
+    peer_update(h->sender_steam_id, owner_name, &peer_p2p);
+    char cc[3] = {b->owner_country[0], b->owner_country[1], 0};
+    peer_set_country(h->sender_steam_id, cc);
 
     if (b->owner_id == g_local_steam_id) return; /* ignorar nosso próprio beacon */
 
@@ -412,13 +499,13 @@ static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, 
 
     lb->lobby_id = b->lobby_id;
     lb->owner_id = b->owner_id;
-    snprintf(lb->owner_name, sizeof lb->owner_name, "%s", b->owner_name);
+    snprintf(lb->owner_name, sizeof lb->owner_name, "%s", owner_name);
     lb->host_port = h->port;
     lb->host_ip = from->sin_addr;
     lb->member_count = b->member_count;
     lb->max_members = b->max_members;
     lb->members[0] = b->owner_id;
-    snprintf(lb->member_names[0], sizeof lb->member_names[0], "%s", b->owner_name);
+    snprintf(lb->member_names[0], sizeof lb->member_names[0], "%s", owner_name);
     lb->last_seen_ms = get_ticks_ms();
     lb->is_local = 0;
     lb->joinable = 1;
@@ -433,7 +520,7 @@ static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, 
         off += sizeof(lan_kv);
     }
     RE5_INFO("steam_lan", "Lobby detectado na LAN: ID %llu, Dono '%s' (membros %u/%u)",
-             (unsigned long long)b->lobby_id, b->owner_name, b->member_count, b->max_members);
+             (unsigned long long)b->lobby_id, owner_name, b->member_count, b->max_members);
 }
 
 static void handle_ping(const lan_hdr *h, const struct sockaddr_in *from)
@@ -481,6 +568,7 @@ static void send_join_req(void)
     memset(req, 0, sizeof *req);
     req->lobby_id = g_join.lobby_id;
     snprintf(req->client_name, sizeof req->client_name, "%s", g_local_name);
+    memcpy(req->client_country, g_local_country, 2);
     send_raw_udp(g_p2p_sock, &g_join.host, buf, sizeof buf);
 }
 
@@ -498,6 +586,8 @@ static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len
     struct sockaddr_in client_addr = *from;
     client_addr.sin_port = htons(h->port);
     peer_update(h->sender_steam_id, name, &client_addr);
+    char cc[3] = {req->client_country[0], req->client_country[1], 0};
+    peer_set_country(h->sender_steam_id, cc);
 
     uint32_t resp_code = ENTER_SUCCESS;
     int is_new = 0;
@@ -727,6 +817,132 @@ static void handle_p2p_data(const lan_hdr *h, const uint8_t *payload, size_t len
     *q = msg;
 }
 
+/* Um membro da sala mudou de nome ou país no menu LAN. */
+static void handle_profile(const lan_hdr *h, const uint8_t *payload, size_t len)
+{
+    if (len < sizeof(lan_profile_body)) return;
+    const lan_profile_body *pb = (const lan_profile_body *)payload;
+    lan_peer *p = peer_find(h->sender_steam_id);
+    if (!p) return;
+    char raw[sizeof pb->name + 1];
+    memcpy(raw, pb->name, sizeof pb->name);
+    raw[sizeof pb->name] = 0;
+    sanitize_name(raw, p->name, sizeof p->name);
+    char cc[3] = {pb->country[0], pb->country[1], 0};
+    peer_set_country(h->sender_steam_id, cc);
+    if (g_has_active_lobby) {
+        int idx = member_index(&g_active_lobby, h->sender_steam_id);
+        if (idx >= 0) snprintf(g_active_lobby.member_names[idx], sizeof g_active_lobby.member_names[idx], "%s", p->name);
+        if (g_active_lobby.owner_id == h->sender_steam_id)
+            snprintf(g_active_lobby.owner_name, sizeof g_active_lobby.owner_name, "%s", p->name);
+    }
+    push_event(RE5_LAN_EVT_PERSONA_CHANGE, 0, 0, h->sender_steam_id, 0x0001 /* k_EPersonaChangeName */, 0);
+    RE5_INFO("steam_lan", "Jogador #%u agora se chama '%s' (%s)", (uint32_t)h->sender_steam_id, p->name, p->country);
+}
+
+static void handle_keepalive(const lan_hdr *h, const uint8_t *payload, size_t len, const struct sockaddr_in *from)
+{
+    if (len < sizeof(lan_keepalive_body)) return;
+    const lan_keepalive_body *ka = (const lan_keepalive_body *)payload;
+    if (!g_has_active_lobby || g_active_lobby.lobby_id != ka->lobby_id) return;
+    if (member_index(&g_active_lobby, h->sender_steam_id) < 0) return;
+    struct sockaddr_in addr = *from;
+    addr.sin_port = htons(h->port);
+    peer_update(h->sender_steam_id, NULL, &addr);   /* também segue o parceiro que trocou de IP (DHCP do Wi-Fi) */
+    lan_peer *p = peer_find(h->sender_steam_id);
+    if (!p) return;
+    uint32_t now = get_ticks_ms();
+    p->ka_their_t = ka->t_send ? ka->t_send : 1;
+    p->ka_their_at = now;
+    if (ka->echo) {
+        int32_t rtt = (int32_t)(now - ka->echo - ka->echo_hold);
+        if (rtt >= 0 && rtt < 60000) p->rtt_ms = p->rtt_ms < 0 ? rtt : (p->rtt_ms * 3 + rtt) / 4;
+    }
+}
+
+static void send_keepalives(uint32_t now)
+{
+    if (!g_has_active_lobby || g_join.active) return;
+    for (int i = 0; i < g_active_lobby.member_count && i < RE5_LAN_MAX_LOBBY_MEMBERS; i++) {
+        if (g_active_lobby.members[i] == g_local_steam_id) continue;
+        lan_peer *p = peer_find(g_active_lobby.members[i]);
+        if (!p) continue;
+        uint8_t buf[sizeof(lan_hdr) + sizeof(lan_keepalive_body)];
+        fill_hdr((lan_hdr *)buf, PKT_KEEPALIVE);
+        lan_keepalive_body *ka = (lan_keepalive_body *)(buf + sizeof(lan_hdr));
+        ka->lobby_id = g_active_lobby.lobby_id;
+        ka->t_send = now ? now : 1;
+        ka->echo = p->ka_their_t;
+        ka->echo_hold = p->ka_their_t ? now - p->ka_their_at : 0;
+        send_raw_udp(g_p2p_sock, &p->addr, buf, sizeof buf);
+    }
+}
+
+/* Membro sem notícia há MEMBER_TIMEOUT_MS: para o host, sai da sala; para o
+ * cliente, se era o host, a sala acabou. O jogo recebe o mesmo que a Steam manda
+ * numa queda: LobbyChatUpdate_t "desconectou" e P2PSessionConnectFail_t. */
+static void check_member_timeouts(uint32_t now)
+{
+    if (!g_has_active_lobby || g_join.active) return;
+    for (int i = 0; i < g_active_lobby.member_count && i < RE5_LAN_MAX_LOBBY_MEMBERS; i++) {
+        uint64_t id = g_active_lobby.members[i];
+        if (id == g_local_steam_id) continue;
+        lan_peer *p = peer_find(id);
+        if (p && now - p->last_seen_ms < g_member_timeout_ms) continue;
+        uint64_t lobby_id = g_active_lobby.lobby_id;
+        RE5_WARN("steam_lan", "Sem resposta de '%s #%u' ha %u s: desconectado", p ? p->name : "?", (uint32_t)id,
+                 g_member_timeout_ms / 1000u);
+        push_event(RE5_LAN_EVT_LOBBY_CHAT_UPDATE, 0, lobby_id, id, MEMBER_DISCONNECTED, 0);
+        push_event(RE5_LAN_EVT_P2P_SESSION_FAIL, 0, 0, id, P2P_ERROR_TIMEOUT, 0);
+        if (p) p->p2p_session_requested = 0;
+        if (id == g_active_lobby.owner_id) {
+            g_has_active_lobby = 0;
+            return;
+        }
+        for (int k = i; k + 1 < g_active_lobby.member_count && k + 1 < RE5_LAN_MAX_LOBBY_MEMBERS; k++) {
+            g_active_lobby.members[k] = g_active_lobby.members[k + 1];
+            memcpy(g_active_lobby.member_names[k], g_active_lobby.member_names[k + 1], sizeof g_active_lobby.member_names[k]);
+            memcpy(g_active_lobby.member_data[k], g_active_lobby.member_data[k + 1], sizeof g_active_lobby.member_data[k]);
+            g_active_lobby.member_data_count[k] = g_active_lobby.member_data_count[k + 1];
+        }
+        g_active_lobby.member_count--;
+        i--;
+    }
+}
+
+/* Interfaces IPv4 ativas: o IP para mostrar ao jogador e o broadcast de cada rede. */
+static void refresh_interfaces(void)
+{
+    g_n_iface = 0;
+    snprintf(g_local_ip, sizeof g_local_ip, "?");
+#if !defined(_WIN32)
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) != 0) return;
+    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+        if (!(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK)) continue;
+        struct in_addr a = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+        if (strcmp(g_local_ip, "?") == 0) snprintf(g_local_ip, sizeof g_local_ip, "%s", inet_ntoa(a));
+        if ((i->ifa_flags & IFF_BROADCAST) && i->ifa_broadaddr && g_n_iface < MAX_IFACES)
+            g_iface_bcast[g_n_iface++] = ((struct sockaddr_in *)i->ifa_broadaddr)->sin_addr;
+    }
+    freeifaddrs(ifs);
+#else
+    /* Sem getifaddrs: o IP que a rota padrão usaria (connect UDP não envia nada). */
+    hsock_t t = socket(AF_INET, SOCK_DGRAM, 0);
+    if (t == HBAD_SOCK) return;
+    struct sockaddr_in probe;
+    memset(&probe, 0, sizeof probe);
+    probe.sin_family = AF_INET;
+    probe.sin_port = htons(9);
+    probe.sin_addr.s_addr = inet_addr("192.0.2.1");
+    int len = sizeof probe;
+    if (connect(t, (struct sockaddr *)&probe, sizeof probe) == 0 && getsockname(t, (struct sockaddr *)&probe, &len) == 0)
+        snprintf(g_local_ip, sizeof g_local_ip, "%s", inet_ntoa(probe.sin_addr));
+    sock_close(t);
+#endif
+}
+
 static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_in *from)
 {
     if (len < sizeof(lan_hdr)) return;
@@ -746,6 +962,8 @@ static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_i
 
     const uint8_t *payload = buf + sizeof(lan_hdr);
     size_t payload_len = len - sizeof(lan_hdr);
+    lan_peer *known = peer_find(h->sender_steam_id);
+    if (known) known->last_seen_ms = get_ticks_ms();
 
     switch (h->type) {
     case PKT_BEACON:
@@ -765,6 +983,12 @@ static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_i
         break;
     case PKT_DATA_UPDATE:
         handle_data_update(h, payload, payload_len);
+        break;
+    case PKT_PROFILE:
+        handle_profile(h, payload, payload_len);
+        break;
+    case PKT_KEEPALIVE:
+        handle_keepalive(h, payload, payload_len, from);
         break;
     case PKT_P2P_DATA:
         handle_p2p_data(h, payload, payload_len, from);
@@ -853,10 +1077,16 @@ static void lan_worker(void *arg)
 
         uint32_t now = get_ticks_ms();
         join_tick(now);
-        if (now - last_beacon_ms >= 1000) {
+        if (now - g_iface_at >= IFACE_REFRESH_MS) {
+            refresh_interfaces();
+            g_iface_at = now;
+        }
+        if (now - last_beacon_ms >= KEEPALIVE_MS) {
             broadcast_beacon();
+            send_keepalives(now);
             last_beacon_ms = now;
         }
+        check_member_timeouts(now);
         re5_mutex_unlock(&g_mu);
 
         re5_host_sleep_ms(5);
@@ -941,8 +1171,43 @@ static void mkdir_parents(const char *path)
     }
 }
 
-/* Arquivo "chave=valor": id (6 dígitos) e nome. 1 = lido. */
-static int read_identity(const char *path, uint32_t *id, char *name, size_t cap)
+/* Código de país (bandeira): duas letras A-Z, maiúsculas. 1 = válido. */
+static int sanitize_country(const char *in, char out[4])
+{
+    if (!in) return 0;
+    while (*in == ' ' || *in == '\t') in++;
+    if (!isalpha((unsigned char)in[0]) || !isalpha((unsigned char)in[1]) || isalnum((unsigned char)in[2])) return 0;
+    out[0] = (char)toupper((unsigned char)in[0]);
+    out[1] = (char)toupper((unsigned char)in[1]);
+    out[2] = out[3] = 0;
+    return 1;
+}
+
+/* "1.2.3.4, 5.6.7.8" -> g_manual_hosts. Entradas inválidas são ignoradas. */
+static void parse_manual_hosts(const char *list)
+{
+    g_n_manual = 0;
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", list ? list : "");
+    for (char *tok = strtok(buf, ", ;\t\r\n"); tok && g_n_manual < MAX_MANUAL_HOSTS; tok = strtok(NULL, ", ;\t\r\n")) {
+        struct in_addr a;
+        a.s_addr = inet_addr(tok);
+        if (a.s_addr != INADDR_NONE && a.s_addr != 0) g_manual_hosts[g_n_manual++] = a;
+    }
+}
+
+static void manual_hosts_text(char *out, size_t cap)
+{
+    out[0] = 0;
+    for (int i = 0; i < g_n_manual; i++) {
+        size_t n = strlen(out);
+        snprintf(out + n, cap - n, "%s%s", i ? "," : "", inet_ntoa(g_manual_hosts[i]));
+    }
+}
+
+/* Arquivo "chave=valor": id (6 dígitos), nome, pais, hosts. 1 = lido. */
+static int read_identity(const char *path, uint32_t *id, char *name, size_t cap, char country[4], char *hosts,
+                         size_t hosts_cap)
 {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -959,13 +1224,18 @@ static int read_identity(const char *path, uint32_t *id, char *name, size_t cap)
             if (v >= RE5_LAN_ID_MIN && v < RE5_LAN_ID_MIN + RE5_LAN_ID_SPAN) *id = (uint32_t)v;
         } else if (strcmp(key, "nome") == 0 || strcmp(key, "name") == 0) {
             sanitize_name(val, name, cap);
+        } else if (strcmp(key, "pais") == 0 || strcmp(key, "country") == 0) {
+            sanitize_country(val, country);
+        } else if (strcmp(key, "hosts") == 0) {
+            snprintf(hosts, hosts_cap, "%s", val);
+            for (char *e = hosts + strlen(hosts); e > hosts && isspace((unsigned char)e[-1]); e--) e[-1] = 0;
         }
     }
     fclose(f);
     return 1;
 }
 
-static void write_identity(const char *path, uint32_t id, const char *name)
+static void write_identity(const char *path)
 {
     mkdir_parents(path);
     FILE *f = fopen(path, "w");
@@ -973,37 +1243,72 @@ static void write_identity(const char *path, uint32_t id, const char *name)
         RE5_WARN("steam_lan", "Nao foi possivel gravar a identidade LAN em %s: o ID muda a cada execucao", path);
         return;
     }
+    char hosts[128];
+    manual_hosts_text(hosts, sizeof hosts);
     fprintf(f, "# Identidade do jogador no multiplayer LAN do RE5.\n"
-               "# nome: o que os outros jogadores veem (ate %d caracteres, sem '#').\n"
-               "# id:   seu codigo unico na rede; nao copie este arquivo para outro aparelho.\n"
-               "#       Apague a linha para gerar um novo.\n"
+               "# Tambem editavel dentro do jogo: F12 ou toque com tres dedos.\n"
+               "# nome:  o que os outros jogadores veem (ate %d caracteres, sem '#').\n"
+               "# pais:  codigo de duas letras da bandeira (BR, PT, US...).\n"
+               "# hosts: IPs de hosts para procurar direto, separados por virgula (rede sem broadcast).\n"
+               "# id:    seu codigo unico na rede; nao copie este arquivo para outro aparelho.\n"
+               "#        Apague a linha para gerar um novo.\n"
                "nome=%s\n"
+               "pais=%s\n"
+               "hosts=%s\n"
                "id=%u\n",
-            RE5_LAN_MAX_NAME_LEN, name, id);
+            RE5_LAN_MAX_NAME_LEN, g_local_name, g_local_country, hosts, g_file_id);
     fclose(f);
 }
 
-/* Prioridade: RE5_STEAM_ID / RE5_PLAYER_NAME > arquivo de identidade > gerado.
- * Instâncias no mesmo aparelho dividem o arquivo, então a N-ésima (porta P2P
- * base + N) soma N ao ID e cada uma continua com um ID próprio. */
+/* País padrão: o da localidade do sistema (pt_BR -> BR), senão US. */
+static void default_country(char out[4])
+{
+    snprintf(out, 4, "US");
+#if defined(_WIN32)
+    char cc[8];
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SISO3166CTRYNAME, cc, sizeof cc) > 0) sanitize_country(cc, out);
+#else
+    const char *envs[] = {"LC_ALL", "LC_CTYPE", "LANG"};
+    for (int i = 0; i < 3; i++) {
+        const char *l = getenv(envs[i]);
+        const char *u = l ? strchr(l, '_') : NULL;   /* "pt_BR.UTF-8" */
+        if (u && u[1] && u[2]) {
+            char two[3] = {u[1], u[2], 0};
+            if (sanitize_country(two, out)) return;
+        }
+    }
+#endif
+}
+
+/* Prioridade: RE5_STEAM_ID / RE5_PLAYER_NAME / RE5_COUNTRY / RE5_LAN_HOSTS >
+ * arquivo de identidade > gerado. Instâncias no mesmo aparelho dividem o arquivo,
+ * então a N-ésima (porta P2P base + N) soma N ao ID e cada uma tem um ID próprio. */
 static void load_identity(uint16_t base_p2p)
 {
     uint32_t slot = (uint32_t)(g_p2p_port - base_p2p);
     uint32_t id = 0;
     char name[RE5_LAN_MAX_NAME_LEN + 1] = "";
+    char country[4] = "";
+    char hosts[256] = "";
 
-    char path[1024];
-    int have_path = identity_path(path, sizeof path) == 0;
-    int read_ok = have_path && read_identity(path, &id, name, sizeof name);
-    if (have_path && (!read_ok || !id || !name[0])) {
-        if (!id) id = RE5_LAN_ID_MIN + lan_random() % RE5_LAN_ID_SPAN;
-        if (!name[0]) snprintf(name, sizeof name, "%s", LAN_DEFAULT_NAME);
-        write_identity(path, id, name);
-        RE5_INFO("steam_lan", "Identidade LAN criada em %s (edite 'nome' para mudar o nome)", path);
-    } else if (have_path) {
-        RE5_INFO("steam_lan", "Identidade LAN lida de %s", path);
-    }
+    int have_path = identity_path(g_identity_path, sizeof g_identity_path) == 0;
+    if (!have_path) g_identity_path[0] = 0;
+    int read_ok = have_path && read_identity(g_identity_path, &id, name, sizeof name, country, hosts, sizeof hosts);
+    int need_write = have_path && (!read_ok || !id || !name[0] || !country[0]);
     if (!id) id = RE5_LAN_ID_MIN + lan_random() % RE5_LAN_ID_SPAN;
+    if (!name[0]) snprintf(name, sizeof name, "%s", LAN_DEFAULT_NAME);
+    if (!country[0]) default_country(country);
+    g_file_id = id;
+    snprintf(g_local_name, sizeof g_local_name, "%s", name);
+    snprintf(g_local_country, sizeof g_local_country, "%s", country);
+    parse_manual_hosts(hosts);
+    if (need_write) {
+        write_identity(g_identity_path);
+        RE5_INFO("steam_lan", "Identidade LAN criada em %s (F12 ou toque com tres dedos no jogo para editar)",
+                 g_identity_path);
+    } else if (have_path) {
+        RE5_INFO("steam_lan", "Identidade LAN lida de %s", g_identity_path);
+    }
     id = RE5_LAN_ID_MIN + (id - RE5_LAN_ID_MIN + slot) % RE5_LAN_ID_SPAN;
 
     const char *env_id = getenv("RE5_STEAM_ID");
@@ -1012,11 +1317,12 @@ static void load_identity(uint16_t base_p2p)
 
     const char *env_name = getenv("RE5_PLAYER_NAME");
     if (!env_name || !*env_name) env_name = getenv("RE5_LAN_NAME");
-    if (env_name && *env_name) sanitize_name(env_name, name, sizeof name);
-    if (!name[0]) snprintf(name, sizeof name, "%s", LAN_DEFAULT_NAME);
+    if (env_name && *env_name) sanitize_name(env_name, g_local_name, sizeof g_local_name);
+    if (g_local_name[0] == 0) snprintf(g_local_name, sizeof g_local_name, "%s", LAN_DEFAULT_NAME);
+    sanitize_country(getenv("RE5_COUNTRY"), g_local_country);
+    if (getenv("RE5_LAN_HOSTS")) parse_manual_hosts(getenv("RE5_LAN_HOSTS"));
 
     g_local_steam_id = ((uint64_t)RE5_LAN_STEAMID_USER_HI << 32) | id;
-    snprintf(g_local_name, sizeof g_local_name, "%s", name);
     g_nonce = lan_random();
 }
 
@@ -1091,6 +1397,10 @@ int steam_lan_init(void)
     g_p2p_port = bound_port;
 
     load_identity(base_p2p);
+    const char *env_to = getenv("RE5_LAN_TIMEOUT_MS");
+    if (env_to && strtoul(env_to, NULL, 10) >= 500) g_member_timeout_ms = (uint32_t)strtoul(env_to, NULL, 10);
+    refresh_interfaces();
+    g_iface_at = get_ticks_ms();
 
     g_running = 1;
     g_initialized = 1;
@@ -1629,4 +1939,104 @@ int steam_lan_get_p2p_state(uint64_t remote_id, void *out_state)
     st[2] = 0;         /* m_eP2PSessionError */
     st[3] = 0;         /* m_bUsingRelay */
     return p ? 1 : 0;
+}
+
+/* ---- perfil editável no jogo (menu LAN) ---- */
+
+void steam_lan_get_local_country(char out[4])
+{
+    re5_mutex_lock(&g_mu);
+    memcpy(out, g_local_country, 4);
+    re5_mutex_unlock(&g_mu);
+}
+
+int steam_lan_set_profile(const char *name, const char *country)
+{
+    char n[RE5_LAN_MAX_NAME_LEN + 1], cc[4];
+    sanitize_name(name ? name : "", n, sizeof n);
+    if (!n[0] || !sanitize_country(country, cc)) return 0;
+
+    re5_mutex_lock(&g_mu);
+    snprintf(g_local_name, sizeof g_local_name, "%s", n);
+    memcpy(g_local_country, cc, sizeof cc);
+    if (g_identity_path[0]) write_identity(g_identity_path);
+
+    if (g_has_active_lobby) {
+        int me = member_index(&g_active_lobby, g_local_steam_id);
+        if (me >= 0) snprintf(g_active_lobby.member_names[me], sizeof g_active_lobby.member_names[me], "%s", n);
+        if (g_active_lobby.owner_id == g_local_steam_id)
+            snprintf(g_active_lobby.owner_name, sizeof g_active_lobby.owner_name, "%s", n);
+
+        uint8_t buf[sizeof(lan_hdr) + sizeof(lan_profile_body)];
+        fill_hdr((lan_hdr *)buf, PKT_PROFILE);
+        lan_profile_body *pb = (lan_profile_body *)(buf + sizeof(lan_hdr));
+        memset(pb, 0, sizeof *pb);
+        snprintf(pb->name, sizeof pb->name, "%s", n);
+        memcpy(pb->country, cc, 2);
+        for (int i = 0; i < g_active_lobby.member_count && i < RE5_LAN_MAX_LOBBY_MEMBERS; i++) {
+            if (g_active_lobby.members[i] == g_local_steam_id) continue;
+            lan_peer *p = peer_find(g_active_lobby.members[i]);
+            if (p) send_raw_udp(g_p2p_sock, &p->addr, buf, sizeof buf);
+        }
+        broadcast_beacon();   /* quem está procurando salas já vê o nome novo */
+    }
+    push_event(RE5_LAN_EVT_PERSONA_CHANGE, 0, 0, g_local_steam_id, 0x0001 /* k_EPersonaChangeName */, 0);
+    re5_mutex_unlock(&g_mu);
+    RE5_INFO("steam_lan", "Perfil LAN: '%s #%u', pais %s", n, (uint32_t)g_local_steam_id, cc);
+    return 1;
+}
+
+int steam_lan_set_manual_hosts(const char *list)
+{
+    re5_mutex_lock(&g_mu);
+    parse_manual_hosts(list);
+    int n = g_n_manual;
+    if (g_identity_path[0]) write_identity(g_identity_path);
+    re5_mutex_unlock(&g_mu);
+    return n;
+}
+
+void steam_lan_get_manual_hosts(char *out, size_t cap)
+{
+    re5_mutex_lock(&g_mu);
+    manual_hosts_text(out, cap);
+    re5_mutex_unlock(&g_mu);
+}
+
+void steam_lan_get_status(re5_lan_status *st)
+{
+    memset(st, 0, sizeof *st);
+    re5_mutex_lock(&g_mu);
+    st->local_id = g_local_steam_id;
+    snprintf(st->local_ip, sizeof st->local_ip, "%s", g_local_ip);
+    st->p2p_port = g_p2p_port;
+    st->lobbies_seen = g_num_lobbies;
+    st->joining = g_join.active;
+    st->in_lobby = g_has_active_lobby && !g_join.active;
+    if (st->in_lobby) {
+        uint32_t now = get_ticks_ms();
+        st->is_host = g_active_lobby.owner_id == g_local_steam_id;
+        st->max_members = g_active_lobby.max_members;
+        for (int i = 0; i < g_active_lobby.member_count && i < RE5_LAN_MAX_LOBBY_MEMBERS; i++) {
+            re5_lan_member_info *m = &st->members[st->member_count++];
+            uint64_t id = g_active_lobby.members[i];
+            m->steam_id = id;
+            m->is_owner = id == g_active_lobby.owner_id;
+            m->is_local = id == g_local_steam_id;
+            m->rtt_ms = -1;
+            if (m->is_local) {
+                snprintf(m->name, sizeof m->name, "%.24s", g_local_name);
+                memcpy(m->country, g_local_country, sizeof m->country);
+            } else {
+                lan_peer *p = peer_find(id);
+                snprintf(m->name, sizeof m->name, "%.24s", p && p->name[0] ? p->name : g_active_lobby.member_names[i]);
+                if (p) {
+                    memcpy(m->country, p->country, sizeof m->country);
+                    m->rtt_ms = p->rtt_ms;
+                    m->silent_ms = now - p->last_seen_ms;
+                }
+            }
+        }
+    }
+    re5_mutex_unlock(&g_mu);
 }
