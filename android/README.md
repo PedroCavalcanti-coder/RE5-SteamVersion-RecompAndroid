@@ -21,4 +21,8 @@ Pontos que já estão decididos (ver `docs/ARQUITETURA.md` e `docs/PLANO_DO_PROJ
 - mesma reserva de 4 GiB do guest e o mesmo código gerado do Linux (D2);
 - DXVK com WSI de `ANativeWindow`, portando `tools/nfsu2-reference/ports/dxvk_android`;
 - `libadrenotools` para drivers Turnip em Adreno;
-- preset de CMake `android-arm64` já existe em `CMakePresets.json`.
+- preset de CMake `android-arm64` já existe em `CMakePresets.json`;
+- permissões de rede no `AndroidManifest.xml` para Multiplayer LAN (`steam_lan`):
+  - `android.permission.INTERNET`
+  - `android.permission.ACCESS_NETWORK_STATE`
+  - `android.permission.CHANGE_WIFI_MULTICAST_STATE` (necessário para recepção de broadcast/multicast UDP via Wi-Fi no Android).

@@ -74,6 +74,7 @@ add_library(re5_runtime STATIC
     src/win32/oleaut32.c
     src/win32/shell32.c
     src/win32/steam_api.c
+    src/win32/steam_lan.c
     src/win32/user32.c
     src/win32/winmm.c
     src/win32/wmvcore.c
