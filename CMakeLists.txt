@@ -7,7 +7,7 @@
 #   re5_generated  código gerado (generated/src) ou o stub vazio antes da Fase 2
 #   re5            executável host
 cmake_minimum_required(VERSION 3.22)
-project(re5_recompiled LANGUAGES C)
+project(re5_recompiled LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -29,8 +29,13 @@ add_subdirectory(third_party/SDL2 EXCLUDE_FROM_ALL)
 add_subdirectory(runtime)
 add_subdirectory(generated)
 
-add_executable(re5 runtime/src/host/main.c)
-target_link_libraries(re5 PRIVATE re5_runtime re5_generated)
+if(ANDROID)
+    add_library(re5 SHARED runtime/src/host/main.c)
+    target_link_libraries(re5 PRIVATE "-Wl,--whole-archive,$<TARGET_FILE:SDL2-static>,--no-whole-archive" re5_runtime re5_generated c++_static log)
+else()
+    add_executable(re5 runtime/src/host/main.c)
+    target_link_libraries(re5 PRIVATE re5_runtime re5_generated)
+endif()
 
 # Vulkan no Windows: os d3d9.dll x64 da DXVK (scripts/build_dxvk.sh <versão>) vão
 # para dxvk/<versão>/ ao lado do re5.exe; o runtime carrega a mais nova que a

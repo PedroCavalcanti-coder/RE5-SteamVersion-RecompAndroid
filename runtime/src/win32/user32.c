@@ -536,6 +536,7 @@ static void lock_wait_pump(void) { SDL_PumpEvents(); }
 static void sdl_init(void)
 {
     if (g_sdl_ready || getenv("RE5_HEADLESS")) return;
+    SDL_SetMainReady();
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* o handler de crash do runtime fica */
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
@@ -594,6 +595,12 @@ static uint32_t create_window(CPU *c, int wide)
         Uint32 flags = win->visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN;
         if (style & U32_WS_THICKFRAME) flags |= SDL_WINDOW_RESIZABLE;
         if ((style & U32_WS_CAPTION) != U32_WS_CAPTION) flags |= SDL_WINDOW_BORDERLESS;
+#if defined(__ANDROID__)
+        /* Sem flag de gráficos o SDL2 do Android cria a janela com OpenGL, e a
+         * EGLSurface dela ocupa o ANativeWindow: o vkCreateAndroidSurfaceKHR da
+         * DXVK falha ("Failed to create surface", CreateDevice NOTAVAILABLE). */
+        flags |= SDL_WINDOW_VULKAN;
+#endif
         win->sdl = SDL_CreateWindow(win->title[0] ? win->title : "Resident Evil 5", ox, oy, cw, ch, flags);
         if (!win->sdl) re5_fatal("user32", "SDL_CreateWindow(%dx%d) falhou: %s", cw, ch, SDL_GetError());
         RE5_INFO("user32", "janela 0x%X '%s': externa %dx%d em (%d,%d), cliente %dx%d (SDL)", win->hwnd,
@@ -1095,7 +1102,9 @@ void re5_user32_handle_event(const SDL_Event *e)
 {
     const SDL_Event ev = *e;
     window *w = NULL;
+#if !defined(__ANDROID__)
     if (re5_lan_menu_event(e)) return;   /* menu LAN aberto (F12 / três dedos): a entrada é dele */
+#endif
     switch (ev.type) {
     case SDL_KEYDOWN:
     case SDL_KEYUP:
@@ -1792,3 +1801,17 @@ static const re5_import_def k_defs[] = {
 };
 
 const re5_import_module re5_mod_user32 = {"user32.dll", k_defs};
+
+int re5_user32_is_cursor_hidden(void)
+{
+    return cursor_hidden();
+}
+
+#if defined(__ANDROID__)
+#include <jni.h>
+JNIEXPORT jboolean JNICALL Java_org_libsdl_app_SDLActivity_nativeIsCursorHidden(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    return (jboolean)(cursor_hidden() ? JNI_TRUE : JNI_FALSE);
+}
+#endif

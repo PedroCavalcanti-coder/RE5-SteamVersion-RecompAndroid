@@ -33,11 +33,16 @@
 #include "re5/d3d9_bridge.h"
 #include "re5/user32.h"
 #include "kernel32_internal.h"
+#include "dxt_decode.h"
 
 #if defined(RE5_HOST_WINDOWS)
 #include <windows.h>
 #endif
 #include <d3d9.h>
+
+#ifndef HEAP_ZERO_MEMORY
+#define HEAP_ZERO_MEMORY 0x08u
+#endif
 
 #define D9_MAGIC    0x39443344u   /* 'D3D9' */
 #define D9_OBJ_SIZE 16u
@@ -73,18 +78,36 @@ typedef struct {
     uint32_t pitch, row_bytes, rows, flags;
     uint32_t slices, slice_pitch;   /* volumes: fatias de `rows` linhas; o resto: 1 */
     int      owned;      /* 1: bloco só desta trava (texturas); 0: dentro da sombra do buffer */
+    /* Fallback DXT -> RGBA8 */
+    uint32_t dxt_orig_format, dxt_fallback_fmt;
+    uint32_t dxt_region_w, dxt_region_h;
+    uint32_t dxt_region_left, dxt_region_top;
+    uint32_t dxt_guest_pitch, dxt_guest_rows;
+    uint32_t dxt_shadow_idx;
 } d9_lock;
 
+typedef struct {
+    uint32_t  orig_format;   /* D3DFMT_DXT1, DXT3, DXT5, ou 0 se nativo */
+    uint32_t  fallback_fmt;  /* D3DFMT_A8B8G8R8 ou D3DFMT_A8R8G8B8 */
+    uint32_t  width, height;
+    uint32_t  levels, faces;
+    uint8_t **levels_data;   /* faces * levels buffers com os dados brutos DXT */
+    uint32_t *levels_size;
+} d9_dxt_shadow;
+
 typedef struct d9_obj {
-    IUnknown      *host;
-    uint32_t       guest, handle;
-    d9_kind        kind;
-    uint32_t       refs;                  /* referências que o guest tem */
-    struct d9_obj *hnext;                 /* hash host -> objeto */
-    uint32_t       shadow, shadow_size;   /* vertex/index buffer */
-    d9_lock       *locks;
-    uint32_t       nlocks, caplocks;
-    uint32_t       focus_hwnd, behavior;  /* device: o que o guest passou ao CreateDevice */
+    IUnknown       *host;
+    uint32_t        guest, handle;
+    d9_kind         kind;
+    uint32_t        refs;                  /* referências que o guest tem */
+    struct d9_obj  *hnext;                 /* hash host -> objeto */
+    uint32_t        shadow, shadow_size;   /* vertex/index buffer */
+    d9_lock        *locks;
+    uint32_t        nlocks, caplocks;
+    uint32_t        focus_hwnd, behavior;  /* device: o que o guest passou ao CreateDevice */
+    d9_dxt_shadow  *dxt;                   /* aponta para dxt_storage (ou do pai se surface) */
+    d9_dxt_shadow   dxt_storage;           /* armazenamento para Texture e CubeTexture */
+    uint32_t        dxt_surface_sub;       /* subresource herdado da textura pai (se surface) */
 } d9_obj;
 
 #define D9_HASH 4096u
@@ -193,6 +216,12 @@ static void d9_retire(d9_obj *o)
     for (uint32_t i = 0; i < o->nlocks; i++)
         if (o->locks[i].owned) k32_heap_free(heap(), o->locks[i].guest);
     if (o->shadow) k32_heap_free(heap(), o->shadow);
+    if (o->dxt_storage.levels_data) {
+        uint32_t total = o->dxt_storage.faces * o->dxt_storage.levels;
+        for (uint32_t i = 0; i < total; i++) free(o->dxt_storage.levels_data[i]);
+        free(o->dxt_storage.levels_data);
+        free(o->dxt_storage.levels_size);
+    }
     for (d9_obj **p = &g_hash[hash_of(o->host)]; *p; p = &(*p)->hnext) {
         if (*p == o) {
             *p = o->hnext;
@@ -404,6 +433,89 @@ static HWND host_hwnd(uint32_t hwnd, const char *what)
     return h;
 }
 
+/* ---- helpers DXT (fallback para GPUs sem textureCompressionBC, ex.: Mali) ---- */
+
+static inline int is_dxt(D3DFORMAT f)
+{
+    return f == D3DFMT_DXT1 || f == D3DFMT_DXT2 || f == D3DFMT_DXT3 ||
+           f == D3DFMT_DXT4 || f == D3DFMT_DXT5;
+}
+
+static inline int dxt_mode(D3DFORMAT f)
+{
+    if (f == D3DFMT_DXT1) return 1;
+    if (f == D3DFMT_DXT2 || f == D3DFMT_DXT3) return 3;
+    if (f == D3DFMT_DXT4 || f == D3DFMT_DXT5) return 5;
+    return 0;
+}
+
+static int force_cpu_dxt(void)
+{
+    const char *e = getenv("RE5_D3D9_CPU_DXT");
+    return e && *e && *e != '0';
+}
+
+static int host_supports_format(IDirect3DDevice9 *dev, D3DFORMAT fmt, DWORD usage, D3DRESOURCETYPE rtype)
+{
+    if (!dev || !dev->lpVtbl || !dev->lpVtbl->GetDirect3D) return 1;
+    IDirect3D9 *d3d = NULL;
+    if (FAILED(dev->lpVtbl->GetDirect3D(dev, &d3d)) || !d3d) return 1;
+    D3DDEVICE_CREATION_PARAMETERS cp;
+    D3DDISPLAYMODE dm;
+    memset(&cp, 0, sizeof cp);
+    memset(&dm, 0, sizeof dm);
+    dev->lpVtbl->GetCreationParameters(dev, &cp);
+    d3d->lpVtbl->GetAdapterDisplayMode(d3d, cp.AdapterOrdinal, &dm);
+    HRESULT hr = d3d->lpVtbl->CheckDeviceFormat(d3d, cp.AdapterOrdinal, cp.DeviceType, dm.Format, usage, rtype, fmt);
+    d3d->lpVtbl->Release(d3d);
+    return SUCCEEDED(hr);
+}
+
+static D3DFORMAT get_dxt_fallback_format(IDirect3DDevice9 *dev, DWORD usage, D3DRESOURCETYPE rtype)
+{
+    if (!dev || !dev->lpVtbl || !dev->lpVtbl->GetDirect3D) return D3DFMT_A8B8G8R8;
+    IDirect3D9 *d3d = NULL;
+    if (FAILED(dev->lpVtbl->GetDirect3D(dev, &d3d)) || !d3d) return D3DFMT_A8B8G8R8;
+    D3DDEVICE_CREATION_PARAMETERS cp;
+    D3DDISPLAYMODE dm;
+    memset(&cp, 0, sizeof cp);
+    memset(&dm, 0, sizeof dm);
+    dev->lpVtbl->GetCreationParameters(dev, &cp);
+    d3d->lpVtbl->GetAdapterDisplayMode(d3d, cp.AdapterOrdinal, &dm);
+    /* No Vulkan/Android/Mali, A8B8G8R8 (VK_FORMAT_R8G8B8A8_UNORM) é universal. */
+    if (SUCCEEDED(d3d->lpVtbl->CheckDeviceFormat(d3d, cp.AdapterOrdinal, cp.DeviceType, dm.Format, usage, rtype, D3DFMT_A8B8G8R8))) {
+        d3d->lpVtbl->Release(d3d);
+        return D3DFMT_A8B8G8R8;
+    }
+    if (SUCCEEDED(d3d->lpVtbl->CheckDeviceFormat(d3d, cp.AdapterOrdinal, cp.DeviceType, dm.Format, usage, rtype, D3DFMT_A8R8G8B8))) {
+        d3d->lpVtbl->Release(d3d);
+        return D3DFMT_A8R8G8B8;
+    }
+    d3d->lpVtbl->Release(d3d);
+    return D3DFMT_A8B8G8R8;
+}
+
+static void d_CheckDeviceFormat(CPU *c)
+{
+    IDirect3D9 *d3d = d9_self(c, D9K_D3D9);
+    uint32_t adapter = re5_arg(c, 1);
+    D3DDEVTYPE devtype = (D3DDEVTYPE)re5_arg(c, 2);
+    D3DFORMAT adapter_fmt = (D3DFORMAT)re5_arg(c, 3);
+    DWORD usage = re5_arg(c, 4);
+    D3DRESOURCETYPE rtype = (D3DRESOURCETYPE)re5_arg(c, 5);
+    D3DFORMAT check_fmt = (D3DFORMAT)re5_arg(c, 6);
+
+    HRESULT hr = d3d->lpVtbl->CheckDeviceFormat(d3d, adapter, devtype, adapter_fmt, usage, rtype, check_fmt);
+    if (FAILED(hr) && is_dxt(check_fmt) && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) &&
+        (rtype == D3DRTYPE_TEXTURE || rtype == D3DRTYPE_CUBETEXTURE || rtype == D3DRTYPE_SURFACE)) {
+        HRESULT hr_fallback = d3d->lpVtbl->CheckDeviceFormat(d3d, adapter, devtype, adapter_fmt, usage, rtype, D3DFMT_A8B8G8R8);
+        if (FAILED(hr_fallback))
+            hr_fallback = d3d->lpVtbl->CheckDeviceFormat(d3d, adapter, devtype, adapter_fmt, usage, rtype, D3DFMT_A8R8G8B8);
+        if (SUCCEEDED(hr_fallback)) hr = D3D_OK;
+    }
+    c->eax = (uint32_t)hr;
+}
+
 /* ---- Direct3DCreate9 e IDirect3D9 ---- */
 
 static void d_Direct3DCreate9(CPU *c)
@@ -451,11 +563,108 @@ static void d_CreateDevice(CPU *c)
         d9_obj *o = obj_of(rd32(out));
         o->focus_hwnd = focus;
         o->behavior = flags;
+        int dxt1_ok = host_supports_format(dev, D3DFMT_DXT1, 0, D3DRTYPE_TEXTURE);
+        int dxt5_ok = host_supports_format(dev, D3DFMT_DXT5, 0, D3DRTYPE_TEXTURE);
+        RE5_INFO("d3d9", "suporte DXT nativo no host: DXT1 %s, DXT5 %s (fallback CPU %s)",
+                 dxt1_ok ? "sim" : "não", dxt5_ok ? "sim" : "não",
+                 (!dxt1_ok || !dxt5_ok || force_cpu_dxt()) ? "ativo" : "inativo");
     }
     c->eax = (uint32_t)hr;
 }
 
 /* ---- IDirect3DDevice9 ---- */
+
+static void d_CreateTexture(CPU *c)
+{
+    IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
+    uint32_t w = re5_arg(c, 1), h = re5_arg(c, 2), levels = re5_arg(c, 3), usage = re5_arg(c, 4);
+    D3DFORMAT format = (D3DFORMAT)re5_arg(c, 5);
+    D3DPOOL pool = (D3DPOOL)re5_arg(c, 6);
+    uint32_t out = re5_arg(c, 7);
+    d9_no_shared(re5_arg(c, 8), "IDirect3DDevice9::CreateTexture");
+    if (!out) {
+        c->eax = (uint32_t)D3DERR_INVALIDCALL;
+        return;
+    }
+    D3DFORMAT host_format = format;
+    int need_dxt_fallback = 0;
+    if (is_dxt(format) && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) {
+        if (force_cpu_dxt() || !host_supports_format(dev, format, usage, D3DRTYPE_TEXTURE)) {
+            host_format = get_dxt_fallback_format(dev, usage, D3DRTYPE_TEXTURE);
+            need_dxt_fallback = 1;
+        }
+    }
+    IDirect3DTexture9 *tex = NULL;
+    HRESULT hr = dev->lpVtbl->CreateTexture(dev, w, h, levels, usage, host_format, pool, &tex, NULL);
+    if (SUCCEEDED(hr) && tex) {
+        uint32_t g = d9_wrap(tex, D9K_TEXTURE);
+        if (need_dxt_fallback) {
+            d9_obj *o = obj_of(g);
+            uint32_t actual_levels = tex->lpVtbl->GetLevelCount(tex);
+            o->dxt_storage.orig_format = (uint32_t)format;
+            o->dxt_storage.fallback_fmt = (uint32_t)host_format;
+            o->dxt_storage.width = w;
+            o->dxt_storage.height = h;
+            o->dxt_storage.levels = actual_levels;
+            o->dxt_storage.faces = 1;
+            o->dxt_storage.levels_data = calloc(actual_levels, sizeof(uint8_t *));
+            o->dxt_storage.levels_size = calloc(actual_levels, sizeof(uint32_t));
+            o->dxt = &o->dxt_storage;
+            RE5_DEBUG("d3d9", "CreateTexture %ux%u DXT%d (%u níveis) -> fallback host %u",
+                      w, h, dxt_mode(format), actual_levels, (unsigned)host_format);
+        }
+        wr32(out, g);
+    } else {
+        wr32(out, 0);
+    }
+    c->eax = (uint32_t)hr;
+}
+
+static void d_CreateCubeTexture(CPU *c)
+{
+    IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
+    uint32_t edge = re5_arg(c, 1), levels = re5_arg(c, 2), usage = re5_arg(c, 3);
+    D3DFORMAT format = (D3DFORMAT)re5_arg(c, 4);
+    D3DPOOL pool = (D3DPOOL)re5_arg(c, 5);
+    uint32_t out = re5_arg(c, 6);
+    d9_no_shared(re5_arg(c, 7), "IDirect3DDevice9::CreateCubeTexture");
+    if (!out) {
+        c->eax = (uint32_t)D3DERR_INVALIDCALL;
+        return;
+    }
+    D3DFORMAT host_format = format;
+    int need_dxt_fallback = 0;
+    if (is_dxt(format) && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) {
+        if (force_cpu_dxt() || !host_supports_format(dev, format, usage, D3DRTYPE_CUBETEXTURE)) {
+            host_format = get_dxt_fallback_format(dev, usage, D3DRTYPE_CUBETEXTURE);
+            need_dxt_fallback = 1;
+        }
+    }
+    IDirect3DCubeTexture9 *cube = NULL;
+    HRESULT hr = dev->lpVtbl->CreateCubeTexture(dev, edge, levels, usage, host_format, pool, &cube, NULL);
+    if (SUCCEEDED(hr) && cube) {
+        uint32_t g = d9_wrap(cube, D9K_CUBETEXTURE);
+        if (need_dxt_fallback) {
+            d9_obj *o = obj_of(g);
+            uint32_t actual_levels = cube->lpVtbl->GetLevelCount(cube);
+            o->dxt_storage.orig_format = (uint32_t)format;
+            o->dxt_storage.fallback_fmt = (uint32_t)host_format;
+            o->dxt_storage.width = edge;
+            o->dxt_storage.height = edge;
+            o->dxt_storage.levels = actual_levels;
+            o->dxt_storage.faces = 6;
+            o->dxt_storage.levels_data = calloc(actual_levels * 6u, sizeof(uint8_t *));
+            o->dxt_storage.levels_size = calloc(actual_levels * 6u, sizeof(uint32_t));
+            o->dxt = &o->dxt_storage;
+            RE5_DEBUG("d3d9", "CreateCubeTexture edge %u DXT%d (%u níveis x 6 faces) -> fallback host %u",
+                      edge, dxt_mode(format), actual_levels, (unsigned)host_format);
+        }
+        wr32(out, g);
+    } else {
+        wr32(out, 0);
+    }
+    c->eax = (uint32_t)hr;
+}
 
 static void d_GetCreationParameters(CPU *c)
 {
@@ -597,7 +806,9 @@ static void d_Present(CPU *c)
     const RGNDATA *dirty = d9_ptr(re5_arg(c, 4));
     HRESULT hr;
     re5_coldebug_draw(dev);
+#if !defined(__ANDROID__)
     re5_lan_menu_draw(dev);
+#endif
     if (shot_wanted(g_presents + 1)) shot(dev, g_presents + 1);
     re5_dump_at_present(g_presents + 1);
     re5_capture_at_present(g_presents + 1);
@@ -661,11 +872,32 @@ static void lock_finish(d9_obj *o, int idx)
          * era 22% das esperas das outras threads no carregamento (RE5_PROFILE).
          * O recurso continua travado no host até o Unlock de quem chamou. */
         RE5_BLOCKING_BEGIN();
-        const uint8_t *g = re5_g2h(l.guest);
-        for (uint32_t z = 0; z < (l.slices ? l.slices : 1); z++) {
-            size_t base = (size_t)z * l.slice_pitch;
-            for (uint32_t r = 0; r < l.rows; r++)
-                memcpy(l.host + base + (size_t)r * l.pitch, g + base + (size_t)r * l.pitch, l.row_bytes);
+        if (l.dxt_orig_format) {
+            /* 1) Atualiza a sombra DXT */
+            if (o->dxt && o->dxt->levels_data && l.dxt_shadow_idx < o->dxt->faces * o->dxt->levels &&
+                o->dxt->levels_data[l.dxt_shadow_idx]) {
+                uint32_t level = l.sub % 32u;
+                uint32_t mip_w = o->dxt->width >> level; if (!mip_w) mip_w = 1;
+                uint32_t full_bw = (mip_w + 3) / 4;
+                uint32_t b_size = (l.dxt_orig_format == D3DFMT_DXT1) ? 8 : 16;
+                uint32_t full_pitch = full_bw * b_size;
+                uint32_t shadow_off = (l.dxt_region_top / 4) * full_pitch + (l.dxt_region_left / 4) * b_size;
+                for (uint32_t r = 0; r < l.dxt_guest_rows; r++)
+                    memcpy(o->dxt->levels_data[l.dxt_shadow_idx] + shadow_off + (size_t)r * full_pitch,
+                           (const uint8_t *)re5_g2h(l.guest) + (size_t)r * l.dxt_guest_pitch,
+                           l.dxt_guest_pitch);
+            }
+            /* 2) Descompacta DXT para os pixels RGBA8 do host */
+            re5_dxt_decode(dxt_mode((D3DFORMAT)l.dxt_orig_format), l.dxt_region_w, l.dxt_region_h,
+                           (const uint8_t *)re5_g2h(l.guest), l.dxt_guest_pitch,
+                           l.host, l.pitch, (l.dxt_fallback_fmt == D3DFMT_A8R8G8B8));
+        } else {
+            const uint8_t *g = re5_g2h(l.guest);
+            for (uint32_t z = 0; z < (l.slices ? l.slices : 1); z++) {
+                size_t base = (size_t)z * l.slice_pitch;
+                for (uint32_t r = 0; r < l.rows; r++)
+                    memcpy(l.host + base + (size_t)r * l.pitch, g + base + (size_t)r * l.pitch, l.row_bytes);
+            }
         }
         RE5_BLOCKING_END();
     }
@@ -775,6 +1007,67 @@ static void lock_pixels(d9_obj *o, uint32_t sub, const D3DSURFACE_DESC *desc, co
     uint32_t w = rect ? (uint32_t)(rect->right - rect->left) : desc->Width;
     uint32_t h = rect ? (uint32_t)(rect->bottom - rect->top) : desc->Height;
     uint32_t rows = (h + bh - 1) / bh, row_bytes = (w + bw - 1) / bw * bytes;
+
+    if (o->dxt && o->dxt->orig_format) {
+        /* Fallback CPU DXT -> RGBA8 */
+        uint32_t face = sub / 32u, level = sub % 32u;
+        uint32_t s_idx = face * o->dxt->levels + level;
+        uint32_t mip_w = o->dxt->width >> level; if (!mip_w) mip_w = 1;
+        uint32_t mip_h = o->dxt->height >> level; if (!mip_h) mip_h = 1;
+        uint32_t full_bw = (mip_w + 3) / 4;
+        uint32_t full_bh = (mip_h + 3) / 4;
+        uint32_t b_size = (o->dxt->orig_format == D3DFMT_DXT1) ? 8 : 16;
+        uint32_t full_pitch = full_bw * b_size;
+        uint32_t full_size = full_pitch * full_bh;
+
+        if (o->dxt->levels_data && s_idx < o->dxt->faces * o->dxt->levels) {
+            if (!o->dxt->levels_data[s_idx]) {
+                o->dxt->levels_data[s_idx] = calloc(1, full_size);
+                o->dxt->levels_size[s_idx] = full_size;
+            }
+        }
+
+        uint32_t r_left = rect ? (uint32_t)rect->left : 0;
+        uint32_t r_top  = rect ? (uint32_t)rect->top  : 0;
+        uint32_t guest_pitch = row_bytes;
+        uint64_t guest_size = (uint64_t)guest_pitch * rows;
+        if (guest_size > 0x40000000u) re5_fatal("d3d9", "trava DXT de %llu bytes", (unsigned long long)guest_size);
+        uint32_t g = k32_heap_alloc(heap(), 0, (uint32_t)guest_size);
+        if (!g) re5_fatal("d3d9", "sem memória do guest para travar DXT (%llu bytes)", (unsigned long long)guest_size);
+
+        if (!(flags & D3DLOCK_DISCARD) && o->dxt->levels_data && s_idx < o->dxt->faces * o->dxt->levels &&
+            o->dxt->levels_data[s_idx]) {
+            uint32_t shadow_off = (r_top / 4) * full_pitch + (r_left / 4) * b_size;
+            for (uint32_t r = 0; r < rows; r++)
+                memcpy((uint8_t *)re5_g2h(g) + (size_t)r * guest_pitch,
+                       o->dxt->levels_data[s_idx] + shadow_off + (size_t)r * full_pitch,
+                       guest_pitch);
+        }
+
+        d9_lock *l = lock_push(o);
+        l->sub = sub;
+        l->guest = g;
+        l->host = lr->pBits;
+        l->pitch = (uint32_t)lr->Pitch;   /* pitch do host para decodificação */
+        l->row_bytes = row_bytes;
+        l->rows = rows;
+        l->flags = flags;
+        l->owned = 1;
+        l->dxt_orig_format = o->dxt->orig_format;
+        l->dxt_fallback_fmt = o->dxt->fallback_fmt;
+        l->dxt_region_w = w;
+        l->dxt_region_h = h;
+        l->dxt_region_left = r_left;
+        l->dxt_region_top = r_top;
+        l->dxt_guest_pitch = guest_pitch;
+        l->dxt_guest_rows = rows;
+        l->dxt_shadow_idx = s_idx;
+
+        wr32(out, guest_pitch);
+        wr32(out + 4, g);
+        return;
+    }
+
     if (lr->Pitch <= 0 || (uint32_t)lr->Pitch < row_bytes || !rows)
         re5_fatal("d3d9", "%s::LockRect: pitch %d do host para %u bytes por linha", kind_name(o->kind), lr->Pitch,
                   row_bytes);
@@ -821,7 +1114,10 @@ static void t_LockRect(CPU *c)
     D3DLOCKED_RECT lr;
     HRESULT hr = t->lpVtbl->GetLevelDesc(t, level, &desc);
     if (SUCCEEDED(hr)) hr = t->lpVtbl->LockRect(t, level, &lr, rect, flags);
-    if (SUCCEEDED(hr)) lock_pixels(o, level, &desc, &lr, rect, flags, out);
+    if (SUCCEEDED(hr)) {
+        if (o->dxt && o->dxt->orig_format) desc.Format = (D3DFORMAT)o->dxt->orig_format;
+        lock_pixels(o, level, &desc, &lr, rect, flags, out);
+    }
     c->eax = (uint32_t)hr;
 }
 
@@ -833,6 +1129,42 @@ static void t_UnlockRect(CPU *c)
     int i = lock_find(o, level);
     if (i >= 0) lock_finish(o, i);
     c->eax = (uint32_t)t->lpVtbl->UnlockRect(t, level);
+}
+
+static void t_GetLevelDesc(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_TEXTURE);
+    IDirect3DTexture9 *t = (IDirect3DTexture9 *)o->host;
+    uint32_t level = re5_arg(c, 1), pdesc = re5_arg(c, 2);
+    if (!pdesc) { c->eax = (uint32_t)D3DERR_INVALIDCALL; return; }
+    D3DSURFACE_DESC *d = re5_g2h(pdesc);
+    HRESULT hr = t->lpVtbl->GetLevelDesc(t, level, d);
+    if (SUCCEEDED(hr) && o->dxt && o->dxt->orig_format) {
+        d->Format = (D3DFORMAT)o->dxt->orig_format;
+    }
+    c->eax = (uint32_t)hr;
+}
+
+static void t_GetSurfaceLevel(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_TEXTURE);
+    IDirect3DTexture9 *t = (IDirect3DTexture9 *)o->host;
+    uint32_t level = re5_arg(c, 1), pp = re5_arg(c, 2);
+    if (!pp) { c->eax = (uint32_t)D3DERR_INVALIDCALL; return; }
+    IDirect3DSurface9 *surf = NULL;
+    HRESULT hr = t->lpVtbl->GetSurfaceLevel(t, level, &surf);
+    if (SUCCEEDED(hr) && surf) {
+        uint32_t g = d9_wrap(surf, D9K_SURFACE);
+        d9_obj *so = obj_of(g);
+        if (so && o->dxt && o->dxt->orig_format) {
+            so->dxt = o->dxt;
+            so->dxt_surface_sub = level;
+        }
+        wr32(pp, g);
+    } else {
+        wr32(pp, 0);
+    }
+    c->eax = (uint32_t)hr;
 }
 
 /* Volume: o mesmo que lock_pixels, fatia a fatia (D3DLOCKED_BOX do guest: RowPitch, SlicePitch, pBits). */
@@ -922,7 +1254,10 @@ static void x_LockRect(CPU *c)
     D3DLOCKED_RECT lr;
     HRESULT hr = t->lpVtbl->GetLevelDesc(t, level, &desc);
     if (SUCCEEDED(hr)) hr = t->lpVtbl->LockRect(t, (D3DCUBEMAP_FACES)face, level, &lr, rect, flags);
-    if (SUCCEEDED(hr)) lock_pixels(o, sub, &desc, &lr, rect, flags, out);
+    if (SUCCEEDED(hr)) {
+        if (o->dxt && o->dxt->orig_format) desc.Format = (D3DFORMAT)o->dxt->orig_format;
+        lock_pixels(o, sub, &desc, &lr, rect, flags, out);
+    }
     c->eax = (uint32_t)hr;
 }
 
@@ -936,14 +1271,51 @@ static void x_UnlockRect(CPU *c)
     c->eax = (uint32_t)t->lpVtbl->UnlockRect(t, (D3DCUBEMAP_FACES)face, level);
 }
 
+static void x_GetLevelDesc(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_CUBETEXTURE);
+    IDirect3DCubeTexture9 *t = (IDirect3DCubeTexture9 *)o->host;
+    uint32_t level = re5_arg(c, 1), pdesc = re5_arg(c, 2);
+    if (!pdesc) { c->eax = (uint32_t)D3DERR_INVALIDCALL; return; }
+    D3DSURFACE_DESC *d = re5_g2h(pdesc);
+    HRESULT hr = t->lpVtbl->GetLevelDesc(t, level, d);
+    if (SUCCEEDED(hr) && o->dxt && o->dxt->orig_format) {
+        d->Format = (D3DFORMAT)o->dxt->orig_format;
+    }
+    c->eax = (uint32_t)hr;
+}
+
+static void x_GetCubeMapSurface(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_CUBETEXTURE);
+    IDirect3DCubeTexture9 *t = (IDirect3DCubeTexture9 *)o->host;
+    uint32_t face = re5_arg(c, 1), level = re5_arg(c, 2), pp = re5_arg(c, 3);
+    if (!pp) { c->eax = (uint32_t)D3DERR_INVALIDCALL; return; }
+    IDirect3DSurface9 *surf = NULL;
+    HRESULT hr = t->lpVtbl->GetCubeMapSurface(t, (D3DCUBEMAP_FACES)face, level, &surf);
+    if (SUCCEEDED(hr) && surf) {
+        uint32_t g = d9_wrap(surf, D9K_SURFACE);
+        d9_obj *so = obj_of(g);
+        if (so && o->dxt && o->dxt->orig_format) {
+            so->dxt = o->dxt;
+            so->dxt_surface_sub = face * 32u + level;
+        }
+        wr32(pp, g);
+    } else {
+        wr32(pp, 0);
+    }
+    c->eax = (uint32_t)hr;
+}
+
 static void s_LockRect(CPU *c)
 {
     d9_obj *o = self_obj(c, D9K_SURFACE);
     IDirect3DSurface9 *s = (IDirect3DSurface9 *)o->host;
     uint32_t out = re5_arg(c, 1), flags = re5_arg(c, 3);
+    uint32_t sub = o->dxt ? o->dxt_surface_sub : 0;
     RECT tmp;
     const RECT *rect = rect_from(re5_arg(c, 2), &tmp);
-    if (!out || lock_find(o, 0) >= 0) {
+    if (!out || lock_find(o, sub) >= 0) {
         c->eax = (uint32_t)D3DERR_INVALIDCALL;
         return;
     }
@@ -951,7 +1323,10 @@ static void s_LockRect(CPU *c)
     D3DLOCKED_RECT lr;
     HRESULT hr = s->lpVtbl->GetDesc(s, &desc);
     if (SUCCEEDED(hr)) hr = s->lpVtbl->LockRect(s, &lr, rect, flags);
-    if (SUCCEEDED(hr)) lock_pixels(o, 0, &desc, &lr, rect, flags, out);
+    if (SUCCEEDED(hr)) {
+        if (o->dxt && o->dxt->orig_format) desc.Format = (D3DFORMAT)o->dxt->orig_format;
+        lock_pixels(o, sub, &desc, &lr, rect, flags, out);
+    }
     c->eax = (uint32_t)hr;
 }
 
@@ -959,9 +1334,24 @@ static void s_UnlockRect(CPU *c)
 {
     d9_obj *o = self_obj(c, D9K_SURFACE);
     IDirect3DSurface9 *s = (IDirect3DSurface9 *)o->host;
-    int i = lock_find(o, 0);
+    uint32_t sub = o->dxt ? o->dxt_surface_sub : 0;
+    int i = lock_find(o, sub);
     if (i >= 0) lock_finish(o, i);
     c->eax = (uint32_t)s->lpVtbl->UnlockRect(s);
+}
+
+static void s_GetDesc(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_SURFACE);
+    IDirect3DSurface9 *s = (IDirect3DSurface9 *)o->host;
+    uint32_t pdesc = re5_arg(c, 1);
+    if (!pdesc) { c->eax = (uint32_t)D3DERR_INVALIDCALL; return; }
+    D3DSURFACE_DESC *d = re5_g2h(pdesc);
+    HRESULT hr = s->lpVtbl->GetDesc(s, d);
+    if (SUCCEEDED(hr) && o->dxt && o->dxt->orig_format) {
+        d->Format = (D3DFORMAT)o->dxt->orig_format;
+    }
+    c->eax = (uint32_t)hr;
 }
 
 /* ---- vtables ---- */
@@ -981,16 +1371,24 @@ typedef struct {
 
 static const d9_manual k_manual[] = {
     {D9K_D3D9, "CreateDevice", d_CreateDevice},
+    {D9K_D3D9, "CheckDeviceFormat", d_CheckDeviceFormat},
     {D9K_DEVICE, "GetCreationParameters", d_GetCreationParameters},
     {D9K_DEVICE, "Reset", d_Reset},
     {D9K_DEVICE, "Present", d_Present},
     {D9K_DEVICE, "SetVertexShaderConstantF", d_SetVertexShaderConstantF},
+    {D9K_DEVICE, "CreateTexture", d_CreateTexture},
+    {D9K_DEVICE, "CreateCubeTexture", d_CreateCubeTexture},
     {D9K_SURFACE, "LockRect", s_LockRect},
     {D9K_SURFACE, "UnlockRect", s_UnlockRect},
+    {D9K_SURFACE, "GetDesc", s_GetDesc},
     {D9K_TEXTURE, "LockRect", t_LockRect},
     {D9K_TEXTURE, "UnlockRect", t_UnlockRect},
+    {D9K_TEXTURE, "GetLevelDesc", t_GetLevelDesc},
+    {D9K_TEXTURE, "GetSurfaceLevel", t_GetSurfaceLevel},
     {D9K_CUBETEXTURE, "LockRect", x_LockRect},
     {D9K_CUBETEXTURE, "UnlockRect", x_UnlockRect},
+    {D9K_CUBETEXTURE, "GetLevelDesc", x_GetLevelDesc},
+    {D9K_CUBETEXTURE, "GetCubeMapSurface", x_GetCubeMapSurface},
     {D9K_VOLUMETEXTURE, "LockBox", v_LockBox},
     {D9K_VOLUMETEXTURE, "UnlockBox", v_UnlockBox},
     {D9K_VERTEXBUFFER, "Lock", b_Lock},
@@ -1047,3 +1445,17 @@ static const re5_import_def k_defs[] = {
 };
 
 const re5_import_module re5_mod_d3d9 = {"d3d9.dll", k_defs};
+
+uint32_t re5_d3d9_get_presents(void)
+{
+    return g_presents;
+}
+
+#if defined(__ANDROID__)
+#include <jni.h>
+JNIEXPORT jint JNICALL Java_org_libsdl_app_SDLActivity_nativeGetPresents(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    return (jint)g_presents;
+}
+#endif

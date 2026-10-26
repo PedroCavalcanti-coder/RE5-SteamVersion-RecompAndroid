@@ -12,7 +12,7 @@
 #   3.1.1 (third_party/dxvk): Vulkan 1.4 + maintenance5/6 e load_store_op_none.
 #   No Android (Mali do Exynos 1380 e outros Vulkan 1.1) a versão é a DXVK
 #   native 1.9.2b (third_party/dxvk-native) com o porte do NFSU2
-#   (tools/nfsu2-reference/ports/dxvk_android), não este script.
+#   (tools/nfsu2-reference/ports/dxvk_android): scripts/build_dxvk_android.sh.
 #
 #   Windows (Git Bash/MSYS2 com MinGW-w64): d3d9.dll x64, ligada estática ao
 #       libgcc/libstdc++ (só depende do vulkan-1.dll do driver).

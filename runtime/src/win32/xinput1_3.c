@@ -25,6 +25,7 @@
 
 typedef struct {
     SDL_GameController *gc;
+    SDL_Joystick       *js;
     SDL_JoystickID      id;
     uint32_t            packet;
     uint8_t             last[12];
@@ -40,8 +41,8 @@ static int sdl_ready(void)
     g_ready = -1;
     if (getenv("RE5_HEADLESS")) return 0;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* como o XInput: lê sem foco */
-    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
-        RE5_WARN("xinput", "SDL_INIT_GAMECONTROLLER falhou (%s): nenhum controle", SDL_GetError());
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
+        RE5_WARN("xinput", "SDL_InitSubSystem falhou (%s): nenhum controle", SDL_GetError());
         return 0;
     }
     g_ready = 1;
@@ -51,7 +52,7 @@ static int sdl_ready(void)
 static int slot_of(SDL_JoystickID id)
 {
     for (int i = 0; i < XI_USERS; i++)
-        if (g_pads[i].gc && g_pads[i].id == id) return i;
+        if ((g_pads[i].gc || g_pads[i].js) && g_pads[i].id == id) return i;
     return -1;
 }
 
@@ -65,28 +66,63 @@ static void scan(void)
             RE5_INFO("xinput", "controle %d desligado", i);
             SDL_GameControllerClose(g_pads[i].gc);
             memset(&g_pads[i], 0, sizeof g_pads[i]);
+        } else if (g_pads[i].js && !SDL_JoystickGetAttached(g_pads[i].js)) {
+            RE5_INFO("xinput", "joystick %d desligado", i);
+            SDL_JoystickClose(g_pads[i].js);
+            memset(&g_pads[i], 0, sizeof g_pads[i]);
         }
     }
     for (int j = 0; j < SDL_NumJoysticks(); j++) {
-        if (!SDL_IsGameController(j) || slot_of(SDL_JoystickGetDeviceInstanceID(j)) >= 0) continue;
+        SDL_JoystickID jid = SDL_JoystickGetDeviceInstanceID(j);
+        if (slot_of(jid) >= 0) continue;
         int i = 0;
-        while (i < XI_USERS && g_pads[i].gc) i++;
+        while (i < XI_USERS && (g_pads[i].gc || g_pads[i].js)) i++;
         if (i == XI_USERS) break;
+
+        /* Se o controle não foi reconhecido de fábrica, adiciona mapeamento padrão Android */
+        if (!SDL_IsGameController(j)) {
+            char guid_str[64];
+            SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(j);
+            SDL_JoystickGetGUIDString(guid, guid_str, sizeof(guid_str));
+            const char *name = SDL_JoystickNameForIndex(j);
+            char mapping[512];
+            snprintf(mapping, sizeof(mapping),
+                "%s,%s,a:b0,b:b1,x:b2,y:b3,back:b4,guide:b5,start:b6,leftstick:b7,rightstick:b8,leftshoulder:b9,rightshoulder:b10,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a4,righttrigger:a5,platform:Android,",
+                guid_str, name ? name : "Gamepad");
+            SDL_GameControllerAddMapping(mapping);
+        }
+
         SDL_GameController *gc = SDL_GameControllerOpen(j);
-        if (!gc) continue;
-        g_pads[i].gc = gc;
-        g_pads[i].id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc));
-        RE5_INFO("xinput", "controle %d: %s", i, SDL_GameControllerName(gc));
+        if (gc) {
+            g_pads[i].gc = gc;
+            g_pads[i].js = SDL_GameControllerGetJoystick(gc);
+            g_pads[i].id = SDL_JoystickInstanceID(g_pads[i].js);
+            RE5_INFO("xinput", "controle %d (GameController): %s", i, SDL_GameControllerName(gc));
+        } else {
+            SDL_Joystick *js = SDL_JoystickOpen(j);
+            if (js) {
+                g_pads[i].gc = NULL;
+                g_pads[i].js = js;
+                g_pads[i].id = SDL_JoystickInstanceID(js);
+                RE5_INFO("xinput", "controle %d (Joystick fallback): %s", i, SDL_JoystickName(js));
+            }
+        }
     }
 }
 
 /* Controle do usuário `i`, ou NULL. */
-static SDL_GameController *pad_of(uint32_t i)
+static pad *pad_of(uint32_t i)
 {
     if (!sdl_ready()) return NULL;
     SDL_GameControllerUpdate();
-    if (!g_pads[i].gc || !SDL_GameControllerGetAttached(g_pads[i].gc)) scan();
-    return g_pads[i].gc && SDL_GameControllerGetAttached(g_pads[i].gc) ? g_pads[i].gc : NULL;
+    if ((!g_pads[i].gc && !g_pads[i].js) ||
+        (g_pads[i].gc && !SDL_GameControllerGetAttached(g_pads[i].gc)) ||
+        (g_pads[i].js && !SDL_JoystickGetAttached(g_pads[i].js))) {
+        scan();
+    }
+    if (g_pads[i].gc && SDL_GameControllerGetAttached(g_pads[i].gc)) return &g_pads[i];
+    if (g_pads[i].js && SDL_JoystickGetAttached(g_pads[i].js)) return &g_pads[i];
+    return NULL;
 }
 
 static void wr16le(uint8_t *p, uint16_t v)
@@ -142,17 +178,32 @@ static void x_GetState(CPU *c)
         c->eax = XI_ERROR_SUCCESS;
         return;
     }
-    SDL_GameController *gc = pad_of(user);
-    if (!gc) {
+    pad *p = pad_of(user);
+    if (!p) {
         c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
         return;
     }
-    int16_t axis[6];
+    int16_t axis[6] = {0};
     uint32_t buttons = 0;
-    for (int a = 0; a < 6; a++) axis[a] = SDL_GameControllerGetAxis(gc, (SDL_GameControllerAxis)a);
-    for (int k = 0; k < SDL_CONTROLLER_BUTTON_MAX && k < 32; k++)
-        if (SDL_GameControllerGetButton(gc, (SDL_GameControllerButton)k)) buttons |= 1u << k;
-    pad *p = &g_pads[user];
+    if (p->gc) {
+        for (int a = 0; a < 6; a++) axis[a] = SDL_GameControllerGetAxis(p->gc, (SDL_GameControllerAxis)a);
+        for (int k = 0; k < SDL_CONTROLLER_BUTTON_MAX && k < 32; k++)
+            if (SDL_GameControllerGetButton(p->gc, (SDL_GameControllerButton)k)) buttons |= 1u << k;
+    } else if (p->js) {
+        int naxes = SDL_JoystickNumAxes(p->js);
+        for (int a = 0; a < 6 && a < naxes; a++) axis[a] = SDL_JoystickGetAxis(p->js, a);
+        int nbuttons = SDL_JoystickNumButtons(p->js);
+        for (int b = 0; b < nbuttons && b < 32; b++) {
+            if (SDL_JoystickGetButton(p->js, b)) buttons |= (1u << b);
+        }
+        if (SDL_JoystickNumHats(p->js) > 0) {
+            Uint8 hat = SDL_JoystickGetHat(p->js, 0);
+            if (hat & SDL_HAT_UP)    buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_UP);
+            if (hat & SDL_HAT_DOWN)  buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+            if (hat & SDL_HAT_LEFT)  buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+            if (hat & SDL_HAT_RIGHT) buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+        }
+    }
     uint8_t g[12];
     re5_xinput_gamepad(axis, buttons, g);
     if (memcmp(g, p->last, sizeof g) != 0) {   /* dwPacketNumber muda quando o estado muda */
@@ -171,14 +222,18 @@ static void x_SetState(CPU *c)
         c->eax = XI_ERROR_BAD_ARGUMENTS;
         return;
     }
-    SDL_GameController *gc = pad_of(user);
-    if (!gc) {
+    pad *p = pad_of(user);
+    if (!p) {
         c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
         return;
     }
     /* XINPUT_VIBRATION: wLeftMotorSpeed, wRightMotorSpeed. O XInput mantém até
      * mudar; o SDL pede duração: o jogo renova a vibração enquanto ela dura. */
-    SDL_GameControllerRumble(gc, rd16(vib), rd16(vib + 2), 5000);
+    if (p->gc) {
+        SDL_GameControllerRumble(p->gc, rd16(vib), rd16(vib + 2), 5000);
+    } else if (p->js) {
+        SDL_JoystickRumble(p->js, rd16(vib), rd16(vib + 2), 5000);
+    }
     c->eax = XI_ERROR_SUCCESS;
 }
 

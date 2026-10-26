@@ -14,6 +14,10 @@
 #include "re5/platform.h"
 #include "re5/guest_base.h"
 
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
+#include "sse2neon.h"
+#endif
+
 #ifndef RECOMP_FS_SIMULATED
 #define RECOMP_FS_SIMULATED 1
 #endif

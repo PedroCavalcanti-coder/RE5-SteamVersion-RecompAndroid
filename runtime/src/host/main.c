@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define SDL_MAIN_HANDLED
+#include <SDL2/SDL.h>
 #include "re5/runtime.h"
 
 #define HOST_STACK_BYTES ((size_t)256 << 20)   /* o código gerado aninha uma chamada C por chamada do guest */
@@ -46,7 +48,7 @@ static void usage(void)
     fprintf(stderr, "uso: re5 [--exe PATH] [--game-dir DIR] [--user-dir DIR] [--census [--missing]]\n");
 }
 
-int main(int argc, char **argv)
+static int re5_main_entry(int argc, char **argv)
 {
     const char *exe = "bin_input/re5dx9.clean.exe", *game_dir = NULL, *user_dir = NULL;
     int census = 0, missing = 0;
@@ -59,6 +61,7 @@ int main(int argc, char **argv)
         else { usage(); return 2; }
     }
 
+    SDL_SetMainReady();
     if (re5_runtime_init() != 0) return 1;
 
     char dir[1024];
@@ -94,4 +97,14 @@ int main(int argc, char **argv)
     }
     RE5_INFO("host", "entry point retornou 0x%08X", a.result);
     return (int)a.result;
+}
+
+int main(int argc, char **argv)
+{
+    return re5_main_entry(argc, argv);
+}
+
+int SDL_main(int argc, char **argv)
+{
+    return re5_main_entry(argc, argv);
 }

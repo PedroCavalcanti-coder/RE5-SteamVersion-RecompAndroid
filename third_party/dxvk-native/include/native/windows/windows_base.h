@@ -261,13 +261,14 @@ typedef struct RGNDATA {
 #ifdef __cplusplus
 #define STDMETHOD(name) virtual HRESULT name
 #define STDMETHOD_(type, name) virtual type name
+#define THIS_
+#define THIS
 #else
 #define STDMETHOD(name) HRESULT (STDMETHODCALLTYPE *name)
 #define STDMETHOD_(type, name) type (STDMETHODCALLTYPE *name)
+#define THIS_ struct INTERFACE *This,
+#define THIS  struct INTERFACE *This
 #endif // __cplusplus
-
-#define THIS_
-#define THIS
 
 #define __C89_NAMELESSUNIONNAME
 #define __C89_NAMELESSUNIONNAME1

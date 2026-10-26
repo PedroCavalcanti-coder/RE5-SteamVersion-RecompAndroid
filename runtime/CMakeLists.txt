@@ -31,7 +31,7 @@ add_custom_command(
 # bytes como tipos diferentes e conta com aritmética de complemento de dois.
 add_library(re5_cpu INTERFACE)
 add_dependencies(re5_cpu re5_cpu_header)
-target_include_directories(re5_cpu INTERFACE "${RE5_GEN_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(re5_cpu INTERFACE "${RE5_GEN_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/third_party/sse2neon")
 if(MSVC)
     target_compile_options(re5_cpu INTERFACE /utf-8)
 else()
@@ -100,15 +100,20 @@ if(WIN32)
 endif()
 
 # FFmpeg mínimo (asf + vc1/wmapro) para o wmvcore (etapa 4.5), compilado por
-# scripts/build_ffmpeg.sh. Os headers são os do fonte mais os gerados no build.
-set(RE5_FFMPEG_DIR "${CMAKE_SOURCE_DIR}/build/ffmpeg" CACHE PATH "Build do FFmpeg (scripts/build_ffmpeg.sh)")
+# scripts/build_ffmpeg.sh ou build_ffmpeg_android.sh. Os headers são os do fonte mais os gerados no build.
+if(ANDROID)
+    set(RE5_FFMPEG_DEFAULT "${CMAKE_SOURCE_DIR}/build/ffmpeg-android")
+else()
+    set(RE5_FFMPEG_DEFAULT "${CMAKE_SOURCE_DIR}/build/ffmpeg")
+endif()
+set(RE5_FFMPEG_DIR "${RE5_FFMPEG_DEFAULT}" CACHE PATH "Build do FFmpeg (scripts/build_ffmpeg.sh ou build_ffmpeg_android.sh)")
 set(RE5_FFMPEG_LIBS
     "${RE5_FFMPEG_DIR}/libavformat/libavformat.a"
     "${RE5_FFMPEG_DIR}/libavcodec/libavcodec.a"
     "${RE5_FFMPEG_DIR}/libavutil/libavutil.a")
 foreach(lib ${RE5_FFMPEG_LIBS})
     if(NOT EXISTS "${lib}")
-        message(FATAL_ERROR "FFmpeg não encontrado (${lib}). Rode: scripts/build_ffmpeg.sh "
+        message(FATAL_ERROR "FFmpeg não encontrado (${lib}). Rode: scripts/build_ffmpeg.sh (ou scripts/build_ffmpeg_android.sh) "
                             "\"${RE5_FFMPEG_DIR}\" ou aponte RE5_FFMPEG_DIR para um build pronto.")
     endif()
 endforeach()

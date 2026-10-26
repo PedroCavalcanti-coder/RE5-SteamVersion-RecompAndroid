@@ -23,6 +23,9 @@ add_executable(test_d3d9 unit/test_d3d9.c)
 target_link_libraries(test_d3d9 PRIVATE re5_runtime re5_d3d9_headers)
 add_test(NAME d3d9 COMMAND test_d3d9)
 
+add_executable(test_dxt_decode unit/test_dxt_decode.c)
+add_test(NAME dxt_decode COMMAND test_dxt_decode)
+
 # Estouro da pilha do host com relatório (filtro com pilha de reserva).
 if(WIN32)
     add_executable(test_crash unit/test_crash.c)
