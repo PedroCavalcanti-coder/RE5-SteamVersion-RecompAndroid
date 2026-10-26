@@ -191,7 +191,7 @@ static HRESULT STDMETHODCALLTYPE dev_GetBackBuffer(IDirect3DDevice9 *This, UINT 
 static HRESULT STDMETHODCALLTYPE dev_CreateTexture(IDirect3DDevice9 *This, UINT w, UINT h, UINT l, DWORD u,
                                                    D3DFORMAT f, D3DPOOL p, IDirect3DTexture9 **out, HANDLE *sh)
 {
-    if (sh || w != 8 || h != 8 || f != D3DFMT_A8R8G8B8) return D3DERR_INVALIDCALL;
+    if (sh || w != 8 || h != 8 || (f != D3DFMT_A8R8G8B8 && f != D3DFMT_A8B8G8R8)) return D3DERR_INVALIDCALL;
     g_tex.refs++;
     *out = (IDirect3DTexture9 *)&g_tex;
     return D3D_OK;
@@ -253,9 +253,18 @@ static struct IDirect3DDevice9Vtbl k_dev_vt = {
     .SetTexture = dev_SetTexture,
 };
 
+static HRESULT STDMETHODCALLTYPE surf_GetDesc(IDirect3DSurface9 *This, D3DSURFACE_DESC *d)
+{
+    memset(d, 0, sizeof *d);
+    d->Format = D3DFMT_A8B8G8R8;
+    d->Width = d->Height = 8;
+    return D3D_OK;
+}
+
 static struct IDirect3DSurface9Vtbl k_bb_vt = {
     .AddRef = fake_IDirect3DSurface9_AddRef,
     .Release = fake_IDirect3DSurface9_Release,
+    .GetDesc = surf_GetDesc,
 };
 
 static HRESULT STDMETHODCALLTYPE vb_GetDesc(IDirect3DVertexBuffer9 *This, D3DVERTEXBUFFER_DESC *d)
@@ -288,6 +297,14 @@ static struct IDirect3DVertexBuffer9Vtbl k_vb_vt = {
 
 #define TEX_PITCH 40u   /* maior que 8 * 4: a ponte tem de manter o pitch do host */
 
+static DWORD STDMETHODCALLTYPE tex_GetLevelCount(IDirect3DTexture9 *This) { return 1; }
+
+static HRESULT STDMETHODCALLTYPE tex_GetSurfaceLevel(IDirect3DTexture9 *This, UINT l, IDirect3DSurface9 **out)
+{
+    g_bb.refs++;
+    *out = (IDirect3DSurface9 *)&g_bb;
+    return D3D_OK;
+}
 static D3DRESOURCETYPE STDMETHODCALLTYPE tex_GetType(IDirect3DTexture9 *This) { return D3DRTYPE_TEXTURE; }
 
 static HRESULT STDMETHODCALLTYPE tex_GetLevelDesc(IDirect3DTexture9 *This, UINT l, D3DSURFACE_DESC *d)
@@ -318,7 +335,9 @@ static struct IDirect3DTexture9Vtbl k_tex_vt = {
     .AddRef = fake_IDirect3DTexture9_AddRef,
     .Release = fake_IDirect3DTexture9_Release,
     .GetType = tex_GetType,
+    .GetLevelCount = tex_GetLevelCount,
     .GetLevelDesc = tex_GetLevelDesc,
+    .GetSurfaceLevel = tex_GetSurfaceLevel,
     .LockRect = tex_LockRect,
     .UnlockRect = tex_UnlockRect,
 };
@@ -595,6 +614,59 @@ int main(void)
     CHECK_EQ_U32(g_tex.mem[3 * TEX_PITCH + 15], 0xEE);
     CHECK_EQ_U32(g_tex.mem[3 * TEX_PITCH + 16], (3 * TEX_PITCH + 16) & 0xFF);   /* fora do retângulo */
     CHECK_EQ_U32(g_tex.unlocks, 2);
+
+    /* Textura com fallback DXT (CPU) para GPUs móveis sem textureCompressionBC (Mali) */
+#if defined(_WIN32)
+    _putenv("RE5_D3D9_CPU_DXT=1");
+#else
+    setenv("RE5_D3D9_CPU_DXT", "1", 1);
+#endif
+    uint32_t pdxt_tex = gbuf(4);
+    const uint32_t ctx_dxt[8] = {8, 8, 1, 0, D3DFMT_DXT5, D3DPOOL_MANAGED, pdxt_tex, 0};
+    CHECK_EQ_U32(vcall(dev, 23, 8, ctx_dxt), D3D_OK);
+    uint32_t dxt_tex = rd32(pdxt_tex);
+    CHECK(dxt_tex != 0);
+
+    /* GetLevelDesc deve reportar o formato original DXT5 ao guest */
+    uint32_t pdesc = gbuf(32);
+    const uint32_t gld[2] = {0, pdesc};
+    CHECK_EQ_U32(vcall(dxt_tex, 17, 2, gld), D3D_OK);
+    CHECK_EQ_U32(rd32(pdesc), D3DFMT_DXT5);
+
+    /* GetSurfaceLevel propaga o formato DXT5 */
+    uint32_t psurf = gbuf(4);
+    const uint32_t gsl[2] = {0, psurf};
+    CHECK_EQ_U32(vcall(dxt_tex, 18, 2, gsl), D3D_OK);
+    uint32_t surf = rd32(psurf);
+    CHECK(surf != 0);
+    const uint32_t gsd[1] = {pdesc};
+    CHECK_EQ_U32(vcall(surf, 12, 1, gsd), D3D_OK);
+    CHECK_EQ_U32(rd32(pdesc), D3DFMT_DXT5);
+
+    /* LockRect deve devolver pitch do DXT5 ((8/4)*16 = 32 bytes por linha) */
+    uint32_t dxt_lr = gbuf(8);
+    const uint32_t dxt_ltx[4] = {0, dxt_lr, 0, 0};
+    CHECK_EQ_U32(vcall(dxt_tex, 19, 4, dxt_ltx), D3D_OK);
+    CHECK_EQ_U32(rd32(dxt_lr), 32);
+    uint32_t dxt_bits = rd32(dxt_lr + 4);
+    CHECK(in_guest(dxt_bits));
+
+    /* Preenche o 1º bloco (4x4) com DXT5 vermelho opaco */
+    uint8_t *raw_dxt = (uint8_t *)re5_g2h(dxt_bits);
+    raw_dxt[0] = 255; raw_dxt[1] = 0;
+    memset(raw_dxt + 2, 0, 6);
+    uint16_t red = 0xF800;
+    memcpy(raw_dxt + 8, &red, 2);
+    memcpy(raw_dxt + 10, &red, 2);
+    memset(raw_dxt + 12, 0, 4);
+
+    CHECK_EQ_U32(vcall(dxt_tex, 20, 1, &utx), D3D_OK);
+    CHECK_EQ_U32(g_tex.mem[3], 255);
+#if defined(_WIN32)
+    _putenv("RE5_D3D9_CPU_DXT=0");
+#else
+    setenv("RE5_D3D9_CPU_DXT", "0", 1);
+#endif
 
     /* Volume: fatias com os pitches do host; o que fica entre as fatias não é tocado. */
     for (uint32_t i = 0; i < sizeof g_vol.mem; i++) g_vol.mem[i] = (uint8_t)i;

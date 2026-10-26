@@ -6,8 +6,10 @@
  *                scripts/build_dxvk.sh), o d3d9.dll do sistema sem nenhuma, ou
  *                o caminho em RE5_D3D9_DLL. A janela é o HWND nativo da janela
  *                SDL2 (SDL_GetWindowWMInfo).
- *   Linux/Android: a DXVK native (libdxvk_d3d9.so, ou RE5_D3D9_LIB) com o WSI
+ *   Linux:       a DXVK native (libdxvk_d3d9.so, ou RE5_D3D9_LIB) com o WSI
  *                do SDL2: a "HWND" que ela recebe é o próprio SDL_Window*.
+ *   Android:     a DXVK native 1.9.2b de scripts/build_dxvk_android.sh, no
+ *                jniLibs do app; a "HWND" é o ANativeWindow* da janela SDL2.
  *
  * Falha ao carregar aborta com o motivo (D8): sem Direct3D do host não há o
  * que o guest possa fazer com o NULL de um Direct3DCreate9.
@@ -27,6 +29,10 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#endif
+#if defined(__ANDROID__)
+#include <errno.h>
+#include <sys/stat.h>
 #endif
 
 typedef void *(
@@ -168,10 +174,38 @@ static void load(void)
     const char *path = getenv("RE5_D3D9_LIB");
     if (!path || !*path) path = "libdxvk_d3d9.so";
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* a janela que a ponte entrega é um SDL_Window* */
+#if defined(__ANDROID__)
+    /* Sem DXVK_STATE_CACHE_PATH a DXVK tenta criar o diretório "" ao lado do
+     * "executável" (app_process64) e aborta no CreateDevice com um
+     * filesystem_error. O cache (estados e VkPipelineCache) vai para a pasta
+     * interna do app. */
+    if (!getenv("DXVK_STATE_CACHE_PATH")) {
+        const char *base = SDL_AndroidGetInternalStoragePath();
+        if (!base) re5_fatal("d3d9", "SDL_AndroidGetInternalStoragePath falhou: %s", SDL_GetError());
+        char cache[1024];
+        snprintf(cache, sizeof cache, "%s/dxvk", base);
+        if (mkdir(cache, 0700) != 0 && errno != EEXIST) re5_fatal("d3d9", "mkdir(\"%s\") falhou: %s", cache, strerror(errno));
+        setenv("DXVK_STATE_CACHE_PATH", cache, 1);
+        RE5_INFO("d3d9", "cache da DXVK em %s", cache);
+    }
+#endif
     void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!lib) re5_fatal("d3d9", "dlopen(\"%s\") falhou: %s", path, dlerror());
     g_create9 = (create9_fn)dlsym(lib, "Direct3DCreate9");
     if (!g_create9) re5_fatal("d3d9", "%s não exporta Direct3DCreate9", path);
+#if defined(__ANDROID__)
+    /* O WSI do Android (android/dxvk/android_wsi.cpp) lista os modos do
+     * adaptador a partir do tamanho da tela, antes de existir device. */
+    void (*set_screen)(uint32_t, uint32_t) = (void (*)(uint32_t, uint32_t))dlsym(lib, "re5_dxvk_set_screen");
+    if (!set_screen) re5_fatal("d3d9", "%s não exporta re5_dxvk_set_screen (não é a DXVK do Android)", path);
+    SDL_DisplayMode dm;
+    if (SDL_GetDesktopDisplayMode(0, &dm) == 0) {
+        uint32_t sw = (uint32_t)dm.w, sh = (uint32_t)dm.h;
+        if (sw < sh) { uint32_t t = sw; sw = sh; sh = t; }
+        set_screen(sw, sh);
+        RE5_INFO("d3d9", "tela do Android: %dx%d (landscape)", sw, sh);
+    }
+#endif
     RE5_INFO("d3d9", "Direct3D do host: %s (DXVK native)", path);
 #endif
 }
@@ -192,6 +226,14 @@ static void *host_window(uint32_t hwnd)
     if (!SDL_GetWindowWMInfo(w, &info) || info.subsystem != SDL_SYSWM_WINDOWS)
         re5_fatal("d3d9", "SDL_GetWindowWMInfo da janela 0x%X falhou: %s", hwnd, SDL_GetError());
     return info.info.win.window;
+#elif defined(__ANDROID__)
+    /* A DXVK do Android não usa o SDL (que está estático na libre5.so): o WSI
+     * dela cria a superfície Vulkan direto do ANativeWindow da janela. */
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(w, &info) || info.subsystem != SDL_SYSWM_ANDROID || !info.info.android.window)
+        re5_fatal("d3d9", "janela 0x%X sem ANativeWindow (SDL_GetWindowWMInfo: %s)", hwnd, SDL_GetError());
+    return info.info.android.window;
 #else
     return w;
 #endif
