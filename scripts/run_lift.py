@@ -322,7 +322,7 @@ def cmd_lift(args, cfg):
     lifter = lift32_cpu.Lifter(exe, pe.OPTIONAL_HEADER.SizeOfImage, read_va)
     lifter.flags_dead_ret_below = cfg["lift"].get("flags_dead_at_ret_below")
     lifter.cache_flags = bool(cfg["lift"].get("cache_flags", True))
-    lifter.tail_calls = bool(cfg["lift"].get("tail_calls", True))
+    lifter.tail_calls = bool(cfg["lift"].get("tail_calls", True)) and not getattr(args, "no_tail_calls", False)
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
     lifter.reloc_vas = {(base + e.rva) & 0xFFFFFFFF
                         for br in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", [])
@@ -529,6 +529,8 @@ def main():
             p.add_argument("--bytes-per-file", type=lambda v: int(v, 0),
                            help="janela de endereços por arquivo .c (0 = dividir por contagem)")
             p.add_argument("--prefix", default="re5")
+            p.add_argument("--no-tail-calls", action="store_true",
+                           help="força lift.tail_calls = false (A/B; use com --out para não sobrescrever)")
     args = ap.parse_args()
     cfg = rc.load_config()
     return {"catalog": cmd_catalog, "lift": cmd_lift}[args.cmd](args, cfg) or 0
