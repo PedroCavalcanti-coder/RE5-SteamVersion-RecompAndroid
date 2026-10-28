@@ -31,6 +31,7 @@
 #include "re5/coldebug.h"
 #include "re5/lan_menu.h"
 #include "re5/d3d9_bridge.h"
+#include "re5/stats.h"
 #include "re5/user32.h"
 #include "kernel32_internal.h"
 #include "dxt_decode.h"
@@ -547,13 +548,14 @@ static void d_CreateDevice(CPU *c)
     re5_d3d9_pp_to_guest(&pp, ppva);
     RE5_INFO("d3d9",
              "CreateDevice(adaptador %u, tipo %u, foco 0x%X, flags 0x%X): %ux%u formato %u, %u back buffer(s), "
-             "%s, swap %u, MSAA %u, profundidade %s/%u, intervalo 0x%X -> 0x%08X",
+             "%s, swap %u, MSAA %u, profundidade %s/%u, intervalo 0x%X (%s; modo real: DXVK_LOG_LEVEL=info) -> 0x%08X",
              adapter, type, focus, flags, pp.BackBufferWidth, pp.BackBufferHeight, (unsigned)pp.BackBufferFormat,
              pp.BackBufferCount,
              rd32(ppva + 32) ? "janela" : force_windowed() ? "tela cheia (no host: janela)" : "tela cheia",
              (unsigned)pp.SwapEffect,
              (unsigned)pp.MultiSampleType, pp.EnableAutoDepthStencil ? "sim" : "não",
-             (unsigned)pp.AutoDepthStencilFormat, pp.PresentationInterval, (uint32_t)hr);
+             (unsigned)pp.AutoDepthStencilFormat, pp.PresentationInterval,
+             pp.PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE ? "sem vsync" : "vsync", (uint32_t)hr);
     d9_out(out, SUCCEEDED(hr), dev, D9K_DEVICE);
     uint32_t target_hwnd = rd32(ppva + PP_HWND) ? rd32(ppva + PP_HWND) : focus;
     if (SUCCEEDED(hr) && force_windowed() && target_hwnd) {
@@ -704,9 +706,10 @@ static void d_Reset(CPU *c)
     if (SUCCEEDED(hr) && force_windowed() && target_hwnd) {
         re5_user32_set_fullscreen(target_hwnd, !rd32(ppva + 32), pp.BackBufferWidth, pp.BackBufferHeight);
     }
-    RE5_INFO("d3d9", "Reset: %ux%u formato %u, %s -> 0x%08X", pp.BackBufferWidth, pp.BackBufferHeight,
-             (unsigned)pp.BackBufferFormat,
+    RE5_INFO("d3d9", "Reset: %ux%u formato %u, %s, intervalo 0x%X (%s) -> 0x%08X", pp.BackBufferWidth,
+             pp.BackBufferHeight, (unsigned)pp.BackBufferFormat,
              rd32(ppva + 32) ? "janela" : force_windowed() ? "tela cheia (no host: janela)" : "tela cheia",
+             pp.PresentationInterval, pp.PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE ? "sem vsync" : "vsync",
              (uint32_t)hr);
     c->eax = (uint32_t)hr;
 }
@@ -717,12 +720,27 @@ static void fps_log(void)
 {
     static int on = -1;
     static uint32_t t0, n0;
-    if (on < 0) on = getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") != '0';
+    static uint64_t th0, d30, dr0, hp0, lw0, dp0;
+    if (on < 0) {
+        on = getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") != '0';
+        re5_stats_on = on;
+    }
     if (!on) return;
     uint32_t now = SDL_GetTicks();
     if (!t0) { t0 = now; n0 = g_presents; return; }
     if (now - t0 >= 1000u) {
-        RE5_INFO("d3d9", "fps %.1f (Present %u)", (double)(g_presents - n0) * 1000.0 / (double)(now - t0), g_presents);
+        double dt = (double)(now - t0);
+        uint64_t th = re5_stat_thunks, d3 = re5_stat_d3d9, dr = re5_stat_draws, hp = re5_stat_heap,
+                 lw = re5_stat_lockwait_ns, dp = re5_stat_dispatches();
+        /* Por segundo: thunks do HLE (e, deles, D3D9 e Draw*), Heap*, dispatches
+         * (call/jmp indiretos), e a espera no lock em ms somados das threads. */
+        RE5_INFO("d3d9", "fps %.1f (Present %u) thunks %llu d3d9 %llu draws %llu heap %llu dispatch %llu lock_ms %.1f",
+                 (double)(g_presents - n0) * 1000.0 / dt, g_presents,
+                 (unsigned long long)((th - th0) * 1000.0 / dt), (unsigned long long)((d3 - d30) * 1000.0 / dt),
+                 (unsigned long long)((dr - dr0) * 1000.0 / dt), (unsigned long long)((hp - hp0) * 1000.0 / dt),
+                 (unsigned long long)(dp > dp0 ? (dp - dp0) * 1000.0 / dt : 0),
+                 (double)(lw - lw0) / 1e6 * 1000.0 / dt);
+        th0 = th; d30 = d3; dr0 = dr; hp0 = hp; lw0 = lw; dp0 = dp;
         t0 = now;
         n0 = g_presents;
     }

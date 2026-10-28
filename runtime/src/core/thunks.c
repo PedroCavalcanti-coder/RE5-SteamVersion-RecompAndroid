@@ -6,6 +6,7 @@
 
 #include "re5/guest_memory.h"
 #include "re5/log.h"
+#include "re5/stats.h"
 #include "re5/thunks.h"
 #include "re5/thread.h"
 #include "host_sync.h"
@@ -78,6 +79,14 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
     if (th) th->thunk = t->name;
     RE5_TRACE("thunk", "-> %s", t->name);
     /* RE5_GUEST_LOCK=hle: o código do guest roda solto; o lock protege só o HLE. */
+    if (re5_stats_on) {
+        RE5_STAT_ADD(re5_stat_thunks, 1);
+        if (!strncmp(t->name, "IDirect3D", 9)) {
+            RE5_STAT_ADD(re5_stat_d3d9, 1);
+            const char *m = strstr(t->name, "::");
+            if (m && !strncmp(m + 2, "Draw", 4)) RE5_STAT_ADD(re5_stat_draws, 1);
+        }
+    }
     int lk = re5_guest_lock_mode_hle() && !(t->flags & RE5_THUNK_NOLOCK);
     if (lk) re5_guest_lock();
     t->fn(c);

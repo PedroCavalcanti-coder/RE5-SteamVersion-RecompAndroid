@@ -163,6 +163,28 @@ class LifterGaps(unittest.TestCase):
         self.assertIn("op_shl(c, ", c4)
         self.assertIn("c->zf = R_zf;", [l for l in c4.splitlines() if "return" in l][0])
 
+    def test_cache_flags_off_keeps_flags_in_struct(self):
+        # lift.cache_flags = false (A/B da fase 0.2): GPR/XMM seguem em locais, cf..of na CPU.
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        lifter = Lifter.__new__(Lifter)
+        lifter.md = md
+        lifter.reloc_vas = set()
+        lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+        lifter.read_va = None
+        lifter.flags_dead_ret_below = 0x00000800
+        code = bytes.fromhex("85c0" "0fa30424" "d3e0" "c3")     # test; bt [esp],eax; shl eax,cl; ret
+        lifter.cache_flags = True
+        on = lifter.lift_function(code, 0x1000)
+        lifter.cache_flags = False
+        off = lifter.lift_function(code, 0x1000)
+        self.assertIn("R_zf = c->zf", on)
+        self.assertNotIn("R_zf = c->zf", off)
+        self.assertNotIn("c->cf = R_cf;", off)
+        self.assertNotIn("c->zf = R_zf;", off)
+        self.assertIn("uint32_t R_eax = c->eax", off)             # registradores seguem em locais
+        self.assertIn("c->eax = R_eax;", off)
+
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
         # (0x00E64680, std; repne scasb) devolvia NULL e o 0x0072BC80 registrava toda

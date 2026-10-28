@@ -9,6 +9,7 @@
 #include "re5/guest_memory.h"
 #include "re5/log.h"
 #include "re5/runtime.h"
+#include "re5/stats.h"
 #include "re5/thread.h"
 #include "re5/thunks.h"
 #include "host_sync.h"
@@ -32,6 +33,19 @@ static RE5_THREAD_LOCAL re5_thread *t_self;
 /* Threads do guest vivas, para o watchdog. */
 #define MAX_THREADS 256
 static re5_thread *g_threads[MAX_THREADS];
+
+int re5_stats_on;
+uint64_t re5_stat_thunks, re5_stat_d3d9, re5_stat_draws, re5_stat_heap, re5_stat_lockwait_ns;
+
+uint64_t re5_stat_dispatches(void)
+{
+    uint64_t n = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        re5_thread *t = g_threads[i];
+        if (t && t->trail_pos) n += *t->trail_pos;
+    }
+    return n;
+}
 
 static void ensure_init(void)
 {
@@ -315,6 +329,7 @@ void re5_guest_lock(void)
         return;
     }
     int hle = re5_guest_lock_mode_hle();
+    uint64_t wait0 = re5_stats_on ? now_ns() : 0;
     if (t) t->lock_wait = 1;
     for (;;) {
         if (t) wait_resumed(t);
@@ -327,6 +342,7 @@ void re5_guest_lock(void)
         else give_turn();
     }
     if (t) t->lock_wait = 0;
+    if (wait0) RE5_STAT_ADD(re5_stat_lockwait_ns, now_ns() - wait0);
     *depth = 1;
     g_holder = t;
 }

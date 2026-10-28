@@ -587,9 +587,11 @@ def _insert_around(text, names, before, after):
         i = stmt_end
 
 
-def cache_registers(items, succ):
+def cache_registers(items, succ, cache_flags=True):
     """items: [(insn, [rewritable C lines])], succ from flag_liveness. Returns new items
-    and the declaration line for the top of the function."""
+    and the declaration line for the top of the function. cache_flags=False leaves cf..of
+    in the CPU struct (the generated file maps R_cf.. to c->cf..), for A/B measurement."""
+    regs = CACHED if cache_flags else CACHED[:16]
     n = len(items)
     texts = [[_rewrite(l) for l in lines] for _, lines in items]
     joined = [" ".join(t) for t in texts]
@@ -622,8 +624,8 @@ def cache_registers(items, succ):
     new_items = []
     for i, (ins, _) in enumerate(items):
         d = dirty_in[i] | writes[i]
-        stores = " ".join(_store(r) for r in CACHED if r in d)
-        loads_all = " ".join(_load(r) for r in CACHED)
+        stores = " ".join(_store(r) for r in regs if r in d)
+        loads_all = " ".join(_load(r) for r in regs)
         lines = []
         for line in texts[i]:
             if kinds[i] == "full":
@@ -636,8 +638,8 @@ def cache_registers(items, succ):
             elif kinds[i] == "flags" and _sync_kind(line) == "flags":
                 # The helper sits inside an expression (R_eax = op_rol(c, ...)), so the
                 # sync goes around the whole statement, not around the call.
-                st = " ".join(_store(r) for r in _FLAGS if r in d)
-                ld = " ".join(_load(r) for r in _FLAGS)
+                st = " ".join(_store(r) for r in _FLAGS if r in d and cache_flags)
+                ld = " ".join(_load(r) for r in _FLAGS if cache_flags)
                 line = (st + " " if st else "") + line + " " + ld
             if "return;" in line:
                 line = line.replace("return;", "{ " + stores + " return; }" if stores else "return;")
@@ -645,7 +647,8 @@ def cache_registers(items, succ):
         new_items.append((ins, lines))
     decl = ("uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[:8]) + "; "
             "XMM " + ", ".join(f"R_{r} = c->xmm[{r[1:]}]" for r in CACHED[8:16]) + "; "
-            "uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[16:]) + ";")
+            "uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[16:]) + ";") if cache_flags else         ("uint32_t " + ", ".join(f"R_{r} = c->{r}" for r in CACHED[:8]) + "; "
+         "XMM " + ", ".join(f"R_{r} = c->xmm[{r[1:]}]" for r in CACHED[8:16]) + ";")
     return new_items, decl
 
 
@@ -1861,7 +1864,8 @@ class Lifter:
         items = [(ins, [_apply_masks(l, mask) for l in lines]) for (ins, lines), mask in zip(items, masks)]
         cache = getattr(self, "cache_registers", True) and bool(items)
         if cache:
-            items, decl = cache_registers(items, flag_liveness.succ)
+            cache_flags = getattr(self, "cache_flags", True)
+            items, decl = cache_registers(items, flag_liveness.succ, cache_flags)
             out.append(f"    {decl}")
         for ins, lines in items:
             if ins.address in labels:
@@ -1896,7 +1900,7 @@ class Lifter:
             nxt = insns[-1].address + insns[-1].size if insns else end
             out.append(f"    /* extent ends mid-function: fall through */")
             if cache:
-                out.append("    " + " ".join(_store(r) for r in CACHED))
+                out.append("    " + " ".join(_store(r) for r in (CACHED if cache_flags else CACHED[:16])))
             out.append(f"    dispatch(c, 0x{nxt:08X}u); return;")
 
         out.append("}")
