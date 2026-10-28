@@ -38,7 +38,8 @@ target_include_directories(re5_cpu INTERFACE "${RE5_GEN_INCLUDE}" "${CMAKE_CURRE
 if(MSVC)
     target_compile_options(re5_cpu INTERFACE /utf-8)
 else()
-    target_compile_options(re5_cpu INTERFACE -fno-strict-aliasing -fwrapv -ffp-contract=off)
+    # -fno-math-errno: o guest não lê errno; sqrt vira sqrtsd sem o desvio para a libm.
+    target_compile_options(re5_cpu INTERFACE -fno-strict-aliasing -fwrapv -ffp-contract=off -fno-math-errno)
 endif()
 
 # Fase P4 (PLANO_MESTRE_OTIMIZACAO): PGO e -march, sem mudar a semântica de ponto flutuante
@@ -48,7 +49,15 @@ endif()
 # RE5_MARCH=x86-64-v2 (SSE4.2/POPCNT) só em host x86-64; v3 traz FMA, que o -ffp-contract=off não usa.
 set(RE5_PGO "off" CACHE STRING "PGO do runtime e do código gerado: off | gen | use")
 set(RE5_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Pasta dos perfis do PGO")
-set(RE5_MARCH "" CACHE STRING "-march= para o host x86-64 (vazio = padrão do compilador)")
+# Padrão x86-64-v2 (SSE4.1/4.2, POPCNT: todo PC desde ~2010): floor/ceil/trunc/nearbyint do fistp e do
+# frndint (o jogo converte float->int o tempo todo) viram um roundsd em vez de chamada à libm.
+# RE5_MARCH="" volta ao x86-64 base.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(RE5_MARCH_DEFAULT "x86-64-v2")
+else()
+    set(RE5_MARCH_DEFAULT "")
+endif()
+set(RE5_MARCH "${RE5_MARCH_DEFAULT}" CACHE STRING "-march= para o host x86-64 (vazio = padrão do compilador)")
 if(NOT MSVC)
     if(RE5_PGO STREQUAL "gen")
         target_compile_options(re5_cpu INTERFACE -fprofile-generate -fprofile-update=atomic -fprofile-dir=${RE5_PGO_DIR})
