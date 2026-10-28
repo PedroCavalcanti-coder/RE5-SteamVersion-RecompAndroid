@@ -238,6 +238,45 @@ class LifterGaps(unittest.TestCase):
         c3 = lifter.lift_function(code, 0x1000)
         self.assertIn("c->zf = R_zf", [l for l in c3.splitlines() if "dispatch(" in l][0])
 
+    def test_x87_cache(self):
+        # lift.x87_cache: num trecho reto a pilha x87 fica em locais; a chamada sincroniza.
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        lifter = Lifter.__new__(Lifter)
+        lifter.md = md
+        lifter.reloc_vas = set()
+        lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+        lifter.read_va = None
+        lifter.flags_dead_ret_below = 0x00E63000
+        lifter.x87_cache = True
+        # fld [esp+4]; fmul [esp+8]; fld st0; fxch st1; faddp st1; fstp [esp+12]; call 0x2000; fstp [esp+16]; ret
+        code = bytes.fromhex("d9442404" "d84c2408" "d9c0" "d9c9" "dec1" "d95c240c" "e8")
+        code += (0x2000 - (0x1000 + len(code) + 4)).to_bytes(4, "little", signed=True) + bytes.fromhex("d95c2410" "c3")
+        c = lifter.lift_function(code, 0x1000)
+        lines = {l.split("/* ")[1][:8]: l for l in c.splitlines() if "/* 0000" in l}
+        self.assertIn("int R_ftop = c->fpu_top;", c)
+        self.assertIn("X_p1 = (rdf32((R_esp + 0x00000004u)))", lines["00001000"])
+        self.assertIn("X_p1 = (X_p1) * rdf32(", lines["00001004"])
+        self.assertIn("X_p2 = (X_p1)", lines["00001008"])                       # fld st(0)
+        self.assertIn("X_p1 = (X_p1) + (X_p2)", lines["0000100C"])               # faddp st(1)
+        self.assertIn("wrf32((R_esp + 0x0000000Cu), X_p1)", lines["0000100E"])
+        for k in ("00001000", "00001004", "00001008", "0000100A", "0000100C", "0000100E"):
+            self.assertNotIn("fst(c", lines[k])
+            self.assertNotIn("c->st[", lines[k])
+        call = lines["00001012"]
+        self.assertLess(call.index("c->fpu_top = R_ftop;"), call.index("dispatch("))
+        self.assertGreater(call.rindex("R_ftop = c->fpu_top;"), call.index("dispatch("))
+        self.assertIn("X_m0 = c->st[(R_ftop - (0)) & 7]", lines["00001017"])     # st(0) devolvido pela chamada
+        self.assertIn("R_ftop = (R_ftop - (-1)) & 7; c->fpu_top = R_ftop;", lines["0000101B"])
+        # Rótulo no meio: o trecho termina antes dele (o valor vivo volta para c->st).
+        # fld [esp+4]; jz +2 (para o fstp); fld1; faddp; fstp [esp+8]; ret
+        code2 = bytes.fromhex("d9442404" "7404" "d9e8" "dec1" "d95c2408" "c3")
+        c2 = lifter.lift_function(code2, 0x1000)
+        jz = [l for l in c2.splitlines() if ": je " in l][0]
+        self.assertIn("c->st[(R_ftop - (1)) & 7] = X_p1; R_ftop = (R_ftop - (1)) & 7;", jz)
+        lifter.x87_cache = False
+        self.assertNotIn("R_ftop", lifter.lift_function(code, 0x1000))
+
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
         # (0x00E64680, std; repne scasb) devolvia NULL e o 0x0072BC80 registrava toda

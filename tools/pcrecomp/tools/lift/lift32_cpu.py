@@ -659,6 +659,157 @@ def cache_registers(items, succ, cache_flags=True, elide_flag_stores=False):
     return new_items, decl
 
 
+# ---- x87 stack in locals ----------------------------------------------------------
+#
+# The x87 register stack lives in the CPU struct (c->st[8], c->fpu_top) and every
+# fld/fstp/fmul... went through c->st[(c->fpu_top + i) & 7]: a dynamic index, so the
+# compiler kept every value in memory. 17% of the game's instructions are x87 (MSVC
+# returns float in st(0), so nearly every function has a fld/fstp pair), at 4-26 host
+# instructions each.
+#
+# Inside a straight run of code - no label, no jump, no call, no return - the stack
+# depth relative to the start of the run is known when lifting. There st(K) is a fixed
+# slot, position a = d - K (d = pushes minus pops since the run began), and the slot is
+# a C local (X_p1, X_m0...) that the compiler keeps in a register. At the end of the run
+# the live dirty slots go back to c->st[(R_ftop - a) & 7] and R_ftop (the top, in a local)
+# moves by d. Calls, returns and the instructions that read the stack through the CPU
+# (fninit, fnstsw/fnstenv, anything with c->st or c->fpu_top in its text) also store
+# c->fpu_top before and reload it after. Positions that existed before the run are loaded
+# from c->st on first touch; new ones are written by the push itself.
+
+_X87_TOK = re.compile(r"\bfpush\(c,\s*|\bfpop\(c\)\s*;?|\*fst\(c,\s*(\d+)\)")
+_X87_ANY = re.compile(r"\bfpush\(c\b|\bfpop\(c\)|\bfst\(c\b")
+_X87_RAW = re.compile(r"c->fpu_top|c->st\b|(?<!\*)\bfst\(c\b")
+_X87_COND = re.compile(r"\b(?:if|while|for)\s*\(|\?")
+_X87_ASSIGN = re.compile(r"\s*(?:=(?!=)|\+=|-=|\*=|/=)")
+
+
+def _x87_name(a):
+    return f"X_m{-a}" if a <= 0 else f"X_p{a}"
+
+
+class _X87Run:
+    """One straight run: depth d since it began, slots valid in locals, slots dirty."""
+
+    def __init__(self):
+        self.d = 0
+        self.valid = set()
+        self.dirty = set()
+
+    def copy(self):
+        r = _X87Run()
+        r.d, r.valid, r.dirty = self.d, set(self.valid), set(self.dirty)
+        return r
+
+    def empty(self):
+        return self.d == 0 and not self.dirty and not self.valid
+
+    def flush(self, store_top):
+        """Text that writes the run back to the CPU struct; the run starts over."""
+        parts = [f"c->st[(R_ftop - ({a})) & 7] = {_x87_name(a)};"
+                 for a in sorted(self.dirty) if self.d - 7 <= a <= self.d]
+        if self.d:
+            parts.append(f"R_ftop = (R_ftop - ({self.d})) & 7;")
+        if store_top:
+            parts.append("c->fpu_top = R_ftop;")
+        self.__init__()
+        return " ".join(parts)
+
+
+def _x87_rewrite(text, st, used, loads):
+    """Rewrite x87 accesses in `text` over the locals, updating `st`. Loads of slots that
+    existed before the run go to `loads` (they read memory the run has not written, so
+    they can go in front of the whole instruction). None when the text does not fit."""
+    out, i = [], 0
+    while True:
+        m = _X87_TOK.search(text, i)
+        if not m:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:m.start()])
+        tok = m.group(0)
+        if tok.startswith("fpush"):
+            parsed = _call_args(text, m.start() + len("fpush"))
+            if not parsed or len(parsed[0]) != 2:
+                return None
+            inner = _x87_rewrite(parsed[0][1], st, used, loads)
+            if inner is None:
+                return None
+            st.d += 1
+            if st.d > 8:
+                return None
+            st.valid.add(st.d)
+            st.dirty.add(st.d)
+            used.add(st.d)
+            out.append(f"{_x87_name(st.d)} = ({inner})")
+            i = parsed[1] + 1
+            continue
+        if tok.startswith("fpop"):
+            st.d -= 1
+            if st.d < -8:
+                return None
+            i = m.end()
+            continue
+        a = st.d - int(m.group(1))
+        if a not in st.valid:
+            if a > 0:
+                return None          # a slot this run never pushed: not modelled
+            loads.append(f"{_x87_name(a)} = c->st[(R_ftop - ({a})) & 7];")
+            st.valid.add(a)
+        used.add(a)
+        if _X87_ASSIGN.match(text, m.end()):
+            st.dirty.add(a)
+        out.append(_x87_name(a))
+        i = m.end()
+
+
+def x87_cache(items, labels):
+    """items: [(insn, [C lines])]. Returns (items, decl, tail) or None when the function has
+    no x87; tail is the sync to put before a fall-through dispatch at the end."""
+    if not any(_X87_ANY.search(" ".join(lines)) or _X87_RAW.search(" ".join(lines)) for _, lines in items):
+        return None
+    run = _X87Run()
+    used = set()
+    new = [[ins, list(lines)] for ins, lines in items]
+    for idx, (ins, lines) in enumerate(new):
+        if idx and ins.address in labels and not run.empty():
+            fl = run.flush(store_top=False)          # a jump can land here: the run ends
+            if fl:
+                new[idx - 1][1][-1] += " " + fl
+        text = " ".join(lines)
+        is_x87 = bool(_X87_ANY.search(text))
+        sync = (_sync_kind(text) == "full" or bool(_X87_RAW.search(text))
+                or (is_x87 and _X87_COND.search(text) and re.search(r"\bfpush\(|\bfpop\(", text)))
+        if not sync and is_x87:
+            st, loads, body = run.copy(), [], []
+            for line in lines:
+                r = _x87_rewrite(line, st, used, loads)
+                if r is None:
+                    body = None
+                    break
+                body.append(r)
+            if body is not None:
+                body[0] = (" ".join(loads) + " " if loads else "") + body[0]
+                new[idx][1] = body
+                run = st
+                continue
+            sync = True
+        if sync:
+            # Through the CPU struct, as before: everything stored, the top reloaded after.
+            fl = run.flush(store_top=True)
+            lines[0] = (fl + " " if fl else "") + lines[0]
+            lines[-1] += " R_ftop = c->fpu_top;"
+            continue
+        if "goto " in text or "return" in text:
+            fl = run.flush(store_top="return" in text)
+            if fl:
+                lines[0] = fl + " " + lines[0]
+    tail = run.flush(store_top=True)
+    names = sorted({_x87_name(a) for a in used})
+    decl = "int R_ftop = c->fpu_top;" + (" double " + ", ".join(names) + ";" if names else "")
+    return [(ins, lines) for ins, lines in new], decl, tail
+
+
 def writes_after_call(text):
     """Does the instruction write a register after its full-sync call (so it ends dirty)?"""
     m = None
@@ -1873,6 +2024,10 @@ class Lifter:
         below = getattr(self, "flags_dead_ret_below", None)
         masks = flag_liveness(items, labels, dead_at_ret=below is not None and start < below)
         items = [(ins, [_apply_masks(l, mask) for l in lines]) for (ins, lines), mask in zip(items, masks)]
+        x87 = x87_cache(items, labels) if getattr(self, "x87_cache", False) and items else None
+        if x87:
+            items, x87_decl, x87_tail = x87
+            out.append(f"    {x87_decl}")
         cache = getattr(self, "cache_registers", True) and bool(items)
         if cache:
             cache_flags = getattr(self, "cache_flags", True)
@@ -1911,6 +2066,8 @@ class Lifter:
             # it. Mario Kart lost a pointer to a memcpy that way.
             nxt = insns[-1].address + insns[-1].size if insns else end
             out.append(f"    /* extent ends mid-function: fall through */")
+            if x87 and x87_tail:
+                out.append(f"    {x87_tail}")
             if cache:
                 out.append("    " + " ".join(_store(r) for r in (CACHED if cache_flags else CACHED[:16])))
             out.append(f"    dispatch(c, 0x{nxt:08X}u); return;")
