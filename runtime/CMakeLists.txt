@@ -41,6 +41,30 @@ else()
     target_compile_options(re5_cpu INTERFACE -fno-strict-aliasing -fwrapv -ffp-contract=off)
 endif()
 
+# Fase P4 (PLANO_MESTRE_OTIMIZACAO): PGO e -march, sem mudar a semântica de ponto flutuante
+# (-ffp-contract=off acima vale para todos). Fluxo do PGO, com a chave por build:
+#   1. cmake -DRE5_PGO=gen ...      -> build, rodar scripts/bench_re5.py (grava .gcda em RE5_PGO_DIR)
+#   2. cmake -DRE5_PGO=use ...      -> rebuild (o perfil vale enquanto o código gerado não mudar)
+# RE5_MARCH=x86-64-v2 (SSE4.2/POPCNT) só em host x86-64; v3 traz FMA, que o -ffp-contract=off não usa.
+set(RE5_PGO "off" CACHE STRING "PGO do runtime e do código gerado: off | gen | use")
+set(RE5_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Pasta dos perfis do PGO")
+set(RE5_MARCH "" CACHE STRING "-march= para o host x86-64 (vazio = padrão do compilador)")
+if(NOT MSVC)
+    if(RE5_PGO STREQUAL "gen")
+        target_compile_options(re5_cpu INTERFACE -fprofile-generate -fprofile-update=atomic -fprofile-dir=${RE5_PGO_DIR})
+        target_link_options(re5_cpu INTERFACE -fprofile-generate)
+    elseif(RE5_PGO STREQUAL "use")
+        target_compile_options(re5_cpu INTERFACE -fprofile-use -fprofile-partial-training -fprofile-correction
+                               -fprofile-dir=${RE5_PGO_DIR} -Wno-missing-profile)
+        target_link_options(re5_cpu INTERFACE -fprofile-use)
+    elseif(NOT RE5_PGO STREQUAL "off")
+        message(FATAL_ERROR "RE5_PGO deve ser off, gen ou use (veio '${RE5_PGO}')")
+    endif()
+    if(RE5_MARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86")
+        target_compile_options(re5_cpu INTERFACE -march=${RE5_MARCH})
+    endif()
+endif()
+
 add_library(re5_runtime STATIC
     src/core/cpu_ext.c
     src/core/crash.c
