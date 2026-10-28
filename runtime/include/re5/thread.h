@@ -56,6 +56,8 @@ typedef struct re5_thread {
     const volatile uint32_t *trail_pos; /* contador de dispatches desta thread (dispatch.c) */
     const uint32_t      *trail;        /* últimos endereços despachados */
     void                *host;         /* Windows: HANDLE da thread do host (RE5_PROFILE) */
+    uint64_t             stats[8];     /* RE5_FPS_LOG: contadores desta thread (re5/stats.h, RE5_ST_*) */
+    uint32_t             stat_sample;  /* RE5_FPS_LOG: amostragem da contagem por thunk */
 } re5_thread;
 
 /* Cria o PEB (uma vez por processo). image_base vai para PEB.ImageBaseAddress. */

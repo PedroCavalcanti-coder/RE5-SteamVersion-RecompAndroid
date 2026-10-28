@@ -490,12 +490,12 @@ static void test_env(void)
     call("GetSystemInfo", 1, si);
     CHECK_EQ_U32(rd32(si + 4), 4096);
     CHECK_EQ_U32(rd32(si + 28), 0x10000);
-    /* Núcleos: 2 com o lock global; no hle, os do host menos um (1..8). Máscara e
-     * NUMBER_OF_PROCESSORS coerentes. */
+    /* Núcleos: 2 com o lock global; no hle, todos os processadores lógicos do host (1..32).
+     * Máscara e NUMBER_OF_PROCESSORS coerentes. */
     uint32_t ncpu = rd32(si + 20);
-    if (re5_guest_lock_mode_hle()) CHECK(ncpu >= 1 && ncpu <= 8);
+    if (re5_guest_lock_mode_hle()) CHECK(ncpu >= 1 && ncpu <= 32);
     else CHECK_EQ_U32(ncpu, 2);
-    CHECK_EQ_U32(rd32(si + 16), (1u << ncpu) - 1);
+    CHECK_EQ_U32(rd32(si + 16), ncpu >= 32 ? 0xFFFFFFFFu : (1u << ncpu) - 1);
     {
         char want[16];
         snprintf(want, sizeof want, "%u", ncpu);

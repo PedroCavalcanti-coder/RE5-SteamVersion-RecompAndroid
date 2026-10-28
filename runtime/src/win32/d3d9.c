@@ -730,8 +730,9 @@ static void fps_log(void)
     if (!t0) { t0 = now; n0 = g_presents; return; }
     if (now - t0 >= 1000u) {
         double dt = (double)(now - t0);
-        uint64_t th = re5_stat_thunks, d3 = re5_stat_d3d9, dr = re5_stat_draws, hp = re5_stat_heap,
-                 lw = re5_stat_lockwait_ns, dp = re5_stat_dispatches();
+        uint64_t th = re5_stat_total(RE5_ST_THUNKS), d3 = re5_stat_total(RE5_ST_D3D9),
+                 dr = re5_stat_total(RE5_ST_DRAWS), hp = re5_stat_total(RE5_ST_HEAP),
+                 lw = re5_stat_total(RE5_ST_LOCKWAIT_NS), dp = re5_stat_dispatches();
         /* Por segundo: thunks do HLE (e, deles, D3D9 e Draw*), Heap*, dispatches
          * (call/jmp indiretos), e a espera no lock em ms somados das threads. */
         RE5_INFO("d3d9", "fps %.1f (Present %u) thunks %llu d3d9 %llu draws %llu heap %llu dispatch %llu lock_ms %.1f",

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "re5/d3d9_bridge.h"
+#include "re5/fast_tls.h"
 #include "re5/guest_memory.h"
 #include "re5/log.h"
 #include "re5/runtime.h"
@@ -28,14 +29,47 @@ static re5_mutex g_hle_mu;   /* lock do HLE no modo RE5_GUEST_LOCK=hle: protege 
 static re5_cond g_hle_cv;
 static int g_hle_held, g_hle_waiting;
 static int g_ready;
-static RE5_THREAD_LOCAL re5_thread *t_self;
+RE5_TLS_PTR(re5_thread *, t_self)   /* re5/fast_tls.h: no MinGW, sem o __emutls_get_address */
+
+#if defined(_WIN32) && defined(__GNUC__) && defined(__x86_64__)
+uint32_t re5_tls_alloc_slow(volatile uint32_t *slot)
+{
+    DWORD i = TlsAlloc();
+    if (i == TLS_OUT_OF_INDEXES) re5_fatal("thread", "TlsAlloc falhou: sem slot de TLS do Windows");
+    uint32_t want = (uint32_t)i + 1u;
+    uint32_t prev = (uint32_t)InterlockedCompareExchange((volatile LONG *)slot, (LONG)want, 0);
+    if (prev) {   /* outra thread alocou primeiro */
+        TlsFree(i);
+        return prev;
+    }
+    return want;
+}
+#endif
 
 /* Threads do guest vivas, para o watchdog. */
 #define MAX_THREADS 256
 static re5_thread *g_threads[MAX_THREADS];
 
 int re5_stats_on;
-uint64_t re5_stat_thunks, re5_stat_d3d9, re5_stat_draws, re5_stat_heap, re5_stat_lockwait_ns;
+static uint64_t g_stat_host[RE5_ST_N];      /* threads do host sem re5_thread (atômico) */
+static uint64_t g_stat_retired[RE5_ST_N];   /* threads do guest que já saíram (sob g_tid_mu) */
+
+void re5_stat_add_thread(int which, uint64_t n)
+{
+    re5_thread *t = t_self_get();
+    if (t) t->stats[which] += n;
+    else __atomic_fetch_add(&g_stat_host[which], n, __ATOMIC_RELAXED);
+}
+
+uint64_t re5_stat_total(int which)
+{
+    uint64_t n = __atomic_load_n(&g_stat_host[which], __ATOMIC_RELAXED) + g_stat_retired[which];
+    for (int i = 0; i < MAX_THREADS; i++) {
+        re5_thread *t = g_threads[i];
+        if (t) n += t->stats[which];   /* leitura sem trava: ordem de grandeza */
+    }
+    return n;
+}
 
 uint64_t re5_stat_dispatches(void)
 {
@@ -93,7 +127,7 @@ uint32_t re5_guest_mxcsr_default(void)
 re5_thread *re5_thread_attach(uint32_t stack_bytes)
 {
     ensure_init();
-    if (t_self) return t_self;
+    if (t_self_get()) return t_self_get();
     re5_thread *t = calloc(1, sizeof *t);
     if (!t) return NULL;
     t->stack_lo = re5_mem_alloc(stack_bytes, RE5_PAGE_READWRITE, "pilha");
@@ -140,18 +174,19 @@ re5_thread *re5_thread_attach(uint32_t stack_bytes)
         }
     }
     re5_mutex_unlock(&g_tid_mu);
-    t_self = t;
+    t_self_set(t);
     RE5_DEBUG("thread", "tid 0x%X: pilha 0x%08X-0x%08X, teb 0x%08X", t->tid, t->stack_lo, t->stack_hi, t->teb);
     return t;
 }
 
 void re5_thread_detach(void)
 {
-    re5_thread *t = t_self;
+    re5_thread *t = t_self_get();
     if (!t) return;
     re5_mutex_lock(&g_tid_mu);
     for (int i = 0; i < MAX_THREADS; i++)
         if (g_threads[i] == t) g_threads[i] = NULL;
+    for (int w = 0; w < RE5_ST_N; w++) g_stat_retired[w] += t->stats[w];
     re5_mutex_unlock(&g_tid_mu);
 #if defined(RE5_HOST_WINDOWS)
     if (t->host) CloseHandle((HANDLE)t->host);
@@ -159,10 +194,10 @@ void re5_thread_detach(void)
     re5_mem_free(t->stack_lo);
     re5_mem_free(t->teb);
     free(t);
-    t_self = NULL;
+    t_self_set(NULL);
 }
 
-re5_thread *re5_thread_current(void) { return t_self; }
+re5_thread *re5_thread_current(void) { return t_self_get(); }
 
 uint32_t re5_guest_call(re5_thread *t, uint32_t va, int argc, const uint32_t *argv)
 {
@@ -172,7 +207,7 @@ uint32_t re5_guest_call(re5_thread *t, uint32_t va, int argc, const uint32_t *ar
     push32(c, RE5_RETURN_TO_HOST);
     /* RE5_GUEST_LOCK=hle: código do guest chamado de dentro de um handler (WndProc,
      * IStream, início de thread...) roda sem o lock, como qualquer outro. */
-    int depth = re5_guest_lock_mode_hle() && t == t_self ? re5_guest_lock_release_all() : 0;
+    int depth = re5_guest_lock_mode_hle() && t == t_self_get() ? re5_guest_lock_release_all() : 0;
     dispatch(c, va);
     if (depth) re5_guest_lock_reacquire(depth);
     c->esp = saved_esp;
@@ -181,10 +216,10 @@ uint32_t re5_guest_call(re5_thread *t, uint32_t va, int argc, const uint32_t *ar
 
 void re5_set_last_error(uint32_t err)
 {
-    if (t_self) w32(t_self->teb + RE5_TEB_LAST_ERROR, err);
+    if (t_self_get()) w32(t_self_get()->teb + RE5_TEB_LAST_ERROR, err);
 }
 
-uint32_t re5_get_last_error(void) { return t_self ? r32(t_self->teb + RE5_TEB_LAST_ERROR) : 0; }
+uint32_t re5_get_last_error(void) { return t_self_get() ? r32(t_self_get()->teb + RE5_TEB_LAST_ERROR) : 0; }
 
 /* ---- lock do guest ---- */
 
@@ -204,9 +239,10 @@ static void wait_resumed(re5_thread *t)
 static uint64_t g_next_ticket, g_serving;
 static volatile int g_waiting;          /* threads na fila, sem a vez */
 static volatile uint64_t g_turn_ns;     /* quando a dona atual pegou a vez */
-static RE5_THREAD_LOCAL int t_anon_depth;   /* threads do host sem re5_thread */
+RE5_TLS_PTR(int *, t_anon_depth)   /* threads do host sem re5_thread */
 static re5_thread *volatile g_holder;   /* quem tem o lock agora (RE5_PROFILE: quem faz os outros esperarem) */
-static RE5_THREAD_LOCAL void (*t_pump)(void);   /* re5_thread_set_lock_wait_pump */
+typedef void (*pump_fn)(void);
+RE5_TLS_PTR(pump_fn, t_pump)   /* re5_thread_set_lock_wait_pump */
 
 #define QUANTUM_NS 2000000ull   /* 2 ms de código do guest antes de dar a vez a quem espera */
 
@@ -247,11 +283,11 @@ static void hle_take(void)
     if (g_hle_held) {
         g_hle_waiting++;
         while (g_hle_held) {
-            if (!t_pump) {
+            if (!t_pump_get()) {
                 re5_cond_wait_ms(&g_hle_cv, &g_hle_mu, 0xFFFFFFFFu);
             } else if (re5_cond_wait_ms(&g_hle_cv, &g_hle_mu, 10) && g_hle_held) {
                 re5_mutex_unlock(&g_hle_mu);   /* o bombeamento roda sem o mutex */
-                t_pump();
+                t_pump_get()();
                 re5_mutex_lock(&g_hle_mu);
             }
         }
@@ -288,7 +324,20 @@ static uint64_t now_ns(void)
 }
 #endif
 
-static int *depth_of(re5_thread *t) { return t ? &t->lock_depth : &t_anon_depth; }
+static RE5_NOINLINE int *anon_depth_new(void)
+{
+    int *p = calloc(1, sizeof *p);
+    if (!p) re5_fatal("thread", "sem memória");
+    t_anon_depth_set(p);
+    return p;
+}
+
+static int *depth_of(re5_thread *t)
+{
+    if (t) return &t->lock_depth;
+    int *p = t_anon_depth_get();
+    return p ? p : anon_depth_new();
+}
 
 static void take_turn(void)
 {
@@ -296,14 +345,14 @@ static void take_turn(void)
     uint64_t my = g_next_ticket++;
     g_waiting++;
     while (g_serving != my) {
-        if (!t_pump) {
+        if (!t_pump_get()) {
             re5_cond_wait_ms(&g_lk_cv, &g_lk, 0xFFFFFFFFu);
             continue;
         }
         re5_cond_wait_ms(&g_lk_cv, &g_lk, 10);
         if (g_serving == my) break;
         re5_mutex_unlock(&g_lk);   /* a fila não espera o bombeamento */
-        t_pump();
+        t_pump_get()();
         re5_mutex_lock(&g_lk);
     }
     g_waiting--;
@@ -322,7 +371,7 @@ static void give_turn(void)
 void re5_guest_lock(void)
 {
     ensure_init();
-    re5_thread *t = t_self;
+    re5_thread *t = t_self_get();
     int *depth = depth_of(t);
     if (*depth > 0) {   /* reentrante: guest -> host -> guest */
         (*depth)++;
@@ -342,7 +391,7 @@ void re5_guest_lock(void)
         else give_turn();
     }
     if (t) t->lock_wait = 0;
-    if (wait0) RE5_STAT_ADD(re5_stat_lockwait_ns, now_ns() - wait0);
+    if (wait0) RE5_STAT_ADD(RE5_ST_LOCKWAIT_NS, now_ns() - wait0);
     *depth = 1;
     g_holder = t;
 }
@@ -467,16 +516,16 @@ void re5_log_process_cpu(void)
 void re5_log_process_cpu(void) {}
 #endif
 
-void re5_thread_set_lock_wait_pump(void (*fn)(void)) { t_pump = fn; }
-int re5_thread_has_pump(void) { return t_pump != NULL; }
+void re5_thread_set_lock_wait_pump(void (*fn)(void)) { t_pump_set(fn); }
+int re5_thread_has_pump(void) { return t_pump_get() != NULL; }
 void re5_thread_pump(void)
 {
-    if (t_pump) t_pump();
+    if (t_pump_get()) t_pump_get()();
 }
 
 void re5_guest_preempt(void)
 {
-    re5_thread *t = t_self;
+    re5_thread *t = t_self_get();
     if (g_mode == 1) {   /* hle: nada a ceder; só o ponto de suspensão do código do guest */
         if (t && t->suspend > 0 && t->lock_depth == 0) wait_resumed(t);
         return;
@@ -493,7 +542,7 @@ uint32_t re5_thread_suspend(re5_thread *t)
     re5_mutex_lock(&g_susp_mu);
     uint32_t prev = (uint32_t)t->suspend++;
     re5_mutex_unlock(&g_susp_mu);
-    if (t == t_self) {   /* a própria thread: para já, sem o lock */
+    if (t == t_self_get()) {   /* a própria thread: para já, sem o lock */
         int depth = re5_guest_lock_release_all();
         wait_resumed(t);
         re5_guest_lock_reacquire(depth);
@@ -513,7 +562,7 @@ uint32_t re5_thread_resume(re5_thread *t)
 
 void re5_guest_unlock(void)
 {
-    int *depth = depth_of(t_self);
+    int *depth = depth_of(t_self_get());
     if (*depth <= 0) re5_fatal("thread", "re5_guest_unlock sem o lock do guest");
     if (--*depth == 0) {
         g_holder = NULL;
@@ -524,7 +573,7 @@ void re5_guest_unlock(void)
 
 int re5_guest_lock_release_all(void)
 {
-    int depth = t_self ? t_self->lock_depth : 0;
+    int depth = t_self_get() ? t_self_get()->lock_depth : 0;
     for (int i = 0; i < depth; i++) re5_guest_unlock();
     return depth;
 }

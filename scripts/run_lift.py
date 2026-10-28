@@ -376,7 +376,9 @@ def cmd_lift(args, cfg):
     failures = []
     lifted = []
     # re5_cov: um byte por endereço de código; a função gerada marca o seu na entrada
-    # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1). Custo: um store por chamada.
+    # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1). Só grava quando o byte ainda é 0:
+    # o store incondicional fazia as 8 threads do jogo disputarem as mesmas linhas de cache
+    # a cada chamada de função (falso compartilhamento); a leitura deixa a linha compartilhada.
     header = ["/* GERADO por scripts/run_lift.py (pcrecomp lift32_cpu) - não edite. */",
               "#define RE5_CACHED_REGS 1"] + (
         [] if lifter.cache_flags else
@@ -384,7 +386,8 @@ def cmd_lift(args, cfg):
         ["#define R_%s c->%s" % (f, f) for f in ("cf", "pf", "af", "zf", "sf", "of")]) + [
               '#include "cpu.h"',
               "extern unsigned char re5_cov[];",
-              "#define RE5_COV(va) (re5_cov[(va) - 0x401000u] = 1)", ""]
+              "#define RE5_COV(va) do { unsigned char *_cv = &re5_cov[(va) - 0x401000u]; "
+              "if (__builtin_expect(!*_cv, 0)) *_cv = 1; } while (0)", ""]
 
     # Cache por arquivo: o C de uma função só depende dos bytes dela, do VA, do
     # tamanho e do lifter. Se nada disso mudou numa janela e o arquivo existe,

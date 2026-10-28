@@ -275,7 +275,7 @@ static void k_HeapDestroy(CPU *c)
 static void k_HeapAlloc(CPU *c)
 {
     uint32_t idx, heap = re5_arg(c, 0), flags = re5_arg(c, 1), size = re5_arg(c, 2);
-    RE5_STAT_ADD(re5_stat_heap, 1);
+    RE5_STAT_ADD(RE5_ST_HEAP, 1);
     hlock();
     if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapAlloc: heap inválido 0x%08X", heap);
     c->eax = heap_alloc_idx(idx, flags, size);
@@ -285,7 +285,7 @@ static void k_HeapAlloc(CPU *c)
 
 static void k_HeapFree(CPU *c)
 {
-    RE5_STAT_ADD(re5_stat_heap, 1);
+    RE5_STAT_ADD(RE5_ST_HEAP, 1);
     c->eax = (uint32_t)k32_heap_free(re5_arg(c, 0), re5_arg(c, 2));
 }
 
@@ -302,7 +302,7 @@ static void k_HeapSize(CPU *c)
 static void k_HeapReAlloc(CPU *c)
 {
     uint32_t idx, heap = re5_arg(c, 0), flags = re5_arg(c, 1), ptr = re5_arg(c, 2), size = re5_arg(c, 3);
-    RE5_STAT_ADD(re5_stat_heap, 1);
+    RE5_STAT_ADD(RE5_ST_HEAP, 1);
     hlock();
     if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapReAlloc: heap inválido 0x%08X", heap);
     check_block(idx, ptr, "HeapReAlloc");
