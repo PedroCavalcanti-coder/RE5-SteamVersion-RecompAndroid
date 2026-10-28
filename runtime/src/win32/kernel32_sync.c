@@ -684,8 +684,23 @@ static void k_GetExitCodeThread(CPU *c)
     c->eax = 1;
 }
 
-/* Com o lock global do guest, prioridade e afinidade não mudam nada. */
-static void k_SetThreadPriority(CPU *c) { c->eax = get_waitable(re5_arg(c, 0), RE5_H_THREAD) || re5_arg(c, 0) == RE5_PSEUDO_THREAD; }
+/* Prioridade só vale no host com RE5_THREAD_PRIO=1 (re5_thread_apply_priority); afinidade nunca. */
+static void k_SetThreadPriority(CPU *c)
+{
+    uint32_t h = re5_arg(c, 0);
+    waitable *w = get_waitable(h, RE5_H_THREAD);
+    uint32_t tid = 0;
+    if (w) {
+        re5_mutex_lock(&g_mu);
+        tid = w->tid;
+        re5_mutex_unlock(&g_mu);
+    } else if (h == RE5_PSEUDO_THREAD) {
+        re5_thread *t = re5_thread_current();
+        tid = t ? t->tid : 0;
+    }
+    if (tid) re5_thread_apply_priority(tid, (int)re5_arg(c, 1));
+    c->eax = w || h == RE5_PSEUDO_THREAD;
+}
 static void k_SetThreadIdealProcessor(CPU *c) { c->eax = 0; }
 
 /* ---- APCs de usuário: só as que a própria thread enfileira (ReadFileEx) ---- */

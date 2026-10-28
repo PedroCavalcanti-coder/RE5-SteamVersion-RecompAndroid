@@ -129,7 +129,7 @@ re5_thread *re5_thread_attach(uint32_t stack_bytes)
 #if defined(RE5_HOST_WINDOWS)
     HANDLE h = NULL;
     if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
-                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, FALSE, 0))
         t->host = h;
 #endif
     re5_mutex_lock(&g_tid_mu);
@@ -345,6 +345,32 @@ void re5_guest_lock(void)
     if (wait0) RE5_STAT_ADD(re5_stat_lockwait_ns, now_ns() - wait0);
     *depth = 1;
     g_holder = t;
+}
+
+/* RE5_THREAD_PRIO=1 (fase P7): SetThreadPriority do guest vale na thread do host, para a de
+ * render/principal passar à frente dos workers. Só Windows; nos outros hosts não faz nada. */
+void re5_thread_apply_priority(uint32_t tid, int prio)
+{
+#if defined(RE5_HOST_WINDOWS)
+    static int on = -1;
+    if (on < 0) on = getenv("RE5_THREAD_PRIO") && *getenv("RE5_THREAD_PRIO") && *getenv("RE5_THREAD_PRIO") != '0';
+    if (!on) return;
+    if (prio < THREAD_PRIORITY_LOWEST && prio != THREAD_PRIORITY_IDLE) prio = THREAD_PRIORITY_LOWEST;
+    if (prio > THREAD_PRIORITY_HIGHEST && prio != THREAD_PRIORITY_TIME_CRITICAL) prio = THREAD_PRIORITY_HIGHEST;
+    if (prio == THREAD_PRIORITY_TIME_CRITICAL) prio = THREAD_PRIORITY_HIGHEST;   /* nunca pior que a UI do host */
+    re5_mutex_lock(&g_tid_mu);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        re5_thread *t = g_threads[i];
+        if (t && t->tid == tid && t->host) {
+            SetThreadPriority((HANDLE)t->host, prio);
+            break;
+        }
+    }
+    re5_mutex_unlock(&g_tid_mu);
+#else
+    (void)tid;
+    (void)prio;
+#endif
 }
 
 void re5_thread_set_lock_wait_pump(void (*fn)(void)) { t_pump = fn; }
