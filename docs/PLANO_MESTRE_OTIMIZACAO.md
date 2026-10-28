@@ -259,9 +259,13 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
 - **Passos:**
   1. Auditar o estado próprio da ponte (tabela de handles, buffers-sombra, contadores de
      `Present`, captura, coldebug, menu LAN) e protegê-lo com locks finos onde preciso.
-  2. Marcar os métodos D3D9 como `RE5_THUNK_NOLOCK` sob a chave `RE5_D3D9_NOLOCK`.
-  3. Heap do HLE com mutex próprio por heap (ou por faixa), também `NOLOCK`, sob a chave
-     `RE5_HEAP_NOLOCK`.
+  2. ~~Marcar os métodos D3D9 como `RE5_THUNK_NOLOCK` sob a chave `RE5_D3D9_NOLOCK`.~~
+     **Adiado (28/10):** a ponte tem estado compartilhado (hash de objetos, travas, sombras);
+     um mutex próprio pode travar contra o lock do HLE quando um callback do guest chama o
+     D3D9. Só entra com o perfil mostrando o D3D9 esperando o lock.
+  3. **Feito (sem medida):** heap do HLE com mutex próprio (`g_hmu`), `HeapAlloc/Free/ReAlloc/Size`
+     sem o lock do HLE sob a chave `RE5_HEAP_NOLOCK=1` (padrão desligado até o A/B);
+     teste `heap_mt`.
   4. Comparar, só para registro, a DXVK com o `d3d9.dll` do próprio Windows
      (`RE5_D3D9_DLL`): no PC de referência o driver nativo pode ganhar ou perder.
 - **Testes:** `test_d3d9` e `kernel32` com várias threads (estresse: criar/destruir texturas

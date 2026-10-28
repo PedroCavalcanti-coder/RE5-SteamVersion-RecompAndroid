@@ -42,6 +42,11 @@ typedef struct {
 /* Handler que não precisa do lock do HLE (RE5_GUEST_LOCK=hle): só mexe no que
  * é da própria thread (TEB, CPU) ou usa atômicos do host. */
 #define RE5_THUNK_NOLOCK 0x1u
+/* Sem o lock do HLE só quando a chave liga (RE5_HEAP_NOLOCK=1, fase P1 do
+ * PLANO_MESTRE_OTIMIZACAO): o handler tem mutex próprio. Os métodos D3D9 ficam de fora:
+ * a ponte tem estado compartilhado (hash de objetos, travas, sombras) e um mutex dela
+ * poderia travar contra o lock do HLE quando um callback do guest chama o D3D9. */
+#define RE5_THUNK_NOLOCK_HEAP 0x2u
 
 int  re5_thunks_init(void);
 uint32_t re5_thunk_new(const char *name, re5_host_fn fn, uint32_t arg_bytes, void *user);

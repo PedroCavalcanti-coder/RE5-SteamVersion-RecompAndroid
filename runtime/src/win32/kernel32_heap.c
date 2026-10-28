@@ -8,14 +8,15 @@
  * de classes de tamanho dentro de arenas de 32 MiB; grandes (>= 256 KiB) ganham
  * uma região própria (re5_mem_alloc) e voltam ao sistema no HeapFree.
  *
- * Sem mutex: todo código do guest - e os handlers chamados por ele - roda sob o
- * lock global do guest (decisão D5). Liberar duas vezes ou passar um ponteiro
+ * Um mutex do host (g_hmu) protege os heaps: os handlers de Heap* podem rodar sem o
+ * lock do HLE (RE5_HEAP_NOLOCK=1, RE5_THUNK_NOLOCK_HEAP; PLANO_MESTRE, fase P1). Liberar duas vezes ou passar um ponteiro
  * que não é de heap aborta com o endereço (falhar alto, D8).
  */
 #include <stdlib.h>
 
 #include "kernel32_internal.h"
 #include "re5/stats.h"
+#include "../core/host_sync.h"
 
 #define HEAP_NO_SERIALIZE          0x01u
 #define HEAP_ZERO_MEMORY           0x08u
@@ -84,6 +85,12 @@ typedef struct {
 static heap_t g_heaps[MAX_HEAPS];
 static uint32_t g_process_heap;
 
+/* Criado por heap_create (HeapCreate/GetProcessHeap rodam sob o lock do HLE e vêm antes
+ * de qualquer HeapAlloc com um handle válido). */
+static re5_mutex g_hmu;
+static void hlock(void) { if (g_hmu.ready) re5_mutex_lock(&g_hmu); }
+static void hunlock(void) { if (g_hmu.ready) re5_mutex_unlock(&g_hmu); }
+
 static heap_t *heap_from_handle(uint32_t h, uint32_t *idx)
 {
     for (uint32_t i = 0; i < MAX_HEAPS; i++) {
@@ -95,9 +102,20 @@ static heap_t *heap_from_handle(uint32_t h, uint32_t *idx)
     return NULL;
 }
 
+static uint32_t heap_create_locked(uint32_t flags);
+
 static uint32_t heap_create(uint32_t flags)
 {
+    if (!g_hmu.ready) re5_mutex_init(&g_hmu);
     init_classes();
+    hlock();
+    uint32_t r = heap_create_locked(flags);
+    hunlock();
+    return r;
+}
+
+static uint32_t heap_create_locked(uint32_t flags)
+{
     for (uint32_t i = 0; i < MAX_HEAPS; i++) {
         if (g_heaps[i].handle) continue;
         uint32_t page = re5_mem_alloc(RE5_MEM_PAGE, RE5_PAGE_READWRITE, "heap");
@@ -203,17 +221,22 @@ static void heap_free_idx(uint32_t hidx, uint32_t ptr)
 uint32_t k32_heap_alloc(uint32_t heap, uint32_t flags, uint32_t size)
 {
     uint32_t idx;
+    hlock();
     if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapAlloc: heap inválido 0x%08X", heap);
-    return heap_alloc_idx(idx, flags, size);
+    uint32_t r = heap_alloc_idx(idx, flags, size);
+    hunlock();
+    return r;
 }
 
 int k32_heap_free(uint32_t heap, uint32_t ptr)
 {
     uint32_t idx;
-    if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapFree: heap inválido 0x%08X", heap);
     if (!ptr) return 1;
+    hlock();
+    if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapFree: heap inválido 0x%08X", heap);
     check_block(idx, ptr, "HeapFree");
     heap_free_idx(idx, ptr);
+    hunlock();
     return 1;
 }
 
@@ -230,8 +253,10 @@ static void k_HeapCreate(CPU *c)
 static void k_HeapDestroy(CPU *c)
 {
     uint32_t idx;
+    hlock();
     heap_t *h = heap_from_handle(re5_arg(c, 0), &idx);
     if (!h || h->handle == g_process_heap) {
+        hunlock();
         re5_set_last_error(K32_ERROR_INVALID_PARAMETER);
         c->eax = 0;
         return;
@@ -243,15 +268,18 @@ static void k_HeapDestroy(CPU *c)
     free(h->large.v);
     re5_mem_free(h->handle);
     memset(h, 0, sizeof *h);
+    hunlock();
     c->eax = 1;
 }
 
 static void k_HeapAlloc(CPU *c)
 {
     uint32_t idx, heap = re5_arg(c, 0), flags = re5_arg(c, 1), size = re5_arg(c, 2);
-    if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapAlloc: heap inválido 0x%08X", heap);
     RE5_STAT_ADD(re5_stat_heap, 1);
+    hlock();
+    if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapAlloc: heap inválido 0x%08X", heap);
     c->eax = heap_alloc_idx(idx, flags, size);
+    hunlock();
     if (!c->eax) RE5_WARN("kernel32", "HeapAlloc(0x%08X, %u bytes): sem memória do guest", heap, size);
 }
 
@@ -264,17 +292,20 @@ static void k_HeapFree(CPU *c)
 static void k_HeapSize(CPU *c)
 {
     uint32_t idx, heap = re5_arg(c, 0), ptr = re5_arg(c, 2);
+    hlock();
     if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapSize: heap inválido 0x%08X", heap);
     check_block(idx, ptr, "HeapSize");
     c->eax = hdr_size(ptr);
+    hunlock();
 }
 
 static void k_HeapReAlloc(CPU *c)
 {
     uint32_t idx, heap = re5_arg(c, 0), flags = re5_arg(c, 1), ptr = re5_arg(c, 2), size = re5_arg(c, 3);
+    RE5_STAT_ADD(re5_stat_heap, 1);
+    hlock();
     if (!heap_from_handle(heap, &idx)) re5_fatal("kernel32", "HeapReAlloc: heap inválido 0x%08X", heap);
     check_block(idx, ptr, "HeapReAlloc");
-    RE5_STAT_ADD(re5_stat_heap, 1);
     uint32_t old = hdr_size(ptr);
     int in_place = hdr_magic(ptr) == MAGIC_LARGE ? size <= capacity(ptr)
                                                  : size <= 0x7FFF0000u && class_of(size + HDR) == class_of(old + HDR);
@@ -282,20 +313,24 @@ static void k_HeapReAlloc(CPU *c)
         if (size > old && (flags & HEAP_ZERO_MEMORY)) memset(re5_g2h(ptr + old), 0, size - old);
         k32_w32(ptr - HDR, size);
         c->eax = ptr;
+        hunlock();
         return;
     }
     if (flags & HEAP_REALLOC_IN_PLACE_ONLY) {
         c->eax = 0;
+        hunlock();
         return;
     }
     uint32_t np = heap_alloc_idx(idx, flags & HEAP_ZERO_MEMORY, size);
     if (!np) {
         c->eax = 0;
+        hunlock();
         return;
     }
     memcpy(re5_g2h(np), re5_g2h(ptr), old < size ? old : size);
     heap_free_idx(idx, ptr);
     c->eax = np;
+    hunlock();
 }
 
 /* ---- VirtualAlloc / VirtualFree ---- */
@@ -385,12 +420,12 @@ static const re5_import_def k_defs[] = {
     {"GlobalAlloc",    k_GlobalAlloc,    8, 0},
     {"GlobalLock",     k_GlobalLock,     4, 0},
     {"GlobalUnlock",   k_GlobalUnlock,   4, 0},
-    {"HeapAlloc",      k_HeapAlloc,     12, 0},
+    {"HeapAlloc",      k_HeapAlloc,     12, 0, RE5_THUNK_NOLOCK_HEAP},
     {"HeapCreate",     k_HeapCreate,    12, 0},
     {"HeapDestroy",    k_HeapDestroy,    4, 0},
-    {"HeapFree",       k_HeapFree,      12, 0},
-    {"HeapReAlloc",    k_HeapReAlloc,   16, 0},
-    {"HeapSize",       k_HeapSize,      12, 0},
+    {"HeapFree",       k_HeapFree,      12, 0, RE5_THUNK_NOLOCK_HEAP},
+    {"HeapReAlloc",    k_HeapReAlloc,   16, 0, RE5_THUNK_NOLOCK_HEAP},
+    {"HeapSize",       k_HeapSize,      12, 0, RE5_THUNK_NOLOCK_HEAP},
     {"VirtualAlloc",   k_VirtualAlloc,  16, 0},
     {"VirtualFree",    k_VirtualFree,   12, 0, RE5_THUNK_NOLOCK},   /* a memória do guest tem mutex próprio */
     {0},
