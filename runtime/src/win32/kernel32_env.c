@@ -23,9 +23,9 @@
 /* Núcleos anunciados ao jogo (GetSystemInfo, NUMBER_OF_PROCESSORS); a MT Framework
  * divide os jobs por eles (workers = min(JobThread do config.ini, 8, este número)).
  * Com o lock global (D5) mais núcleos só disputam o mesmo lock: 2. Com
- * RE5_GUEST_LOCK=hle o código do guest roda em paralelo: os do host menos um (fica
- * para a thread de render da DXVK e o sistema), até 8, o que a MT Framework de 2009
- * conhece. RE5_CPUS força um número (1..32). */
+ * RE5_GUEST_LOCK=hle o código do guest roda em paralelo e anunciamos TODOS os processadores
+ * lógicos do host (até 32, o que cabe no dwActiveProcessorMask de 32 bits); o teto que a
+ * MT Framework impõe, se houver, é o do próprio jogo. RE5_CPUS força um número (1..32). */
 static uint32_t guest_cpus(void)
 {
     static uint32_t n;
@@ -41,8 +41,7 @@ static uint32_t guest_cpus(void)
 #else
     long host = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-    long use = host - 1;
-    n = use < 1 ? 1u : use > 8 ? 8u : (uint32_t)use;
+    n = host < 1 ? 1u : host > 32 ? 32u : (uint32_t)host;
     RE5_INFO("kernel32", "GetSystemInfo: %u núcleos para o jogo (host: %ld)", n, host);
     return n;
 }
