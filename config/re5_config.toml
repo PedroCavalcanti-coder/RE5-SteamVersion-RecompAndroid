@@ -50,10 +50,11 @@ flags_dead_at_ret_below = 0x00E63000
 cache_flags = true
 # jmp com alvo constante para outra função vira chamada em posição de cauda (RE5_TAILCALL):
 # a pilha do host não cresce a cada jmp entre funções e as flags morrem no jmp (fase P2/P3).
-tail_calls = true
+# Desligado: no A/B do usuário (28/10) o melhor build foi sem tail_calls e com RE5_HEAP_NOLOCK=1.
+tail_calls = false
 # Laço de espera pura (só lê a memória e compara, endereço fixo) ganha uma pausa de CPU na
-# cabeça (fase P7). Não se aplica a laço que avança um ponteiro (strlen etc.).
-spin_pause = true
+# cabeça (fase P7); desligado até o A/B. Não se aplica a laço que avança um ponteiro (strlen etc.).
+spin_pause = false
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"
