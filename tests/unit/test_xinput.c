@@ -53,7 +53,7 @@ int main(void)
     const uint32_t vib[2] = {0, buf};
     CHECK_EQ_U32(call("XInputSetState", 2, vib), 1167);
 
-    int16_t axis[6] = {1000, INT16_MIN, -5, INT16_MAX, INT16_MAX, 0};
+    int16_t axis[6] = {9000, INT16_MIN, -9000, INT16_MAX, INT16_MAX, 0};
     uint32_t b = 1u << SDL_CONTROLLER_BUTTON_A | 1u << SDL_CONTROLLER_BUTTON_DPAD_UP |
                  1u << SDL_CONTROLLER_BUTTON_START | 1u << SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
     uint8_t g[12];
@@ -61,9 +61,23 @@ int main(void)
     CHECK_EQ_U32(g[0] | g[1] << 8, 0x1211);    /* A | RIGHT_SHOULDER | START | DPAD_UP */
     CHECK_EQ_U32(g[2], 255);                   /* gatilho esquerdo no fim */
     CHECK_EQ_U32(g[3], 0);
-    CHECK_EQ_U32(s16(g + 4), 1000);
+    CHECK_EQ_U32(s16(g + 4), 9000);
     CHECK_EQ_U32((uint16_t)s16(g + 6), (uint16_t)32767);   /* Y do SDL para cima no máximo -> +32767 */
-    CHECK_EQ_U32((uint16_t)s16(g + 8), (uint16_t)-5);
+    CHECK_EQ_U32((uint16_t)s16(g + 8), (uint16_t)-9000);
     CHECK_EQ_U32((uint16_t)s16(g + 10), (uint16_t)-32767);
+
+    /* Zona morta (7849 esquerdo, 8689 direito) e limiar dos gatilhos (30 de 255). */
+    int16_t small[6] = {1000, -7848, -5, 8688, 3800, 0};    /* 3800 -> 29 no gatilho */
+    re5_xinput_gamepad(small, 0, g);
+    CHECK_EQ_U32(s16(g + 4), 0);
+    CHECK_EQ_U32(s16(g + 6), 0);
+    CHECK_EQ_U32(s16(g + 8), 0);
+    CHECK_EQ_U32(s16(g + 10), 0);
+    CHECK_EQ_U32(g[2], 0);
+    int16_t edge[6] = {7849, 0, -8689, 0, 4000, 0};          /* no limite: passa; 4000 -> 31 */
+    re5_xinput_gamepad(edge, 0, g);
+    CHECK_EQ_U32(s16(g + 4), 7849);
+    CHECK_EQ_U32((uint16_t)s16(g + 8), (uint16_t)-8689);
+    CHECK_EQ_U32(g[2], 31);
     CHECK_DONE();
 }
