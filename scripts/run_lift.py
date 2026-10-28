@@ -349,7 +349,7 @@ def cmd_lift(args, cfg):
     lifter = lift32_cpu.Lifter(exe, pe.OPTIONAL_HEADER.SizeOfImage, read_va)
     lifter.flags_dead_ret_below = cfg["lift"].get("flags_dead_at_ret_below")
     lifter.cache_flags = bool(cfg["lift"].get("cache_flags", True))
-    lifter.tail_calls = bool(cfg["lift"].get("tail_calls", True)) and not getattr(args, "no_tail_calls", False)
+    lifter.tail_calls = bool(cfg["lift"].get("tail_calls", False)) and not getattr(args, "no_tail_calls", False)
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
     lifter.reloc_vas = {(base + e.rva) & 0xFFFFFFFF
                         for br in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", [])
@@ -413,7 +413,7 @@ def cmd_lift(args, cfg):
     # no catálogo depois fica no dispatch (correto, só mais lento) até a janela
     # do chamador ser refeita.
     direct = cfg["lift"].get("direct_calls", True)
-    spin_pause = bool(cfg["lift"].get("spin_pause", True))
+    spin_pause = bool(cfg["lift"].get("spin_pause", False))
     known = {fd["address"] for fd in funcs}
 
     def direct_calls(text):

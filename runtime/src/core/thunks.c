@@ -33,7 +33,8 @@ static int env_on(const char *name)
 int re5_thunks_init(void)
 {
     if (g_thunks) return 0;
-    if (env_on("RE5_HEAP_NOLOCK")) g_nolock_mask |= RE5_THUNK_NOLOCK_HEAP;
+    const char *hn = getenv("RE5_HEAP_NOLOCK");   /* padrão ligado desde o A/B de 28/10; =0 desliga */
+    if (!hn || !*hn || env_on("RE5_HEAP_NOLOCK")) g_nolock_mask |= RE5_THUNK_NOLOCK_HEAP;
     re5_mutex_init(&g_mu);
     g_thunks = calloc(RE5_THUNK_MAX, sizeof *g_thunks);
     if (!g_thunks) return -1;
