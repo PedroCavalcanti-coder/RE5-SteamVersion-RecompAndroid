@@ -230,7 +230,31 @@ LABEL_RE = re.compile(r"^(L_[0-9A-F]{8}):$", re.M)
 GOTO_RE = re.compile(r"goto (L_[0-9A-F]{8});")
 
 
-def loop_barriers(text):
+# Laço de espera pura: o corpo só lê a memória (rd*) e compara, e nenhum registrador que ele
+# escreve entra no endereço de uma leitura (sem ponteiro que avança, como num strlen).
+_IMPURE_RE = re.compile(r"\b(wr\w*|push32\w*|pop32\w*|RE5_CALL|RE5_TAILCALL|dispatch\w*|rep_\w+|RECOMP_\w+|re5_\w+"
+                        r"|FS_WR\w*|fst|fpu\w*|fpush|fpop|op_\w+|bit_string_op)\(")
+_ASSIGN_REG_RE = re.compile(r"\b(R_(?:eax|ecx|edx|ebx|esp|ebp|esi|edi))\s*(?:=(?!=)|[-+*/&|^]=|<<=|>>=|\+\+|--)")
+_RD_RE = re.compile(r"\brd\w*\(([^;]*?)\)\s*[;)&|^=!<>,]")
+
+
+def is_wait_loop(region):
+    if _IMPURE_RE.search(region) or "c->" in region.replace("(c,", ""):
+        return False
+    if not re.search(r"\brd(8|16|32)\(", region):
+        return False
+    written = {m.group(1) for m in _ASSIGN_REG_RE.finditer(region)}
+    for m in re.finditer(r"\brd(?:8|16|32|64)\(", region):
+        depth, i = 1, m.end()
+        while depth and i < len(region):
+            depth += {"(": 1, ")": -1}.get(region[i], 0)
+            i += 1
+        if any(w in region[m.end():i] for w in written):
+            return False
+    return True
+
+
+def loop_barriers(text, spin=False):
     """RE5_LOOP_BARRIER() logo depois de cada rótulo que é alvo de um goto para
     trás (cabeça de laço), função por função. Um laço do jogo que só lê uma flag
     na memória (espera ocupada por outra thread) não tem escrita nenhuma que o
@@ -238,14 +262,17 @@ def loop_barriers(text):
     do laço e giraria para sempre. A barreira obriga a reler a cada volta."""
     out = []
     for part in re.split(r"(?=^void L_[0-9A-F]{8}\()", text, flags=re.M):
-        heads, seen = set(), {}
+        heads, seen, waits = set(), {}, set()
         for m in re.finditer(r"^(L_[0-9A-F]{8}):$|goto (L_[0-9A-F]{8});", part, re.M):
             if m.group(1):
-                seen[m.group(1)] = True
+                seen[m.group(1)] = m.end()
             elif m.group(2) in seen:
                 heads.add(m.group(2))
+                if spin and is_wait_loop(part[seen[m.group(2)]:m.start()]):
+                    waits.add(m.group(2))
         if heads:
-            part = LABEL_RE.sub(lambda m: m.group(0) + (" RE5_LOOP_BARRIER();" if m.group(1) in heads else ""), part)
+            part = LABEL_RE.sub(lambda m: m.group(0) + (
+                (" RE5_SPIN_BARRIER();" if m.group(1) in waits else " RE5_LOOP_BARRIER();") if m.group(1) in heads else ""), part)
         out.append(part)
     return "".join(out)
 
@@ -386,6 +413,7 @@ def cmd_lift(args, cfg):
     # no catálogo depois fica no dispatch (correto, só mais lento) até a janela
     # do chamador ser refeita.
     direct = cfg["lift"].get("direct_calls", True)
+    spin_pause = bool(cfg["lift"].get("spin_pause", True))
     known = {fd["address"] for fd in funcs}
 
     def direct_calls(text):
@@ -414,7 +442,7 @@ def cmd_lift(args, cfg):
     done = reused = 0
     for idx, fds in groups.items():
         name = f"{prefix}_{idx:04d}.c"
-        key = hashlib.sha256(tool_hash.digest() + repr(direct).encode() + repr(
+        key = hashlib.sha256(tool_hash.digest() + repr((direct, spin_pause)).encode() + repr(
             [(fd["address"], fd["size"], fd["address"] in overrides, fd["address"] in excluded,
               fd["address"] in traced) for fd in fds]
         ).encode()).hexdigest()
@@ -462,7 +490,7 @@ def cmd_lift(args, cfg):
         # memória do guest (ponteiros may_alias) a apelida. Sem o restrict, cada
         # escrita no guest obrigava o compilador a reler e regravar os
         # registradores do guest no struct (código ~6% maior, medido em re5_0166.c).
-        body = loop_barriers(SIG_RE.sub(r"void \1(CPU *RE5_RESTRICT c)", body))
+        body = loop_barriers(SIG_RE.sub(r"void \1(CPU *RE5_RESTRICT c)", body), spin_pause)
         decls = []
         if direct:
             body, used = direct_calls(body)
