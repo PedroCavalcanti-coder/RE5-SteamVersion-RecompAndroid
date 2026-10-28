@@ -462,7 +462,7 @@ def cmd_lift(args, cfg):
             va, size = fd["address"], fd["size"]
             if va in overrides:
                 # Corpo escrito à mão no runtime (runtime/src/core/overrides.c).
-                chunk.append(f"void L_{va:08X}(CPU *c) {{ re5_override(c, 0x{va:08X}u); }}")
+                chunk.append(f"void re5_ov_{va:08X}(CPU *c);" + chr(10) + f"void L_{va:08X}(CPU *c) {{ re5_ov_{va:08X}(c); }}")
                 fcounts["override"] += 1
             elif va in excluded:
                 chunk.append(f'void L_{va:08X}(CPU *c) {{ (void)c; RECOMP_TODO(0x{va:08X}, "excluded"); }}')
