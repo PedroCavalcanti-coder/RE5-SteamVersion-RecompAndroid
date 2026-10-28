@@ -10,7 +10,8 @@
 #include "re5/log.h"
 #include "re5/runtime.h"
 
-static void ov_00426230(CPU *c)
+/* Os corpos são chamados direto pelo L_<VA> gerado (run_lift.py): sem busca na tabela. */
+void re5_ov_00426230(CPU *c)
 {
     /* HasCPUID(): x86 testa o bit ID de EFLAGS via pushfd/popfd.
      * Em host recompiled, a CPU sempre suporta CPUID. Retorna 1 em eax. */
@@ -18,8 +19,18 @@ static void ov_00426230(CPU *c)
     c->esp += 4; /* ret */
 }
 
+/* sqrtf do jogo (fase P5): push ebp; fld dword [ebp+8]; fsqrt; pop ebp; ret. Era 9,7% das
+ * amostras do perfil em jogo (28/10). Mesma conta do lift: sqrt em double do float do argumento,
+ * resultado empilhado em st(0); ebp/esp voltam ao que eram, fora o `ret` (esp += 4). */
+void re5_ov_00428D60(CPU *c)
+{
+    fpush(c, __builtin_sqrt((double)rdf32(c->esp + 4u)));
+    c->esp += 4u;
+}
+
 static const re5_override_def k_overrides[] = {
-    {0x00426230u, ov_00426230, "HasCPUID: teste de EFLAGS.ID via pushfd/popfd -> sempre 1"},
+    {0x00426230u, re5_ov_00426230, "HasCPUID: teste de EFLAGS.ID via pushfd/popfd -> sempre 1"},
+    {0x00428D60u, re5_ov_00428D60, "sqrtf: fld dword [ebp+8]; fsqrt - folha pura, 9,7% das amostras em jogo"},
     {0, NULL, NULL},
 };
 

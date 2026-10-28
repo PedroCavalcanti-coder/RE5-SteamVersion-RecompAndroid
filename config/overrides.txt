@@ -4,4 +4,5 @@
 # computados) e documente o motivo aqui E no corpo em overrides.c.
 #
 # VA          motivo
+0x00428D60    sqrtf: fld dword [ebp+8]; fsqrt; ret - folha pura quente (override nativo, P5)
 0x00426230    HasCPUID: teste de alternancia do bit EFLAGS.ID via pushfd/popfd (sempre 1 em recomp)
