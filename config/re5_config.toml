@@ -51,6 +51,9 @@ cache_flags = true
 # jmp com alvo constante para outra função vira chamada em posição de cauda (RE5_TAILCALL):
 # a pilha do host não cresce a cada jmp entre funções e as flags morrem no jmp (fase P2/P3).
 tail_calls = true
+# Laço de espera pura (só lê a memória e compara, endereço fixo) ganha uma pausa de CPU na
+# cabeça (fase P7). Não se aplica a laço que avança um ponteiro (strlen etc.).
+spin_pause = true
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"

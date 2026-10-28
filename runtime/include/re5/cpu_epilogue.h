@@ -34,6 +34,17 @@ typedef void (*re5_lifted_fn)(CPU *c);
 #define RE5_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")
 #endif
 
+/* Laço de espera pura (lift.spin_pause, fase P7): a barreira de sempre mais uma pausa, para a
+ * thread que espera não competir com a que escreve a flag (hyper-thread, ARM yield). */
+#if defined(__x86_64__) || defined(__i386__)
+#define RE5_CPU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define RE5_CPU_PAUSE() __asm__ __volatile__("yield")
+#else
+#define RE5_CPU_PAUSE() ((void)0)
+#endif
+#define RE5_SPIN_BARRIER() do { RE5_LOOP_BARRIER(); RE5_CPU_PAUSE(); } while (0)
+
 typedef struct {
     uint32_t      va;
     re5_lifted_fn fn;
