@@ -16,7 +16,9 @@ if(EXISTS "${RE5_TABLE}")
     if(MSVC)
         target_compile_options(re5_generated PRIVATE /w /O1)
     else()
-        target_compile_options(re5_generated PRIVATE -w ${RE5_GENERATED_OPT})
+        # -foptimize-sibling-calls: o jmp de cauda entre funções (RE5_TAILCALL) vira jmp também
+        # em -O1; onde o compilador não consegue, cai numa chamada normal (mesma semântica).
+        target_compile_options(re5_generated PRIVATE -w ${RE5_GENERATED_OPT} -foptimize-sibling-calls)
     endif()
 else()
     message(STATUS "re5: sem código gerado; usando generated/stub (Fase 2 pendente)")

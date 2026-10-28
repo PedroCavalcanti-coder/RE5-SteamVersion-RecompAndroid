@@ -394,6 +394,8 @@ def flag_liveness(items, labels, dead_at_ret=False):
                 leaves = True
         if mnem in ("ret", "retn") and dead_at_ret and "dispatch" not in text and "RECOMP_TODO" not in text:
             pass                       # returns to a caller that rewrites flags before reading any
+        elif mnem == "jmp" and dead_at_ret and "dispatch_tail(" in text and "dispatch_jmp" not in text:
+            pass                       # tail call: the callee's ret goes to that same caller (P3)
         elif mnem != "call" and ("dispatch" in text or "return" in text or "RECOMP_TODO" in text):
             leaves = True
         stops = mnem in ("jmp", "ret", "retn", "retf", "iret", "iretd", "hlt")
@@ -441,7 +443,7 @@ _XMM_REF = re.compile(r"\bc->xmm\[([0-7])\]")
 _LOCAL = re.compile(r"\bR_(eax|ecx|edx|ebx|esp|ebp|esi|edi|x[0-7]|cf|pf|af|zf|sf|of)\b")
 _ASSIGN = re.compile(r"\s*(?:\.\w+\s*\[[^\]]*\]|\.\w+|\[[^\]]*\])*\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
 # Calls that see the whole CPU: everything must be in the struct before, reloaded after.
-_FULL_SYNC = ("dispatch", "dispatch_jmp", "re5_override", "recomp_cpuid", "recomp_rdtsc", "RECOMP_TODO",
+_FULL_SYNC = ("dispatch", "dispatch_jmp", "dispatch_tail", "re5_override", "recomp_cpuid", "recomp_rdtsc", "RECOMP_TODO",
               "re5_recomp_todo", "RE5_CALL")
 # Helpers that read/write some registers through the CPU: (reads, writes).
 _PARTIAL_SYNC = {"rep_stos": (("eax", "ecx", "edi"), ("ecx", "edi")),
@@ -628,7 +630,9 @@ def cache_registers(items, succ, cache_flags=True):
         loads_all = " ".join(_load(r) for r in regs)
         lines = []
         for line in texts[i]:
-            if kinds[i] == "full":
+            if kinds[i] == "full" and "dispatch_tail(" in line:
+                line = _insert_around(line, ("dispatch_tail",), stores, "")   # não volta: nada a recarregar
+            elif kinds[i] == "full":
                 line = _insert_around(line, _FULL_SYNC, stores, loads_all)
             elif kinds[i] in _PARTIAL_SYNC:
                 rd, wr = _PARTIAL_SYNC[kinds[i]]
@@ -1194,6 +1198,10 @@ class Lifter:
                 out.append("  dispatch_jmp(c, _jt); return; }")
                 return out
             if t.type == X86_OP_IMM:                        # tail call to another function
+                if getattr(self, "tail_calls", False):
+                    # dispatch_tail inclui o `return` (cpu_epilogue.h); o run_lift troca por
+                    # RE5_TAILCALL(c, L_x) quando o alvo é gerado, e o compilador vira um jmp.
+                    return [f"dispatch_tail(c, 0x{t.imm:08X}u);"]
                 return [f"dispatch(c, 0x{t.imm:08X}u); return;"]
             return [f"/* indirect jmp */ dispatch_jmp(c, {self._target(insn,t)}); return;"]
         if m == "call":

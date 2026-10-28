@@ -185,6 +185,33 @@ class LifterGaps(unittest.TestCase):
         self.assertIn("uint32_t R_eax = c->eax", off)             # registradores seguem em locais
         self.assertIn("c->eax = R_eax;", off)
 
+    def test_tail_call_jmp(self):
+        # lift.tail_calls (fases P2/P3): jmp constante para outra função = dispatch_tail; só grava
+        # os registradores sujos antes e não recarrega; as flags morrem abaixo do limite do ret.
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        lifter = Lifter.__new__(Lifter)
+        lifter.md = md
+        lifter.reloc_vas = set()
+        lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+        lifter.read_va = None
+        lifter.flags_dead_ret_below = 0x00E63000
+        lifter.tail_calls = True
+        code = bytes.fromhex("39c8" "b801000000" "e9f40f0000")     # cmp eax,ecx ; mov eax,1 ; jmp 0x2000
+        c = lifter.lift_function(code, 0x1000)
+        tail = [l for l in c.splitlines() if "dispatch_tail" in l][0]
+        self.assertIn("dispatch_tail(c, 0x00002000u);", tail)
+        self.assertIn("c->eax = R_eax;", tail)
+        self.assertLess(tail.index("c->eax = R_eax;"), tail.index("dispatch_tail"))
+        self.assertNotIn("R_eax = c->eax;", tail)                  # não volta
+        self.assertNotIn("return;", tail)
+        cmp_line = [l for l in c.splitlines() if "cmp" in l][0]
+        self.assertIn("flags_sub_m(c, 0x000u", cmp_line)           # flags mortas: o jmp de cauda não as lê
+        lifter.tail_calls = False
+        old = lifter.lift_function(code, 0x1000)
+        self.assertIn("dispatch(c, 0x00002000u);", old)
+        self.assertNotIn("dispatch_tail", old)
+
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
         # (0x00E64680, std; repne scasb) devolvia NULL e o 0x0072BC80 registrava toda
