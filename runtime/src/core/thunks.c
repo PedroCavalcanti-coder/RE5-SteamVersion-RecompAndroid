@@ -1,6 +1,7 @@
 /*
  * thunks.c - faixa de endereços do guest atendida pelo host (ver re5/thunks.h).
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,6 +62,32 @@ uint32_t re5_thunk_new(const char *name, re5_host_fn fn, uint32_t arg_bytes, voi
     return RE5_THUNK_BASE + idx * RE5_THUNK_STRIDE;
 }
 
+void re5_thunk_log_top(int n, double secs)
+{
+    enum { MAXN = 12 };
+    if (n > MAXN) n = MAXN;
+    const re5_thunk *best[MAXN] = {0};
+    uint64_t delta[MAXN] = {0};
+    for (uint32_t i = 0; i < g_next; i++) {
+        re5_thunk *t = &g_thunks[i];
+        uint64_t d = t->calls - t->calls_prev;
+        t->calls_prev = t->calls;
+        for (int k = 0; k < n; k++) {
+            if (d > delta[k]) {
+                for (int j = n - 1; j > k; j--) { best[j] = best[j - 1]; delta[j] = delta[j - 1]; }
+                best[k] = t;
+                delta[k] = d;
+                break;
+            }
+        }
+    }
+    char line[900];
+    int len = snprintf(line, sizeof line, "thunks/s:");
+    for (int k = 0; k < n && best[k] && len < (int)sizeof line - 80; k++)
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s=%.0f", best[k]->name, (double)delta[k] / secs);
+    RE5_INFO("thunk", "%s", line);
+}
+
 void re5_thunk_set_flags(uint32_t va, uint32_t flags)
 {
     if (!re5_is_thunk(va) || (va - RE5_THUNK_BASE) % RE5_THUNK_STRIDE) return;
@@ -91,6 +118,7 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
     /* RE5_GUEST_LOCK=hle: o código do guest roda solto; o lock protege só o HLE. */
     if (re5_stats_on) {
         RE5_STAT_ADD(re5_stat_thunks, 1);
+        ((re5_thunk *)t)->calls++;   /* sem trava: ordem de grandeza basta */
         if (!strncmp(t->name, "IDirect3D", 9)) {
             RE5_STAT_ADD(re5_stat_d3d9, 1);
             const char *m = strstr(t->name, "::");

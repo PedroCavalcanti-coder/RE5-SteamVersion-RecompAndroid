@@ -37,6 +37,7 @@ typedef struct {
     uint32_t    arg_bytes;
     void       *user;      /* dado do handler (ex.: o objeto host de um método COM) */
     uint32_t    flags;     /* RE5_THUNK_* */
+    uint64_t    calls, calls_prev;   /* RE5_FPS_LOG: chamadas (contador sem trava) e total do último log */
 } re5_thunk;
 
 /* Handler que não precisa do lock do HLE (RE5_GUEST_LOCK=hle): só mexe no que
@@ -53,6 +54,8 @@ uint32_t re5_thunk_new(const char *name, re5_host_fn fn, uint32_t arg_bytes, voi
 void re5_thunk_set_flags(uint32_t va, uint32_t flags);
 const re5_thunk *re5_thunk_get(uint32_t va);
 uint32_t re5_thunk_count(void);
+/* RE5_FPS_LOG: escreve no log os n thunks mais chamados desde a última chamada (por segundo, em `secs`). */
+void re5_thunk_log_top(int n, double secs);
 void re5_thunk_invoke(CPU *c, uint32_t va);
 
 /* Thunk que o handler corrente está atendendo (para handlers genéricos). */

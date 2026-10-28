@@ -741,6 +741,8 @@ static void fps_log(void)
                  (unsigned long long)(dp > dp0 ? (dp - dp0) * 1000.0 / dt : 0),
                  (double)(lw - lw0) / 1e6 * 1000.0 / dt);
         th0 = th; d30 = d3; dr0 = dr; hp0 = hp; lw0 = lw; dp0 = dp;
+        static int tick;
+        if (++tick % 10 == 0) re5_thunk_log_top(10, dt / 1000.0 * 10);   /* a cada 10 s, média desse intervalo */
         t0 = now;
         n0 = g_presents;
     }
