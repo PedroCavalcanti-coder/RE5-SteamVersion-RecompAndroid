@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--label", default="base")
     ap.add_argument("--secs", type=float, default=420)
     ap.add_argument("--env", nargs="*", default=[])
+    ap.add_argument("--re5", default=os.path.join(ROOT, "build", "test-build", "re5.exe"), help="executável a medir")
     ap.add_argument("--game-dir", default=os.path.join(ROOT, "bin_input", "game"))
     args = ap.parse_args()
     out = os.path.join(ROOT, "work", "bench", args.label)
@@ -38,7 +39,7 @@ def main():
     for kv in args.env:
         k, v = kv.split("=", 1)
         env[k] = v
-    p = subprocess.Popen([os.path.join(ROOT, "build", "test-build", "re5.exe"), "--game-dir", args.game_dir, "--exe",
+    p = subprocess.Popen([args.re5, "--game-dir", args.game_dir, "--exe",
                           "bin_input/re5dx9.clean.exe"], cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
     t0 = time.time()
