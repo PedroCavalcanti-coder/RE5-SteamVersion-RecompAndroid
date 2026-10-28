@@ -1,0 +1,20 @@
+# Unidades do código gerado compiladas com -O2 (o resto fica em -O1; generated/CMakeLists.txt).
+# Saem do perfil em jogo (RE5_PROFILE, work/bench/perfil-28out): as janelas de 64 KiB com mais
+# amostras. Janela N = função em [0x401000 + N*0x10000, +0x10000). Uma por linha, '#' comenta.
+# Vale enquanto lift.bytes_per_file e o catálogo não mudarem; um relift não invalida a lista.
+re5_0024
+re5_0038
+re5_0009
+re5_0025
+re5_0103
+re5_0141
+re5_0161
+re5_0005
+re5_0010
+re5_0067
+re5_0133
+re5_0013
+re5_0033
+re5_0030
+re5_0055
+re5_0162
