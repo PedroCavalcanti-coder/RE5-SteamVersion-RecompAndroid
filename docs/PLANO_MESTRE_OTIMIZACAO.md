@@ -324,6 +324,10 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
   5. LTO só no runtime (ThinLTO/`-flto=auto`), nunca nas ~180 unidades do código gerado.
 - **Risco:** baixo (sem mudança de semântica). **Esforço:** médio (tempo de build).
 
+> **P7 (branch `otim/p7-spinwait`, sem medida):** `lift.spin_pause` (pausa só em laço de espera
+> pura: endereço de leitura fixo, sem escrita nem chamada) e `RE5_THREAD_PRIO=1` (honra
+> `SetThreadPriority` do guest na thread do host, só Windows; desligado por padrão).
+
 ### Fase P5 — *Overrides* nativos verificados para funções quentes do guest
 
 - **Evidência:** funções do guest no topo do perfil da 0.3 que sejam **folhas puras** (não
