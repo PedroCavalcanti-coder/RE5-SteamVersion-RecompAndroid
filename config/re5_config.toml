@@ -55,6 +55,9 @@ tail_calls = false
 # Laço de espera pura (só lê a memória e compara, endereço fixo) ganha uma pausa de CPU na
 # cabeça (fase P7); desligado até o A/B. Não se aplica a laço que avança um ponteiro (strlen etc.).
 spin_pause = false
+# call/jmp/ret de função do jogo (abaixo de flags_dead_at_ret_below) deixam de gravar cf..of na CPU:
+# quem retorna e quem é chamado nunca as lê (mesma premissa da análise de flags no ret).
+elide_flag_stores = true
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"

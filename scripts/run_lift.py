@@ -350,6 +350,7 @@ def cmd_lift(args, cfg):
     lifter.flags_dead_ret_below = cfg["lift"].get("flags_dead_at_ret_below")
     lifter.cache_flags = bool(cfg["lift"].get("cache_flags", True))
     lifter.tail_calls = bool(cfg["lift"].get("tail_calls", False)) and not getattr(args, "no_tail_calls", False)
+    lifter.elide_flag_stores = bool(cfg["lift"].get("elide_flag_stores", False))
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
     lifter.reloc_vas = {(base + e.rva) & 0xFFFFFFFF
                         for br in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", [])
@@ -405,6 +406,7 @@ def cmd_lift(args, cfg):
     tool_hash.update(repr(cfg["lift"].get("flags_dead_at_ret_below")).encode())
     tool_hash.update(repr(lifter.cache_flags).encode())
     tool_hash.update(repr(lifter.tail_calls).encode())
+    tool_hash.update(repr(lifter.elide_flag_stores).encode())
     file_cache = {}
 
     funcs = [fd for fd in cat["functions"] if fd["size"] > 0]

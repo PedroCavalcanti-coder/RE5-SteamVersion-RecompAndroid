@@ -589,7 +589,7 @@ def _insert_around(text, names, before, after):
         i = stmt_end
 
 
-def cache_registers(items, succ, cache_flags=True):
+def cache_registers(items, succ, cache_flags=True, elide_flag_stores=False):
     """items: [(insn, [rewritable C lines])], succ from flag_liveness. Returns new items
     and the declaration line for the top of the function. cache_flags=False leaves cf..of
     in the CPU struct (the generated file maps R_cf.. to c->cf..), for A/B measurement."""
@@ -626,7 +626,10 @@ def cache_registers(items, succ, cache_flags=True):
     new_items = []
     for i, (ins, _) in enumerate(items):
         d = dirty_in[i] | writes[i]
-        stores = " ".join(_store(r) for r in regs if r in d)
+        # elide_flag_stores (fase P3): em função do jogo (abaixo de flags_dead_at_ret_below) nem o
+        # chamado nem quem retorna lê flags da CPU, então call/jmp/ret não gravam cf..of.
+        st_regs = [r for r in regs if r in d and not (elide_flag_stores and r in _FLAGS)]
+        stores = " ".join(_store(r) for r in st_regs)
         loads_all = " ".join(_load(r) for r in regs)
         lines = []
         for line in texts[i]:
@@ -1873,7 +1876,8 @@ class Lifter:
         cache = getattr(self, "cache_registers", True) and bool(items)
         if cache:
             cache_flags = getattr(self, "cache_flags", True)
-            items, decl = cache_registers(items, flag_liveness.succ, cache_flags)
+            elide = bool(getattr(self, "elide_flag_stores", False)) and below is not None and start < below
+            items, decl = cache_registers(items, flag_liveness.succ, cache_flags, elide)
             out.append(f"    {decl}")
         for ins, lines in items:
             if ins.address in labels:
