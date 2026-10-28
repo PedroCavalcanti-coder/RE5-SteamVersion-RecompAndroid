@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "re5/fast_tls.h"
 #include "re5/image.h"
 #include "re5/log.h"
 #include "re5/runtime.h"
@@ -18,15 +19,31 @@
 uint32_t g_image_delta;   /* cpu.h: GVA(). Sempre 0: a imagem não tem relocações. */
 
 #define TRAIL RE5_TRAIL
-/* Um bloco só: no MinGW o TLS é emulado (__emutls_get_address por variável),
- * e o dispatch roda a cada call/jmp do jogo. */
+/* Um bloco por thread, alocado no primeiro uso e apontado por um slot de TLS rápido
+ * (re5/fast_tls.h): o dispatch roda a cada call/jmp do jogo. Nunca é liberado: a trilha
+ * de uma thread que saiu ainda pode ser lida pelo relatório de travamento. */
 typedef struct { uint32_t pos; uint32_t va[TRAIL]; } trail_t;
-static RE5_THREAD_LOCAL trail_t t_trail;
+RE5_TLS_PTR(trail_t *, t_trail)
 
-void re5_dispatch_trail_ref(const volatile uint32_t **pos, const uint32_t **trail)
+static RE5_NOINLINE trail_t *trail_new(void)
 {
-    *pos = &t_trail.pos;
-    *trail = t_trail.va;
+    trail_t *t = calloc(1, sizeof *t);
+    if (!t) re5_fatal("dispatch", "sem memória para a trilha de dispatch");
+    t_trail_set(t);
+    return t;
+}
+
+static inline trail_t *trail(void)
+{
+    trail_t *t = t_trail_get();
+    return __builtin_expect(t != NULL, 1) ? t : trail_new();
+}
+
+void re5_dispatch_trail_ref(const volatile uint32_t **pos, const uint32_t **trail_va)
+{
+    trail_t *t = trail();
+    *pos = &t->pos;
+    *trail_va = t->va;
 }
 
 /* VA -> função gerada. A busca binária nas ~70 mil entradas eram ~17 passos
@@ -66,8 +83,8 @@ re5_lifted_fn re5_lookup(uint32_t va)
 
 void re5_dispatch_trail_print(void)
 {
-    trail_t *tr = &t_trail;
-    if (!tr->pos) return;
+    trail_t *tr = t_trail_get();
+    if (!tr || !tr->pos) return;
     RE5_ERROR("dispatch", "trilha de dispatch desta thread (mais recente primeiro):");
     uint32_t n = tr->pos < TRAIL ? tr->pos : TRAIL;
     for (uint32_t i = 0; i < n; i++) {
@@ -101,7 +118,7 @@ static RE5_NORETURN void unresolved(CPU *c, uint32_t va, const char *how)
 
 static inline void go(CPU *c, uint32_t va, const char *how)
 {
-    trail_t *tr = &t_trail;
+    trail_t *tr = trail();
     uint32_t n = ++tr->pos;
     tr->va[(n - 1) % TRAIL] = va;
     if ((n & 1023u) == 0) re5_guest_preempt();

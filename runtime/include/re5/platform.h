@@ -10,10 +10,12 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define RE5_NORETURN       __declspec(noreturn)
+#define RE5_NOINLINE       __declspec(noinline)
 #define RE5_THREAD_LOCAL   __declspec(thread)
 #define RE5_PRINTF(f, a)
 #else
 #define RE5_NORETURN       __attribute__((noreturn))
+#define RE5_NOINLINE       __attribute__((noinline))
 #define RE5_THREAD_LOCAL   _Thread_local
 #define RE5_PRINTF(f, a)   __attribute__((format(printf, f, a)))
 #endif

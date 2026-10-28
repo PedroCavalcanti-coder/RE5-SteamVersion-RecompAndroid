@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "re5/fast_tls.h"
 #include "re5/guest_memory.h"
 #include "re5/log.h"
 #include "re5/stats.h"
@@ -15,7 +16,7 @@
 static re5_thunk *g_thunks;
 static uint32_t g_next;
 static re5_mutex g_mu;
-static RE5_THREAD_LOCAL const re5_thunk *t_current;
+RE5_TLS_PTR(const re5_thunk *, t_current)
 
 static void return_to_host(CPU *c)
 {
@@ -103,26 +104,28 @@ const re5_thunk *re5_thunk_get(uint32_t va)
 }
 
 uint32_t re5_thunk_count(void) { return g_next; }
-const re5_thunk *re5_thunk_current(void) { return t_current; }
+const re5_thunk *re5_thunk_current(void) { return t_current_get(); }
 
 void re5_thunk_invoke(CPU *c, uint32_t va)
 {
     const re5_thunk *t = re5_thunk_get(va);
     if (!t) re5_fatal("thunk", "dispatch para 0x%08X na faixa de thunks, mas nenhum thunk mora aí", va);
-    const re5_thunk *prev = t_current;
-    t_current = t;
+    const re5_thunk *prev = t_current_get();
+    t_current_set(t);
     re5_thread *th = re5_thread_current();
     const char *prev_name = th ? th->thunk : NULL;
     if (th) th->thunk = t->name;
     RE5_TRACE("thunk", "-> %s", t->name);
     /* RE5_GUEST_LOCK=hle: o código do guest roda solto; o lock protege só o HLE. */
     if (re5_stats_on) {
-        RE5_STAT_ADD(re5_stat_thunks, 1);
-        ((re5_thunk *)t)->calls++;   /* sem trava: ordem de grandeza basta */
+        RE5_STAT_ADD(RE5_ST_THUNKS, 1);
+        /* Contagem por thunk amostrada 1 em 16: um store por chamada na tabela global disputava
+         * as linhas de cache entre as threads. */
+        if (th && (++th->stat_sample & 15u) == 0) ((re5_thunk *)t)->calls += 16;
         if (!strncmp(t->name, "IDirect3D", 9)) {
-            RE5_STAT_ADD(re5_stat_d3d9, 1);
+            RE5_STAT_ADD(RE5_ST_D3D9, 1);
             const char *m = strstr(t->name, "::");
-            if (m && !strncmp(m + 2, "Draw", 4)) RE5_STAT_ADD(re5_stat_draws, 1);
+            if (m && !strncmp(m + 2, "Draw", 4)) RE5_STAT_ADD(RE5_ST_DRAWS, 1);
         }
     }
     int lk = re5_guest_lock_mode_hle() && !(t->flags & (RE5_THUNK_NOLOCK | g_nolock_mask));
@@ -130,6 +133,6 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
     t->fn(c);
     if (lk) re5_guest_unlock();
     if (th) th->thunk = prev_name;
-    t_current = prev;
+    t_current_set(prev);
     c->esp += 4u + t->arg_bytes;   /* ret N: endereço de retorno + argumentos stdcall */
 }
