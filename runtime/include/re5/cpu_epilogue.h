@@ -58,4 +58,16 @@ void re5_guest_preempt(void);
  * na trilha de diagnóstico do dispatch. */
 #define RE5_CALL(c, fn) do { if ((++(c)->ncalls & 1023u) == 0) re5_guest_preempt(); fn(c); } while (0)
 
+/* jmp com alvo constante para outra função (lift.tail_calls): o `return` faz parte do macro.
+ * dispatch_tail(c, va) cai no dispatch; RE5_TAILCALL(c, fn) é a chamada direta em posição de
+ * cauda - o compilador a faz virar um jmp (-foptimize-sibling-calls, ou RE5_USE_MUSTTAIL com
+ * Clang/GCC 15 para garantir), então a pilha do host não cresce a cada jmp entre funções. */
+#define dispatch_tail(c, va) do { dispatch(c, va); return; } while (0)
+#ifdef RE5_USE_MUSTTAIL
+#define RE5_MUSTTAIL __attribute__((musttail))
+#else
+#define RE5_MUSTTAIL
+#endif
+#define RE5_TAILCALL(c, fn) do { if ((++(c)->ncalls & 1023u) == 0) re5_guest_preempt(); RE5_MUSTTAIL return fn(c); } while (0)
+
 #endif /* RE5_CPU_EPILOGUE_H */

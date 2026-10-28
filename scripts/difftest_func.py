@@ -74,7 +74,7 @@ def main():
         f = cat[va]
         body = lifter.lift_function(img[va - base:f["end"] - base], va)
         bodies[va] = body
-        for m in __import__("re").finditer(r"dispatch(?:_jmp)?\(c, 0x([0-9A-F]{8})u\)", body):
+        for m in __import__("re").finditer(r"dispatch(?:_jmp|_tail)?\(c, 0x([0-9A-F]{8})u\)", body):
             todo.append(int(m.group(1), 16))
     print(f"[*] {len(entries)} entradas, {len(bodies)} funções no fecho")
 

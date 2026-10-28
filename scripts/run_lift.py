@@ -252,6 +252,7 @@ def loop_barriers(text):
 
 # call/jmp com alvo constante, como o lift32_cpu o escreve.
 DIRECT_RE = re.compile(r"dispatch\(c, 0x([0-9A-F]{8})u\)")
+TAIL_RE = re.compile(r"dispatch_tail\(c, 0x([0-9A-F]{8})u\)")
 TODO_RE = re.compile(r'RECOMP_TODO\(0x[0-9A-Fa-f]+, "([^" ]+)')
 
 
@@ -321,6 +322,7 @@ def cmd_lift(args, cfg):
     lifter = lift32_cpu.Lifter(exe, pe.OPTIONAL_HEADER.SizeOfImage, read_va)
     lifter.flags_dead_ret_below = cfg["lift"].get("flags_dead_at_ret_below")
     lifter.cache_flags = bool(cfg["lift"].get("cache_flags", True))
+    lifter.tail_calls = bool(cfg["lift"].get("tail_calls", True))
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
     lifter.reloc_vas = {(base + e.rva) & 0xFFFFFFFF
                         for br in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", [])
@@ -375,6 +377,7 @@ def cmd_lift(args, cfg):
     tool_hash.update(rc.sha256_file(exe).encode())
     tool_hash.update(repr(cfg["lift"].get("flags_dead_at_ret_below")).encode())
     tool_hash.update(repr(lifter.cache_flags).encode())
+    tool_hash.update(repr(lifter.tail_calls).encode())
     file_cache = {}
 
     funcs = [fd for fd in cat["functions"] if fd["size"] > 0]
@@ -394,7 +397,14 @@ def cmd_lift(args, cfg):
                 return m.group(0)
             used.add(va)
             return f"RE5_CALL(c, L_{va:08X})"
-        return DIRECT_RE.sub(sub, text), used
+
+        def sub_tail(m):
+            va = int(m.group(1), 16)
+            if va not in known:
+                return m.group(0)
+            used.add(va)
+            return f"RE5_TAILCALL(c, L_{va:08X})"
+        return DIRECT_RE.sub(sub, TAIL_RE.sub(sub_tail, text)), used
     groups = collections.OrderedDict()
     for i, fd in enumerate(funcs):
         idx = (fd["address"] - code_start) // window if window else i // per_file

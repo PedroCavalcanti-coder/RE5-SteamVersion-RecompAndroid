@@ -48,6 +48,9 @@ flags_dead_at_ret_below = 0x00E63000
 # Flags (cf..of) em variáveis locais (true) ou na estrutura da CPU (false). Existe para
 # o A/B da fase 0.2 do PLANO_MESTRE_OTIMIZACAO.md: mudar pede relift completo.
 cache_flags = true
+# jmp com alvo constante para outra função vira chamada em posição de cauda (RE5_TAILCALL):
+# a pilha do host não cresce a cada jmp entre funções e as flags morrem no jmp (fase P2/P3).
+tail_calls = true
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"
