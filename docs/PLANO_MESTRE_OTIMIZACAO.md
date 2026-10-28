@@ -328,6 +328,20 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
 > pura: endereço de leitura fixo, sem escrita nem chamada) e `RE5_THREAD_PRIO=1` (honra
 > `SetThreadPriority` do guest na thread do host, só Windows; desligado por padrão).
 
+> **Medidas de 28/10 (benchmark variável, PC de referência, 800×600, sem tocar no jogo; mediana / p10):**
+>
+> | Build | Mediana | p10 |
+> |---|---|---|
+> | `tail_calls` desligado, `RE5_HEAP_NOLOCK=1` (teste do usuário, escolhido) | melhor e mais estável | — |
+> | base limpa (`base-28out-limpo`) | 55,9 | 50,6 |
+> | + override nativo do `sqrtf` `0x00428D60` (`sqrt-ov`) | **60,3** (+8%) | 54,2 |
+> | + PGO `use`, treino em jogo real (`pgo-use`) | 59,5 | 55,2 |
+>
+> Perfil em jogo (`perfil-28out`): código gerado 81,2%, handlers do HLE 6,1% (D3D9 ~5%), runtime 10,9%,
+> espera no lock 1,8%. Duas funções do guest somam 18%: `0x00428D60` (sqrtf, resolvida) e `0x00587840`
+> (2535 bytes, 8,6%). PGO = empate (<2%): fica desligado. Filtrar estado D3D9 não vale (handlers são 6%).
+> Os testes 2–4 do A/B com o usuário jogando não são comparáveis em fps; a escolha foi pela estabilidade.
+
 ### Fase P5 — *Overrides* nativos verificados para funções quentes do guest
 
 - **Evidência:** funções do guest no topo do perfil da 0.3 que sejam **folhas puras** (não
