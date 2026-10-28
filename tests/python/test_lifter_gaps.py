@@ -212,6 +212,32 @@ class LifterGaps(unittest.TestCase):
         self.assertIn("dispatch(c, 0x00002000u);", old)
         self.assertNotIn("dispatch_tail", old)
 
+    def test_elide_flag_stores(self):
+        # elide_flag_stores: em função do jogo, o call e o ret não gravam cf..of; no CRT gravam.
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        lifter = Lifter.__new__(Lifter)
+        lifter.md = md
+        lifter.reloc_vas = set()
+        lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+        lifter.read_va = None
+        lifter.flags_dead_ret_below = 0x00E63000
+        lifter.elide_flag_stores = True
+        code = bytes.fromhex("39d8" "7505" "e8f70f0000" "c3")     # cmp eax,ebx ; jne +5 ; call 0x2000 ; ret
+        c = lifter.lift_function(code, 0x1000)
+        for l in c.splitlines():
+            if "dispatch(" in l or "return;" in l:
+                self.assertNotIn("c->zf = R_zf", l)
+                self.assertNotIn("c->cf = R_cf", l)
+        self.assertIn("c->esp = R_esp", [l for l in c.splitlines() if "dispatch(" in l][0])   # o resto continua gravado
+        lifter.flags_dead_ret_below = 0x00000800                    # função "do CRT": flags continuam gravadas
+        c2 = lifter.lift_function(code, 0x1000)
+        self.assertIn("c->zf = R_zf", [l for l in c2.splitlines() if "dispatch(" in l][0])
+        lifter.flags_dead_ret_below = 0x00E63000
+        lifter.elide_flag_stores = False
+        c3 = lifter.lift_function(code, 0x1000)
+        self.assertIn("c->zf = R_zf", [l for l in c3.splitlines() if "dispatch(" in l][0])
+
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
         # (0x00E64680, std; repne scasb) devolvia NULL e o 0x0072BC80 registrava toda
