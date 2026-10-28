@@ -58,6 +58,11 @@ spin_pause = false
 # call/jmp/ret de função do jogo (abaixo de flags_dead_at_ret_below) deixam de gravar cf..of na CPU:
 # quem retorna e quem é chamado nunca as lê (mesma premissa da análise de flags no ret).
 elide_flag_stores = true
+# Pilha x87 em variáveis locais dentro de cada trecho reto de código (lift32_cpu.x87_cache): o
+# fld/fstp/fmul deixa de passar por c->st[(top+i)&7] na memória. Correto (difftest_func igual ao
+# hardware), mas sem ganho medido em 28/10 (mediana 69,7 -> 67,5, dentro do ruído): os trechos são
+# curtos e o float devolvido por chamada atravessa a fronteira pela memória de qualquer jeito.
+x87_cache = false
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"

@@ -54,7 +54,7 @@ def inputs(rng):
 
 
 def main():
-    entries = [int(a, 16) for a in sys.argv[1:]] or DEFAULT
+    entries = [int(a, 16) for a in sys.argv[1:] if not a.startswith("--")] or DEFAULT
     exe = os.path.join(ROOT, "bin_input", "re5dx9.clean.exe")
     cat = {f["address"]: f for f in json.load(open(os.path.join(ROOT, "work", "catalog.json")))["functions"]
            if f["size"] > 0}
@@ -64,6 +64,13 @@ def main():
     lift32_cpu.IMAGE_BASE = base
     lifter = lift32_cpu.Lifter(exe, pe.OPTIONAL_HEADER.SizeOfImage, lambda va, n: pe.get_data(va - base, n))
     lifter.reloc_vas = set()
+    # As mesmas chaves do lift do jogo (config/re5_config.toml), para testar o C que o jogo roda.
+    import re5common as rc  # noqa: E402
+    lcfg = rc.load_config()["lift"]
+    lifter.flags_dead_ret_below = lcfg.get("flags_dead_at_ret_below")
+    lifter.cache_flags = bool(lcfg.get("cache_flags", True))
+    lifter.elide_flag_stores = bool(lcfg.get("elide_flag_stores", False))
+    lifter.x87_cache = bool(lcfg.get("x87_cache", False)) and "--no-x87-cache" not in sys.argv
 
     # Fecho das chamadas diretas a partir das entradas.
     bodies, todo = {}, list(entries)
