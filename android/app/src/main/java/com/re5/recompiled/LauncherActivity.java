@@ -825,6 +825,20 @@ public final class LauncherActivity extends Activity {
         col.addView(checkHud);
         col.addView(text("Mostra contador de FPS em tempo real e consumo de recursos durante a partida.", 12, TEXT_DIM, false));
 
+        // Divisor
+        col.addView(dialogDivider());
+
+        // --- 4. AVANÇADO: variáveis RE5_* (re5_env.txt, lido pelo runtime) ---
+        col.addView(cardTitle("🔧 Avançado (testes de desempenho)", RED));
+        col.addView(text("Uma variável por linha, ex.: RE5_FPS_LOG=1 ou RE5_CPUS=4. Vai para re5_env.txt na pasta do jogo "
+                + "(PLANO_MESTRE_OTIMIZACAO.md). Deixe vazio no uso normal.", 12, TEXT_DIM, false));
+        File envFile = new File(GameStorage.gameDir(this), "re5_env.txt");
+        EditText editEnv = dialogEditText(readTextFile(envFile));
+        editEnv.setHint("RE5_FPS_LOG=1");
+        editEnv.setSingleLine(false);
+        editEnv.setMinLines(3);
+        col.addView(editEnv);
+
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("Configurações")
                 .setView(scroll)
@@ -839,6 +853,8 @@ public final class LauncherActivity extends Activity {
                     float newSc = scVals[spinScale.getSelectedItemPosition()];
                     boolean newHud = checkHud.isChecked();
 
+                    writeEnvFile(envFile, editEnv.getText().toString());
+
                     prefs.edit()
                             .putBoolean("touch_enabled", newTouch)
                             .putFloat("touch_opacity", newOp)
@@ -850,6 +866,35 @@ public final class LauncherActivity extends Activity {
                 })
                 .setNegativeButton("Cancelar", null)
                 .show();
+    }
+
+    private static String readTextFile(File f) {
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append('
+');
+            return sb.toString().trim();
+        } catch (java.io.IOException e) {
+            return "";
+        }
+    }
+
+    private void writeEnvFile(File f, String text) {
+        String t = text.trim();
+        try {
+            if (t.isEmpty()) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+                return;
+            }
+            try (java.io.FileWriter w = new java.io.FileWriter(f)) {
+                w.write(t + "
+");
+            }
+        } catch (java.io.IOException e) {
+            Toast.makeText(this, "Não consegui gravar re5_env.txt: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     private TextView dialogFieldLabel(String label) {

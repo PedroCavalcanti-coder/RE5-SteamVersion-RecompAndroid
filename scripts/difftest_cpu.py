@@ -345,6 +345,9 @@ def main():
     ap.add_argument("--exe", default=os.path.join(ROOT, "bin_input", "re5dx9.clean.exe"))
     ap.add_argument("--catalog", default=os.path.join(ROOT, "work", "catalog.json"))
     ap.add_argument("--cc", default=os.environ.get("RECOMP_CC", "gcc"))
+    ap.add_argument("--cflags", default="", help="flags extras do compilador do lado C (ex.: -march=armv8.2-a+rcpc)")
+    ap.add_argument("--runner", default="", help="prefixo para executar o harness (ex.: 'qemu-aarch64 -L /usr/aarch64-linux-gnu' "
+                    "ou 'adb shell'); com --cc de um cross-compilador mede o lado ARM64 (PLANO_MESTRE, fase 0.4)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--special", type=float, default=0.25, help="chance de valor especial (NaN, inf, -0...)")
     args = ap.parse_args()
@@ -406,7 +409,9 @@ def main():
     exe = os.path.join(work, "harness.exe")
     # O cpu.h que o jogo usa (scripts/gen_cpu_header.py), do build.
     gen = os.path.join(ROOT, "build", os.environ.get("RE5_BUILD", "test-build"), "gen_include")
-    r = subprocess.run([args.cc, "-O1", "-w", "-fno-strict-aliasing", "-fwrapv", "-I", gen, "-I",
+    # Mesmas flags de semântica do re5_cpu (runtime/CMakeLists.txt), inclusive -ffp-contract=off.
+    r = subprocess.run([args.cc, "-O1", "-w", "-fno-strict-aliasing", "-fwrapv", "-ffp-contract=off",
+                        *args.cflags.split(), "-I", gen, "-I",
                         os.path.join(ROOT, "runtime", "include"), cfile, "-o", exe], capture_output=True, text=True)
     if r.returncode:
         print(r.stderr[:4000])
@@ -415,7 +420,7 @@ def main():
     # Lado C, com recomeço depois de um caso que derruba o processo.
     cres, start = {}, 0
     while start < len(cases):
-        p = subprocess.run([exe, patf, str(start)], capture_output=True, text=True)
+        p = subprocess.run([*args.runner.split(), exe, patf, str(start)], capture_output=True, text=True)
         cur = None
         for line in p.stdout.splitlines():
             if line.startswith("C "):

@@ -29,13 +29,16 @@ add_custom_command(
 # Interface comum ao runtime e ao código gerado: includes e flags que mudam a
 # semântica. -fno-strict-aliasing e -fwrapv porque o código gerado lê os mesmos
 # bytes como tipos diferentes e conta com aritmética de complemento de dois.
+# -ffp-contract=off: o Clang (Android) funde a*b+c em fmadd por padrão e o GCC em modo
+# GNU também (com FMA); o x86 do jogo arredonda a multiplicação e a soma em separado, e
+# o PC e o Android do co-op têm que calcular os mesmos números (PLANO_MESTRE, fase 0.4).
 add_library(re5_cpu INTERFACE)
 add_dependencies(re5_cpu re5_cpu_header)
 target_include_directories(re5_cpu INTERFACE "${RE5_GEN_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/third_party/sse2neon")
 if(MSVC)
     target_compile_options(re5_cpu INTERFACE /utf-8)
 else()
-    target_compile_options(re5_cpu INTERFACE -fno-strict-aliasing -fwrapv)
+    target_compile_options(re5_cpu INTERFACE -fno-strict-aliasing -fwrapv -ffp-contract=off)
 endif()
 
 add_library(re5_runtime STATIC

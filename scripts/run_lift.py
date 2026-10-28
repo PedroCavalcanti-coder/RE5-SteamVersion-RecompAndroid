@@ -320,6 +320,7 @@ def cmd_lift(args, cfg):
 
     lifter = lift32_cpu.Lifter(exe, pe.OPTIONAL_HEADER.SizeOfImage, read_va)
     lifter.flags_dead_ret_below = cfg["lift"].get("flags_dead_at_ret_below")
+    lifter.cache_flags = bool(cfg["lift"].get("cache_flags", True))
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
     lifter.reloc_vas = {(base + e.rva) & 0xFFFFFFFF
                         for br in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", [])
@@ -347,7 +348,10 @@ def cmd_lift(args, cfg):
     # re5_cov: um byte por endereço de código; a função gerada marca o seu na entrada
     # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1). Custo: um store por chamada.
     header = ["/* GERADO por scripts/run_lift.py (pcrecomp lift32_cpu) - não edite. */",
-              "#define RE5_CACHED_REGS 1",
+              "#define RE5_CACHED_REGS 1"] + (
+        [] if lifter.cache_flags else
+        ["/* lift.cache_flags = false: cf..of ficam na CPU (A/B da fase 0.2) */"] +
+        ["#define R_%s c->%s" % (f, f) for f in ("cf", "pf", "af", "zf", "sf", "of")]) + [
               '#include "cpu.h"',
               "extern unsigned char re5_cov[];",
               "#define RE5_COV(va) (re5_cov[(va) - 0x401000u] = 1)", ""]
@@ -370,6 +374,7 @@ def cmd_lift(args, cfg):
                 tool_hash.update(f.read())
     tool_hash.update(rc.sha256_file(exe).encode())
     tool_hash.update(repr(cfg["lift"].get("flags_dead_at_ret_below")).encode())
+    tool_hash.update(repr(lifter.cache_flags).encode())
     file_cache = {}
 
     funcs = [fd for fd in cat["functions"] if fd["size"] > 0]

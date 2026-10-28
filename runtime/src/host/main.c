@@ -43,6 +43,39 @@ static void guest_main(void *p)
     a->ok = 1;
 }
 
+/* re5_env.txt (na pasta do jogo, ou em RE5_ENV_FILE): uma linha CHAVE=VALOR por variável
+ * RE5_*, '#' começa comentário. É como o launcher do Android passa as chaves de
+ * desempenho/diagnóstico ao runtime (PLANO_MESTRE_OTIMIZACAO, fase A0); no PC serve para
+ * fixar uma configuração de teste. Variável já presente no ambiente tem prioridade. */
+static void load_env_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+        char *eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        *eq = 0;
+        char *key = p, *val = eq + 1;
+        for (char *e = eq - 1; e >= key && (*e == ' ' || *e == '\t'); e--) *e = 0;
+        val[strcspn(val, "\r\n")] = 0;
+        if (strncmp(key, "RE5_", 4) && strncmp(key, "DXVK_", 5)) continue;   /* só as chaves do projeto */
+        if (getenv(key)) continue;
+#ifdef _WIN32
+        _putenv_s(key, val);
+#else
+        setenv(key, val, 0);
+#endif
+        n++;
+    }
+    fclose(f);
+    fprintf(stderr, "[host] %s: %d variável(is) de ambiente\n", path, n);
+}
+
 static void usage(void)
 {
     fprintf(stderr, "uso: re5 [--exe PATH] [--game-dir DIR] [--user-dir DIR] [--census [--missing]]\n");
@@ -61,9 +94,6 @@ static int re5_main_entry(int argc, char **argv)
         else { usage(); return 2; }
     }
 
-    SDL_SetMainReady();
-    if (re5_runtime_init() != 0) return 1;
-
     char dir[1024];
     if (!game_dir) {
         snprintf(dir, sizeof dir, "%s", exe);
@@ -71,6 +101,18 @@ static int re5_main_entry(int argc, char **argv)
         if (slash) *slash = 0; else snprintf(dir, sizeof dir, ".");
         game_dir = dir;
     }
+    {
+        char envf[1100];
+        const char *e = getenv("RE5_ENV_FILE");
+        if (e && *e) snprintf(envf, sizeof envf, "%s", e);
+        else snprintf(envf, sizeof envf, "%s/re5_env.txt", game_dir);
+        load_env_file(envf);
+    }
+
+    SDL_SetMainReady();
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
+    if (re5_runtime_init() != 0) return 1;
+
     re5_vfs_init(game_dir, user_dir);
 
     re5_image img;

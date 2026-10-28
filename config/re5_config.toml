@@ -45,6 +45,9 @@ direct_calls = true
 # `ret`. O CRT, daqui para cima, tem rotina que devolve resultado em ZF (0x00E72105,
 # lida com `je` em 0x00E66C5C) e mantém todas vivas. Ausente = todas vivas sempre.
 flags_dead_at_ret_below = 0x00E63000
+# Flags (cf..of) em variáveis locais (true) ou na estrutura da CPU (false). Existe para
+# o A/B da fase 0.2 do PLANO_MESTRE_OTIMIZACAO.md: mudar pede relift completo.
+cache_flags = true
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"
