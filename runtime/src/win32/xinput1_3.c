@@ -41,6 +41,7 @@ static int sdl_ready(void)
     g_ready = -1;
     if (getenv("RE5_HEADLESS")) return 0;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* como o XInput: lê sem foco */
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");          /* não trata acelerômetro do celular como joystick */
     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
         RE5_WARN("xinput", "SDL_InitSubSystem falhou (%s): nenhum controle", SDL_GetError());
         return 0;
@@ -54,6 +55,27 @@ static int slot_of(SDL_JoystickID id)
     for (int i = 0; i < XI_USERS; i++)
         if ((g_pads[i].gc || g_pads[i].js) && g_pads[i].id == id) return i;
     return -1;
+}
+
+static int is_gamepad_candidate(int j)
+{
+    const char *name = SDL_JoystickNameForIndex(j);
+    if (!name) return 0;
+    if (strstr(name, "Accelerometer") || strstr(name, "accelerometer") ||
+        strstr(name, "Sensor") || strstr(name, "sensor")) {
+        return 0;
+    }
+    if (SDL_IsGameController(j)) return 1;
+
+    /* Para joysticks genéricos: exige botões e eixos suficientes para um gamepad */
+    SDL_Joystick *js = SDL_JoystickOpen(j);
+    if (!js) return 0;
+    int nbuttons = SDL_JoystickNumButtons(js);
+    int naxes = SDL_JoystickNumAxes(js);
+    SDL_JoystickClose(js);
+
+    if (nbuttons >= 4 && naxes >= 2) return 1;
+    return 0;
 }
 
 static void scan(void)
@@ -73,6 +95,8 @@ static void scan(void)
         }
     }
     for (int j = 0; j < SDL_NumJoysticks(); j++) {
+        if (!is_gamepad_candidate(j)) continue;
+
         SDL_JoystickID jid = SDL_JoystickGetDeviceInstanceID(j);
         if (slot_of(jid) >= 0) continue;
         int i = 0;
@@ -133,6 +157,19 @@ static void wr16le(uint8_t *p, uint16_t v)
 
 static int16_t flip(int16_t v) { return v == INT16_MIN ? INT16_MAX : (int16_t)-v; }
 
+/* Zona morta e limiar dos gatilhos da documentação do XInput (XINPUT_GAMEPAD_*_DEADZONE,
+ * XINPUT_GAMEPAD_TRIGGER_THRESHOLD). O XInput real devolve o valor cru; aqui o corte é
+ * aplicado na ponte para filtrar o drift dos controles genéricos (Android). */
+#define XI_LEFT_THUMB_DEADZONE  7849
+#define XI_RIGHT_THUMB_DEADZONE 8689
+#define XI_TRIGGER_THRESHOLD    30
+
+static int16_t apply_deadzone(int16_t val, int16_t deadzone)
+{
+    if (val > -deadzone && val < deadzone) return 0;
+    return val;
+}
+
 void re5_xinput_gamepad(const int16_t axis[6], uint32_t buttons, uint8_t out[12])
 {
     /* XINPUT_GAMEPAD_*: o SDL usa a mesma disposição do controle do Xbox. */
@@ -151,12 +188,18 @@ void re5_xinput_gamepad(const int16_t axis[6], uint32_t buttons, uint8_t out[12]
     wr16le(out, b);
     for (int t = 0; t < 2; t++) {   /* gatilhos: 0..32767 -> 0..255 */
         int32_t v = axis[SDL_CONTROLLER_AXIS_TRIGGERLEFT + t];
-        out[2 + t] = (uint8_t)(v <= 0 ? 0 : v * 255 / 32767);
+        uint8_t tv = (uint8_t)(v <= 0 ? 0 : v * 255 / 32767);
+        out[2 + t] = tv < XI_TRIGGER_THRESHOLD ? 0 : tv;
     }
-    wr16le(out + 4, (uint16_t)axis[SDL_CONTROLLER_AXIS_LEFTX]);
-    wr16le(out + 6, (uint16_t)flip(axis[SDL_CONTROLLER_AXIS_LEFTY]));
-    wr16le(out + 8, (uint16_t)axis[SDL_CONTROLLER_AXIS_RIGHTX]);
-    wr16le(out + 10, (uint16_t)flip(axis[SDL_CONTROLLER_AXIS_RIGHTY]));
+    int16_t lx = apply_deadzone(axis[SDL_CONTROLLER_AXIS_LEFTX], XI_LEFT_THUMB_DEADZONE);
+    int16_t ly = apply_deadzone(flip(axis[SDL_CONTROLLER_AXIS_LEFTY]), XI_LEFT_THUMB_DEADZONE);
+    int16_t rx = apply_deadzone(axis[SDL_CONTROLLER_AXIS_RIGHTX], XI_RIGHT_THUMB_DEADZONE);
+    int16_t ry = apply_deadzone(flip(axis[SDL_CONTROLLER_AXIS_RIGHTY]), XI_RIGHT_THUMB_DEADZONE);
+
+    wr16le(out + 4, (uint16_t)lx);
+    wr16le(out + 6, (uint16_t)ly);
+    wr16le(out + 8, (uint16_t)rx);
+    wr16le(out + 10, (uint16_t)ry);
 }
 
 static void x_GetState(CPU *c)
