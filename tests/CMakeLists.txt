@@ -1,6 +1,6 @@
 # tests/ — unitários do runtime, ponta a ponta com PE sintético e testes Python do pipeline.
 
-foreach(t guest_memory handle_table dispatch user32 xinput ws2_32 dsound x87)
+foreach(t guest_memory handle_table dispatch user32 xinput ws2_32 dsound x87 heap_mt)
     add_executable(test_${t} unit/test_${t}.c)
     target_link_libraries(test_${t} PRIVATE re5_runtime)
     add_test(NAME ${t} COMMAND test_${t})

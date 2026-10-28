@@ -22,9 +22,18 @@ static void return_to_host(CPU *c)
                        "ou um `ret` sem chamada correspondente", c->esp);
 }
 
+static uint32_t g_nolock_mask;   /* RE5_THUNK_NOLOCK_* ligados por RE5_*_NOLOCK */
+
+static int env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
+}
+
 int re5_thunks_init(void)
 {
     if (g_thunks) return 0;
+    if (env_on("RE5_HEAP_NOLOCK")) g_nolock_mask |= RE5_THUNK_NOLOCK_HEAP;
     re5_mutex_init(&g_mu);
     g_thunks = calloc(RE5_THUNK_MAX, sizeof *g_thunks);
     if (!g_thunks) return -1;
@@ -87,7 +96,7 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
             if (m && !strncmp(m + 2, "Draw", 4)) RE5_STAT_ADD(re5_stat_draws, 1);
         }
     }
-    int lk = re5_guest_lock_mode_hle() && !(t->flags & RE5_THUNK_NOLOCK);
+    int lk = re5_guest_lock_mode_hle() && !(t->flags & (RE5_THUNK_NOLOCK | g_nolock_mask));
     if (lk) re5_guest_lock();
     t->fn(c);
     if (lk) re5_guest_unlock();
