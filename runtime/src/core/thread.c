@@ -373,6 +373,100 @@ void re5_thread_apply_priority(uint32_t tid, int prio)
 #endif
 }
 
+#if defined(RE5_HOST_WINDOWS)
+#include <tlhelp32.h>
+typedef LONG (NTAPI *nt_query_thread_fn)(HANDLE, int, PVOID, ULONG, PULONG);
+typedef HRESULT (WINAPI *get_thread_desc_fn)(HANDLE, PWSTR *);
+
+static uint64_t ft_100ns(FILETIME f) { return ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime; }
+
+/* RE5_FPS_LOG: no ExitProcess, o tempo de CPU de TODAS as threads do processo (inclusive as da
+ * DXVK e do driver, que o RE5_PROFILE não amostra), por módulo da função inicial da thread. */
+void re5_log_process_cpu(void)
+{
+    if (!re5_stats_on) return;
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    nt_query_thread_fn query = nt ? (nt_query_thread_fn)(void *)GetProcAddress(nt, "NtQueryInformationThread") : NULL;
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    get_thread_desc_fn desc = k32 ? (get_thread_desc_fn)(void *)GetProcAddress(k32, "GetThreadDescription") : NULL;
+    FILETIME cr, ex, kn, us;
+    if (!GetProcessTimes(GetCurrentProcess(), &cr, &ex, &kn, &us)) return;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    double wall = (double)(ft_100ns(now) - ft_100ns(cr)) / 1e7;
+    double total = (double)(ft_100ns(kn) + ft_100ns(us)) / 1e7;
+    RE5_INFO("cpu", "processo: %.1f s de parede, %.1f s de CPU em todas as threads (%.2f núcleos em média)", wall, total,
+             wall > 0 ? total / wall : 0.0);
+    static uint32_t prev_tid[256];
+    static double prev_sec[256], prev_wall_t;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    struct row { double sec; char mod[40]; char name[48]; DWORD tid; } rows[256];
+    struct { char mod[40]; double sec; } mods[16];
+    int nr = 0, nm = 0;
+    THREADENTRY32 te = {sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || nr >= 256) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        FILETIME tc, te2, tk, tu;
+        if (GetThreadTimes(h, &tc, &te2, &tk, &tu)) {
+            struct row *r = &rows[nr++];
+            r->sec = (double)(ft_100ns(tk) + ft_100ns(tu)) / 1e7;
+            r->tid = te.th32ThreadID;
+            snprintf(r->mod, sizeof r->mod, "?");
+            r->name[0] = 0;
+            PVOID start = NULL;
+            if (query && query(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof start, NULL) == 0 && start) {
+                HMODULE m = NULL;
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCSTR)start, &m) && m) {
+                    char path[MAX_PATH] = "?";
+                    GetModuleFileNameA(m, path, sizeof path);
+                    const char *b = strrchr(path, '\\');
+                    snprintf(r->mod, sizeof r->mod, "%s", b ? b + 1 : path);
+                }
+            }
+            PWSTR w = NULL;
+            if (desc && SUCCEEDED(desc(h, &w)) && w) {
+                WideCharToMultiByte(CP_UTF8, 0, w, -1, r->name, sizeof r->name, NULL, NULL);
+                LocalFree(w);
+            }
+            int k = 0;
+            while (k < nm && strcmp(mods[k].mod, r->mod)) k++;
+            if (k == nm && nm < 16) { snprintf(mods[nm].mod, sizeof mods[nm].mod, "%s", r->mod); mods[nm++].sec = 0; }
+            if (k < nm) mods[k].sec += r->sec;
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    for (int i = 0; i < nm; i++)
+        RE5_INFO("cpu", "por módulo da thread: %-28s %7.1f s  (%4.1f%% da CPU do processo)", mods[i].mod, mods[i].sec,
+                 total > 0 ? 100.0 * mods[i].sec / total : 0.0);
+    /* Uso no intervalo desde a chamada anterior (% de um núcleo): quem está saturado e quem espera. */
+    double dt = wall - prev_wall_t;
+    for (int k = 0; k < 16; k++) {
+        int bi = -1;
+        for (int i = 0; i < nr; i++) if (rows[i].sec > 0 && (bi < 0 || rows[i].sec > rows[bi].sec)) bi = i;
+        if (bi < 0 || rows[bi].sec < 0.05) break;
+        double before = 0;
+        for (int j = 0; j < 256; j++) if (prev_tid[j] == rows[bi].tid) before = prev_sec[j];
+        double util = dt > 0.5 ? 100.0 * (rows[bi].sec - before) / dt : -1.0;
+        if (util < 0)
+            RE5_INFO("cpu", "  thread %5lu  %7.1f s total  %-24s %s", (unsigned long)rows[bi].tid, rows[bi].sec, rows[bi].mod,
+                     rows[bi].name);
+        else
+            RE5_INFO("cpu", "  thread %5lu  %7.1f s total, %5.1f%% de um núcleo agora  %-24s %s", (unsigned long)rows[bi].tid,
+                     rows[bi].sec, util, rows[bi].mod, rows[bi].name);
+        rows[bi].sec = -rows[bi].sec;   /* marca como impressa; salvo abaixo */
+    }
+    for (int i = 0; i < nr && i < 256; i++) { prev_tid[i] = rows[i].tid; prev_sec[i] = rows[i].sec < 0 ? -rows[i].sec : rows[i].sec; }
+    prev_wall_t = wall;
+}
+#else
+void re5_log_process_cpu(void) {}
+#endif
+
 void re5_thread_set_lock_wait_pump(void (*fn)(void)) { t_pump = fn; }
 int re5_thread_has_pump(void) { return t_pump != NULL; }
 void re5_thread_pump(void)

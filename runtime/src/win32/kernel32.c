@@ -133,6 +133,7 @@ static void k_ExitProcess(CPU *c)
     uint32_t ret = rd32(c->esp);
     const char *nm = re5_name_lookup(ret);
     RE5_INFO("kernel32", "ExitProcess(%u) chamado de 0x%08X%s%s", code, ret, nm ? " " : "", nm ? nm : "");
+    re5_log_process_cpu();
     re5_dispatch_trail_print();
     fflush(NULL);
     exit((int)code);

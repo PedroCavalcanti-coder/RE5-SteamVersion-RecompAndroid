@@ -105,6 +105,9 @@ void re5_thread_set_lock_wait_pump(void (*fn)(void));
 /* SetThreadPriority do guest na thread do host que tem esse TID (RE5_THREAD_PRIO=1, Windows). */
 void re5_thread_apply_priority(uint32_t tid, int prio);
 
+/* RE5_FPS_LOG: CPU de todas as threads do processo, no ExitProcess (Windows). */
+void re5_log_process_cpu(void);
+
 /* O mesmo bombeamento para as esperas do HLE (WaitFor*, Sleep, seção crítica
  * ocupada) na thread dona da janela: 1 se esta thread tem um; re5_thread_pump
  * o chama (sem o lock do guest e sem locks do HLE). */
