@@ -652,6 +652,39 @@ static uint32_t g_pw_hits[PROF_THUNKS], g_ph_hits[PROF_THUNKS];
 static uintptr_t g_po_rip[PROF_OTHER];
 static uint32_t g_po_hits[PROF_OTHER];
 
+/* RE5_PROFILE_RIPS=<arquivo>: cada endereço exato do host amostrado no código gerado, para o
+ * scripts/prof_lines.py levar até a linha do C gerado e à instrução x86 de origem. */
+#define PROF_RIPS 262144
+static uintptr_t g_pr_rip[PROF_RIPS];
+static uint32_t g_pr_hits[PROF_RIPS];
+
+static void pr_hit(uintptr_t rip)
+{
+    uint32_t h = (uint32_t)((rip * 0x9E3779B97F4A7C15ull) >> 46) % PROF_RIPS;
+    for (uint32_t i = 0; i < 256; i++, h = (h + 1) % PROF_RIPS) {
+        if (g_pr_rip[h] == rip || !g_pr_rip[h]) {
+            g_pr_rip[h] = rip;
+            g_pr_hits[h]++;
+            return;
+        }
+    }
+}
+
+static void pr_dump(void)
+{
+    const char *path = getenv("RE5_PROFILE_RIPS");
+    if (!path || !*path) return;
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    uintptr_t mod = (uintptr_t)GetModuleHandleA(NULL);
+    for (uint32_t i = 0; i < PROF_RIPS; i++)
+        if (g_pr_hits[i] && g_pr_rip[i] >= mod)
+            fprintf(f, "0x%llx %u\n", (unsigned long long)(g_pr_rip[i] - mod + 0x140000000ull), g_pr_hits[i]);
+    fclose(f);
+    memset(g_pr_rip, 0, sizeof g_pr_rip);
+    memset(g_pr_hits, 0, sizeof g_pr_hits);
+}
+
 static void po_hit(uintptr_t rip)
 {
     rip &= ~(uintptr_t)15;
@@ -765,6 +798,7 @@ static void prof_report(uint64_t total, uint64_t gen, uint64_t host, uint64_t ot
     }
     tab_report("esperando para entrar em", g_pw_name, g_pw_hits, total, 10);
     tab_report("enquanto o lock está com", g_ph_name, g_ph_hits, total, 10);
+    pr_dump();
     memset(g_po_rip, 0, sizeof g_po_rip);
     memset(g_po_hits, 0, sizeof g_po_hits);
     memset(g_pf_hits, 0, g_npf * sizeof *g_pf_hits);
@@ -821,6 +855,7 @@ static void profile_main(void *arg)
             } else if (f >= 0) {
                 gen++;
                 g_pf_hits[f]++;
+                pr_hit((uintptr_t)ctx.Rip);
             } else {
                 other++;
                 po_hit((uintptr_t)ctx.Rip);
