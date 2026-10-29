@@ -408,7 +408,7 @@ def main():
     open(cfile, "w").write("\n".join(src))
     exe = os.path.join(work, "harness.exe")
     # O cpu.h que o jogo usa (scripts/gen_cpu_header.py), do build.
-    gen = os.path.join(ROOT, "build", os.environ.get("RE5_BUILD", "test-build"), "gen_include")
+    gen = os.path.join(ROOT, "build", os.environ.get("RE5_BUILD", "windows-x64"), "gen_include")
     # Mesmas flags de semântica do re5_cpu (runtime/CMakeLists.txt), inclusive -ffp-contract=off.
     r = subprocess.run([args.cc, "-O1", "-w", "-fno-strict-aliasing", "-fwrapv", "-ffp-contract=off",
                         *args.cflags.split(), "-I", gen, "-I",

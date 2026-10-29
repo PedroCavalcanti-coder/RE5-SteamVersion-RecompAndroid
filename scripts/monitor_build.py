@@ -10,7 +10,7 @@ import os
 import time
 
 SRC_DIR = os.path.join("generated", "src")
-OBJ_DIR = os.path.join("build", "test-build", "generated", "CMakeFiles", "re5_generated.dir", "src")
+OBJ_DIR = os.path.join("build", "windows-x64", "generated", "CMakeFiles", "re5_generated.dir", "src")
 
 
 def main():

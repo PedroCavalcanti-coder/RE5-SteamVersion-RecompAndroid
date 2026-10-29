@@ -11,7 +11,7 @@ import sys
 import time
 
 def main():
-    exe_path = sys.argv[1] if len(sys.argv) > 1 else 'build/test-build/tests/test_steam_lan.exe'
+    exe_path = sys.argv[1] if len(sys.argv) > 1 else 'build/windows-x64/tests/test_steam_lan.exe'
     if not os.path.isfile(exe_path):
         print(f"Executável não encontrado: {exe_path}")
         return 1

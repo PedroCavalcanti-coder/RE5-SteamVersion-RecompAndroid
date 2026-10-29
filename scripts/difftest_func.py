@@ -163,7 +163,7 @@ int main(int argc, char **argv)
 """ % (len(img), STACK_HI, SENTINEL))
     cfile = os.path.join(work, "h.c")
     open(cfile, "w").write("\n".join(src))
-    gen = os.path.join(ROOT, "build", os.environ.get("RE5_BUILD", "test-build"), "gen_include")
+    gen = os.path.join(ROOT, "build", os.environ.get("RE5_BUILD", "windows-x64"), "gen_include")
     hexe = os.path.join(work, "h.exe")
     r = subprocess.run([os.environ.get("RECOMP_CC", "gcc"), "-O1", "-w", "-fno-strict-aliasing", "-fwrapv", "-I", gen,
                         "-I", os.path.join(ROOT, "runtime", "include"), cfile, "-o", hexe],

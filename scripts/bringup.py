@@ -4,7 +4,7 @@ semeia o catálogo com ele, refaz o lift (só as janelas afetadas) e o build, e
 roda de novo. Para no primeiro erro que não é de catálogo (import sem HLE,
 instrução sem tradução, crash) e mostra o fim do log.
 
-    bringup.py [--build-dir build/test-build] [--game-dir DIR] [--max-rounds 50]
+    bringup.py [--build-dir build/windows-x64] [--game-dir DIR] [--max-rounds 50]
 
 Cada volta deixa o log em work/bringup/run_NNN.log. As sementes acumulam em
 work/runtime_seeds.txt (o mesmo arquivo serve para um `catalog --seeds` completo
@@ -38,7 +38,7 @@ def seed_count(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--build-dir", default=rc.repo_path("build/test-build"))
+    ap.add_argument("--build-dir", default=rc.repo_path("build/windows-x64"))
     ap.add_argument("--game-dir", default=DEFAULT_GAME)
     ap.add_argument("--exe", default=rc.repo_path(rc.load_config()["input"]["clean"]))
     ap.add_argument("--max-rounds", type=int, default=50)

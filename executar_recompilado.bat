@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 rem Dados do jogo (nativePC_MT), fora do git.
 set "GAME_DIR=%~dp0bin_input\game"
-set "RECOMP_EXE=build\test-build\re5.exe"
+set "RECOMP_EXE=build\windows-x64\re5.exe"
 
 rem Log completo (stderr + arquivo) e enderecos que o catalogo nao achou (etapa 2.6).
 rem Para ver cada import chamado: set RE5_LOG=trace
@@ -13,7 +13,7 @@ set "RE5_LOG_FILE=%~dp0work\re5_run.log"
 set "RE5_SEED_LOG=%~dp0work\runtime_seeds.txt"
 if not exist "%~dp0work" mkdir "%~dp0work"
 rem Threads: o codigo do jogo roda em paralelo (lock so nos imports, modo hle) e o
-rem jogo ve os nucleos do host menos um (ate 8, o limite da MT Framework). Para
+rem jogo ve todos os processadores logicos do host (ate 32). Para
 rem rodar uma thread do jogo por vez (diagnostico, bem mais lento), tire o "rem":
 rem set "RE5_GUEST_LOCK=global"
 rem Forcar um numero de nucleos para o jogo (1..32). Num APU de 15 W (CPU e GPU
@@ -43,7 +43,7 @@ rem         com a memoria antes e depois, em work\dump\capture_N_* (para o snap_
 rem         Teste da escada: segure "para frente" encostado no degrau e aperte F11.
 rem set "RE5_CAPTURE=00B72FA0"
 rem set "RE5_CAPTURE_N=2"
-rem Video: Vulkan pela DXVK mais nova que a GPU aceita (build\test-build\dxvk\3.1.1
+rem Video: Vulkan pela DXVK mais nova que a GPU aceita (build\windows-x64\dxvk\3.1.1
 rem ou 2.6.2; o log diz qual). Forcar uma: set "RE5_DXVK=2.6.2"
 rem Sem Vulkan (Direct3D do sistema): set "RE5_D3D9_DLL=d3d9.dll"
 rem HUD da DXVK: fps, GPU/driver/versao do Vulkan e versao da DXVK (tire a linha para esconder)

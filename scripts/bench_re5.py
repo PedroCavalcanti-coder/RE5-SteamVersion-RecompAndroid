@@ -26,7 +26,7 @@ def main():
     ap.add_argument("--label", default="base")
     ap.add_argument("--secs", type=float, default=420)
     ap.add_argument("--env", nargs="*", default=[])
-    ap.add_argument("--re5", default=os.path.join(ROOT, "build", "test-build", "re5.exe"), help="executável a medir")
+    ap.add_argument("--re5", default=os.path.join(ROOT, "build", "windows-x64", "re5.exe"), help="executável a medir")
     ap.add_argument("--game-dir", default=os.path.join(ROOT, "bin_input", "game"))
     args = ap.parse_args()
     out = os.path.join(ROOT, "work", "bench", args.label)

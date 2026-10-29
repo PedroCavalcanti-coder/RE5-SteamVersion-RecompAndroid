@@ -4,7 +4,7 @@ cd /d "%~dp0"
 title re5-recompiled - Compilacao completa (lift + build + testes)
 
 rem Lifting (incremental: so as janelas que mudaram, p.ex. pelos tracepoints),
-rem compilacao do build\test-build e testes. O resultado de cada etapa vai para
+rem compilacao do build\windows-x64 (preset windows-x64, o build otimizado) e testes. O resultado de cada etapa vai para
 rem work\compilar_tudo.status (lido por quem esperava a compilacao terminar).
 if not exist "%~dp0work" mkdir "%~dp0work"
 set "STATUS=%~dp0work\compilar_tudo.status"
@@ -24,9 +24,11 @@ if not exist "generated\src\re5_dispatch_table.c" (
 
 echo.
 echo ======================================================================
-echo   2/3  Compilacao (build\test-build)
+echo   2/3  Compilacao (build\windows-x64)
 echo ======================================================================
-cmake --build build\test-build -j 16
+if not exist "build\windows-x64uild.ninja" cmake --preset windows-x64
+rem -j 6: com 16 o compilador as vezes falha por falta de memoria (o arquivo compila sozinho)
+cmake --build build\windows-x64 -j 6 || cmake --build build\windows-x64 -j 4
 if errorlevel 1 (
     echo falhou: build> "%STATUS%"
     goto fim
@@ -36,7 +38,7 @@ echo.
 echo ======================================================================
 echo   3/3  Testes (ctest; o difftest_cpu longo fica de fora)
 echo ======================================================================
-ctest --test-dir build\test-build --output-on-failure -E difftest_cpu
+ctest --test-dir build\windows-x64 --output-on-failure -E difftest_cpu
 if errorlevel 1 (
     echo falhou: ctest> "%STATUS%"
     goto fim
