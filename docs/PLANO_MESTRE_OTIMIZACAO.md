@@ -357,6 +357,18 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
 - **Fora da regra:** qualquer coisa da colisão de escada enquanto aquele bug estiver aberto.
 - **Risco:** médio (por função). **Esforço:** por função.
 
+> **P5, 28/10 (sem medida de fps ainda; o usuário testa):** das 3 funções do topo do
+> `config/hot_functions.txt`, duas são folhas e viraram override:
+> - `0x006702B0` (6,6%): decodificador IMA ADPCM do áudio;
+> - `0x00CD5FB0` (3,8%): propagação de posição, cor e alfa pela cadeia de pais.
+>
+> As duas passam no `scripts/difftest_override.py` (novo, no ctest), 1500/1500 casos iguais ao
+> Unicorn. A comparação cobre registradores e memória, inclusive a pilha abaixo do esp. Uma
+> mutação proposital é pega.
+>
+> `0x00587840` (3,7%) ficou de fora: são 2,5 KB de SSE já vetorizado no lift, com 8 chamadas ao
+> `sqrtf` e comparações x87, então reescrever à mão traz risco alto e ganho incerto.
+
 ### Fase P6 — Gráficos no PC (DXVK)
 
 - **Evidência:** a fatia da DXVK e do driver no perfil da 0.3, e o `DXVK_HUD=fps,frametimes,

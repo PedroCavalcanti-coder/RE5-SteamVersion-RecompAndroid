@@ -28,9 +28,151 @@ void re5_ov_00428D60(CPU *c)
     c->esp += 4u;
 }
 
+/* IMA ADPCM do jogo: um passo. `x` é o índice novo sem limite; o retorno é o x86 ao pé da letra:
+ * a = x < 0 ? 0 : x (not/sar/and), depois a + min(0, 0x58 - a) (sub/sar/and/add) = min(a, 88). */
+static inline uint32_t adpcm_clamp(uint32_t x)
+{
+    uint32_t a = (uint32_t)((int32_t)~x >> 31) & x;
+    uint32_t d = 0x58u - a;
+    return a + ((uint32_t)((int32_t)d >> 31) & d);
+}
+
+/* Preditor += (2n - 15) * passo[idx] (lea + imul, 32 bits com volta); idx = limite(tab[n] + idx). */
+#define ADPCM_STEP(nib)                                                                    \
+    do {                                                                                   \
+        pred += (2u * (nib) - 15u) * rd32(step + idx * 4u);                                \
+        idx = adpcm_clamp(rd32(itab + (nib) * 4u) + idx);                                  \
+    } while (0)
+
+/* Decodificador IMA ADPCM (4 bits -> amostra de 32 bits) do áudio do jogo, fase P5: 6,6% das
+ * amostras do perfil em jogo. Convenção própria (LTCG): eax = número de amostras, ecx = objeto
+ * cujo [ecx] é o destino, [esp+4] = bytes de entrada, [esp+8] = estado {+0 preditor, +0x18
+ * índice, +0x30 byte guardado, +0x34 meio byte pendente}; `ret` sem limpar argumentos.
+ *
+ * Reproduz tudo o que o original deixa visível: as gravações da pilha (pushes, a contagem
+ * gravada por cima do 1º argumento, o contador do laço no lugar do ecx salvo), o estado e os
+ * registradores de volta (eax, ecx, edx; ebx/ebp/esi/edi restaurados). Inclusive a saída
+ * antecipada que não grava preditor/índice no estado e devolve edx = estado. Flags: o lift não
+ * as devolve (mortas no `ret`), e aqui também não. Validado por scripts/difftest_override.py. */
+void re5_ov_006702B0(CPU *c)
+{
+    const uint32_t S = c->esp, step = GVA(0x0109AAC0u), itab = GVA(0x0109AA80u);
+    const uint32_t in0 = rd32(S + 4u), st = rd32(S + 8u), ecx0 = c->ecx;
+    uint32_t n = c->eax, in = in0, out = rd32(ecx0);
+    uint32_t pred = rd32(st), idx = rd32(st + 0x18u);
+
+    wr32(S - 4u, ecx0);
+    wr32(S - 8u, c->ebx);
+    wr32(S - 12u, c->ebp);
+    wr32(S - 16u, c->esi);
+    wr32(S - 20u, c->edi);
+    wr32(S + 4u, n);
+    if (rd32(st + 0x34u) != 0) {
+        uint32_t lo = rd32(st + 0x30u) & 0xFu;
+        ADPCM_STEP(lo);
+        wr32(out, pred);
+        out += 4u;
+        n -= 1u;
+        wr32(S + 4u, n);
+        if (n == 0) {
+            wr32(st + 0x34u, 0);
+            c->eax = idx;
+            c->ecx = ecx0;
+            c->edx = st;
+            c->esp = S + 4u;
+            return;
+        }
+    }
+    uint32_t pairs = n >> 1;
+    uint32_t ecx_ret = ecx0;
+    if (pairs) {
+        for (uint32_t k = pairs; k; k--) {
+            uint32_t b = rd8(in);
+            ADPCM_STEP(b >> 4);
+            wr32(out, pred);
+            ADPCM_STEP(b & 0xFu);
+            wr32(out + 4u, pred);
+            out += 8u;
+            in += 1u;
+        }
+        wr32(S - 4u, 0);      /* o contador do laço, no lugar do ecx salvo, termina em 0 */
+        ecx_ret = 0;
+    }
+    if (n & 1u) {
+        uint32_t b = rd8(in);
+        ADPCM_STEP(b >> 4);
+        wr32(out, pred);
+        wr32(st + 0x30u, b);
+        wr32(st + 0x34u, 1);
+    } else {
+        wr32(st + 0x34u, 0);
+    }
+    wr32(st, pred);
+    wr32(st + 0x18u, idx);
+    c->eax = idx;
+    c->ecx = ecx_ret;
+    c->edx = pred;
+    c->esp = S + 4u;
+}
+#undef ADPCM_STEP
+
+/* Propaga posição e cor pela cadeia de pais (+0x144) de um nó, da raiz para baixo, fase P5:
+ * 3,8% das amostras do perfil em jogo, quase tudo ponteiro seguido pelo lift. Em cada filho:
+ * +0x190 e +0x194 = pai.+0x190 + +0x3c; bytes +0x198..0x19a = +0x34; +0x19b = alfa do pai *
+ * alfa (+0x37) / 255 pela multiplicação mágica do MSVC. A cadeia vai para o vetor de 0x100
+ * bytes na pilha do guest como no original (inclusive o estouro além de 64 nós), e a ordem das
+ * leituras e escritas é a mesma, para valer até com nós que se sobrepõem. */
+void re5_ov_00CD5FB0(CPU *c)
+{
+    const uint32_t S = c->esp, arr = S - 0x100u;
+    uint32_t node = c->ecx, i = 0;
+
+    wr32(S - 0x104u, c->esi);
+    do {
+        wr32(arr + i * 4u, node);
+        node = rd32(node + 0x144u);
+        i++;
+    } while (node);
+    uint32_t root = rd32(arr + (i - 1u) * 4u);
+    uint32_t v = rd32(root + 0x3cu);
+    wr32(root + 0x190u, v);
+    wr32(root + 0x194u, v);
+    v = rd32(root + 0x34u);
+    wr32(root + 0x198u, v);
+    int32_t k = (int32_t)(i - 2u);
+    if (k < 0) {
+        c->eax = root;
+        c->ecx = v;
+        c->esp = S + 4u;
+        return;
+    }
+    wr32(S - 0x108u, c->edi);
+    uint32_t eax = 0, edx = 0, n = 0;
+    for (; k >= 0; k--) {
+        n = rd32(arr + (uint32_t)k * 4u);
+        uint32_t p = rd32(n + 0x144u), e = rd32(n + 0x3cu);
+        wr32(n + 0x190u, rd32(p + 0x190u) + e);
+        wr32(n + 0x194u, rd32(p + 0x190u) + e);
+        uint32_t col = rd32(n + 0x34u);
+        wr8(n + 0x19au, (uint8_t)(col >> 16));
+        wr8(n + 0x199u, (uint8_t)(col >> 8));
+        wr8(n + 0x198u, (uint8_t)col);
+        uint64_t prod = 0x80808081ull * (uint32_t)(rd8(p + 0x19bu) * (col >> 24));
+        eax = (uint32_t)prod;
+        edx = (uint32_t)(prod >> 32) >> 7;
+        wr8(n + 0x19bu, (uint8_t)edx);
+    }
+    c->eax = eax;
+    c->ecx = n;
+    c->edx = edx;
+    c->esp = S + 4u;
+}
+
 static const re5_override_def k_overrides[] = {
     {0x00426230u, re5_ov_00426230, "HasCPUID: teste de EFLAGS.ID via pushfd/popfd -> sempre 1"},
     {0x00428D60u, re5_ov_00428D60, "sqrtf: fld dword [ebp+8]; fsqrt - folha pura, 9,7% das amostras em jogo"},
+    {0x006702B0u, re5_ov_006702B0, "IMA ADPCM do áudio - folha pura, 6,6% das amostras em jogo"},
+    {0x00CD5FB0u, re5_ov_00CD5FB0, "cadeia de pais (posição/cor/alfa) - folha pura, 3,8% das amostras em jogo"},
     {0, NULL, NULL},
 };
 

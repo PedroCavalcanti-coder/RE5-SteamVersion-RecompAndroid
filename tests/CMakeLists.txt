@@ -120,6 +120,12 @@ add_test(NAME difftest_cpu
          COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/difftest_cpu.py" --per-group 1 --seeds 2)
 set_tests_properties(difftest_cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200
                      ENVIRONMENT "RE5_BUILD=${CMAKE_BINARY_DIR};RECOMP_CC=${CMAKE_C_COMPILER}")
+# Overrides que mexem em memória (fase P5) contra a função original no Unicorn
+# (scripts/difftest_override.py; pula com 77 sem o binário ou sem unicorn).
+add_test(NAME difftest_override
+         COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/difftest_override.py" --cases 1000)
+set_tests_properties(difftest_override PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+                     ENVIRONMENT "RE5_BUILD=${CMAKE_BINARY_DIR};RECOMP_CC=${CMAKE_C_COMPILER}")
 add_test(NAME python_pipeline
          COMMAND Python3::Interpreter -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/python" -v)
 set_tests_properties(python_pipeline PROPERTIES ENVIRONMENT "RE5_TEST_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}")
