@@ -74,6 +74,14 @@ if(NOT MSVC)
     endif()
 endif()
 
+# Cobertura de funções (RE5_COV, teclas F8/F9 com RE5_COV=1): uma leitura numa tabela de 11 MB a
+# cada chamada de função gerada, 5,8% do tempo do código gerado (perfil por linha, 28/10). Só para
+# depuração; vale para o runtime e o código gerado (interface do re5_cpu).
+option(RE5_COVERAGE "Código gerado marca a cobertura de funções (RE5_COV)" OFF)
+if(RE5_COVERAGE)
+    target_compile_definitions(re5_cpu INTERFACE RE5_COVERAGE=1)
+endif()
+
 add_library(re5_runtime STATIC
     src/core/cpu_ext.c
     src/core/crash.c

@@ -23,9 +23,9 @@
 #include "re5/trace_packet.h"
 
 /* Cobertura de funções: re5_cov[va - 0x401000] = 1 quando a função gerada de entrada `va` roda
- * (o run_lift.py emite o store). Com RE5_COV=1: F8 zera, F9 grava o que rodou desde o F8 em
- * <RE5_COV_DIR ou work/cov>/cov_<n>.txt ("VA nome" por linha). Comparar um arquivo "parado" com
- * um "quebrando a caixa" mostra só o código daquela ação. */
+ * (o run_lift.py emite o store, só num build com -DRE5_COVERAGE=ON). Com RE5_COV=1: F8 zera, F9
+ * grava o que rodou desde o F8 em <RE5_COV_DIR ou work/cov>/cov_<n>.txt ("VA nome" por linha).
+ * Comparar um arquivo "parado" com um "quebrando a caixa" mostra só o código daquela ação. */
 #define RE5_COV_SIZE 0xB4A000u
 unsigned char re5_cov[RE5_COV_SIZE];
 
@@ -35,6 +35,11 @@ void re5_cov_key(int fkey)
     if (enabled < 0) {
         const char *e = getenv("RE5_COV");
         enabled = e && *e && *e != '0';
+#ifndef RE5_COVERAGE
+        if (enabled)
+            RE5_WARN("cov", "RE5_COV=1, mas o código gerado foi compilado sem cobertura: refaça o build com "
+                            "-DRE5_COVERAGE=ON (o F9 vai gravar um arquivo vazio)");
+#endif
     }
     if (!enabled) return;
     if (fkey == 8) {

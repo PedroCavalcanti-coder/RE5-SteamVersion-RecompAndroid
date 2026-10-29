@@ -362,6 +362,17 @@ def cmd_lift(args, cfg):
     # Pontos de rastreio (config/tracepoints.txt): a função vira um invólucro que
     # avisa o runtime na entrada e na saída (RE5_TRACE liga a impressão).
     traced = read_va_list(os.path.join(rc.CONFIG_DIR, "tracepoints.txt"))
+    # Funções quentes (config/hot_functions.txt, do perfil em jogo: scripts/prof_lines.py
+    # --write-hot): cada uma vai para a seção .text$hNNNN, NNNN = posição no perfil. O ld do
+    # MinGW junta as .text$* em ordem alfabética depois do .text, então o código quente fica
+    # contíguo (e o mais quente primeiro) em vez de espalhado pelos ~112 MB de código gerado.
+    hot_rank = {}
+    hot_path = os.path.join(rc.CONFIG_DIR, "hot_functions.txt")
+    if os.path.exists(hot_path):
+        for line in open(hot_path, encoding="utf-8"):
+            p = line.split("#", 1)[0].split()
+            if p and p[0].startswith("0x"):
+                hot_rank.setdefault(int(p[0], 16), len(hot_rank))
 
     os.makedirs(outdir, exist_ok=True)
     stale = {fn for fn in os.listdir(outdir) if fn.startswith(prefix + "_") and fn.endswith((".c", ".h"))}
@@ -377,7 +388,9 @@ def cmd_lift(args, cfg):
     failures = []
     lifted = []
     # re5_cov: um byte por endereço de código; a função gerada marca o seu na entrada
-    # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1). Só grava quando o byte ainda é 0:
+    # (runtime/src/core/trace.c, teclas F8/F9 com RE5_COV=1), só num build com -DRE5_COVERAGE=ON:
+    # a leitura da tabela de 11 MB a cada chamada era 5,8% do tempo do código gerado (perfil por
+    # linha, 28/10). Com a cobertura ligada, só grava quando o byte ainda é 0:
     # o store incondicional fazia as 8 threads do jogo disputarem as mesmas linhas de cache
     # a cada chamada de função (falso compartilhamento); a leitura deixa a linha compartilhada.
     header = ["/* GERADO por scripts/run_lift.py (pcrecomp lift32_cpu) - não edite. */",
@@ -387,8 +400,12 @@ def cmd_lift(args, cfg):
         ["#define R_%s c->%s" % (f, f) for f in ("cf", "pf", "af", "zf", "sf", "of")]) + [
               '#include "cpu.h"',
               "extern unsigned char re5_cov[];",
+              "#ifdef RE5_COVERAGE",
               "#define RE5_COV(va) do { unsigned char *_cv = &re5_cov[(va) - 0x401000u]; "
-              "if (__builtin_expect(!*_cv, 0)) *_cv = 1; } while (0)", ""]
+              "if (__builtin_expect(!*_cv, 0)) *_cv = 1; } while (0)",
+              "#else",
+              "#define RE5_COV(va) ((void)0)",
+              "#endif", ""]
 
     # Cache por arquivo: o C de uma função só depende dos bytes dela, do VA, do
     # tamanho e do lifter. Se nada disso mudou numa janela e o arquivo existe,
@@ -451,7 +468,7 @@ def cmd_lift(args, cfg):
         name = f"{prefix}_{idx:04d}.c"
         key = hashlib.sha256(tool_hash.digest() + repr((direct, spin_pause)).encode() + repr(
             [(fd["address"], fd["size"], fd["address"] in overrides, fd["address"] in excluded,
-              fd["address"] in traced) for fd in fds]
+              fd["address"] in traced, hot_rank.get(fd["address"])) for fd in fds]
         ).encode()).hexdigest()
         lifted.extend(fd["address"] for fd in fds)
         old = prev_files.get(name)
@@ -486,6 +503,9 @@ def cmd_lift(args, cfg):
                 if va in traced:
                     body = trace_wrapper(va, body)
                     fcounts["traced"] += 1
+                elif va in hot_rank:
+                    body = f'__attribute__((section(".text$h{hot_rank[va]:05d}")))' + chr(10) + body
+                    fcounts["hot"] += 1
                 chunk.append(body)
                 fcounts["lifted"] += 1
             chunk.append("")
