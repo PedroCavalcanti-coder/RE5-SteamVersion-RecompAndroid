@@ -921,6 +921,31 @@ class Lifter:
             terms.append(f"GVA(0x{d:08X})" if self.disp_is_addr(insn, d) else f"0x{d:08X}u")
         return "(" + " + ".join(terms) + ")"
 
+    def acc_addr(self, insn, op):
+        """The address of a memory operand for a host accessor (rd32, wrss, rdf64...) - and
+        only there: never for lea or anything that keeps the address in a uint32_t.
+
+        With `wide_addr` set, a `[reg + disp]` operand (32-bit base, no index) becomes
+        RE5_WIDE(reg, disp): base plus the sign-extended displacement in 64 bits, without the
+        wrap at 4 GiB, which lets the host compiler fold the displacement into its own load
+        or store instead of computing the 32-bit sum first. The two differ only when reg +
+        disp crosses 0 or 4 GiB - an invalid pointer, which the runtime's guard regions turn
+        into a fault. Indexed operands keep the wrap: MSVC code does index with negative
+        registers. So does `[reg + absolute address]`: there the register is the index into
+        a table (`mov dl, [eax + 0x56d902]` after a movsx) and a negative one wraps on purpose -
+        found in RE5, where the wide sum ran into the guard region. Only a small struct offset
+        (|disp| < 16 MiB, not an image address) goes wide: then reg is the pointer.
+        Needs the RE5_WIDE / re5_gaddr accessors of the RE5 cpu.h."""
+        m = op.mem
+        if not getattr(self, "wide_addr", False) or not m.base or m.index:
+            return self.addr_expr(insn, op)
+        base = self.md.reg_name(m.base)
+        d = m.disp & 0xffffffff
+        sd = d - (1 << 32) if d & 0x80000000 else d
+        if base not in R32 or not d or self.disp_is_addr(insn, d) or not -0x1000000 <= sd < 0x1000000:
+            return self.addr_expr(insn, op)
+        return f"RE5_WIDE({self.areg(base)}, 0x{d:08X}u)"
+
     def seg_name(self, op):
         seg = getattr(op.mem, "segment", 0)
         return self.md.reg_name(seg) if seg else None
@@ -954,7 +979,7 @@ class Lifter:
             off = self.seg_off(insn, op)
             if sz not in (1, 2, 4): raise self._bad_size(insn, op, "rd fs:")
             return {1:f"FS_RD8(c, {off})",2:f"FS_RD16(c, {off})",4:f"FS_RD32(c, {off})"}[sz]
-        a = self.addr_expr(insn, op)
+        a = self.acc_addr(insn, op)
         if sz not in (1, 2, 4): raise self._bad_size(insn, op, "rd")
         return {1:f"rd8({a})", 2:f"rd16({a})", 4:f"rd32({a})"}[sz]
 
@@ -965,7 +990,7 @@ class Lifter:
             if sz not in (1, 2, 4): raise self._bad_size(insn, op, "wr fs:")
             return {1:f"FS_WR8(c, {off}, {val});",2:f"FS_WR16(c, {off}, {val});",
                     4:f"FS_WR32(c, {off}, {val});"}[sz]
-        a = self.addr_expr(insn, op)
+        a = self.acc_addr(insn, op)
         if sz not in (1, 2, 4): raise self._bad_size(insn, op, "wr")
         return {1:f"wr8({a}, {val});", 2:f"wr16({a}, {val});", 4:f"wr32({a}, {val});"}[sz]
 
@@ -1416,7 +1441,7 @@ class Lifter:
         return int(mm.group(1)) if mm else 0
 
     def _fmem(self, insn, op, kind):
-        a = self.addr_expr(insn, op); sz = op.size
+        a = self.acc_addr(insn, op); sz = op.size
         if kind == "f":
             if sz == 10: return f"rdf80({a})"      # x87 extended, explicit integer bit 
             return f"rdf32({a})" if sz == 4 else f"rdf64({a})"
@@ -1497,7 +1522,7 @@ class Lifter:
         if m in ("fst", "fstp"):
             pop = "; fpop(c);" if m == "fstp" else ";"
             if memop:
-                sz = memop.size; a = self.addr_expr(insn, memop)
+                sz = memop.size; a = self.acc_addr(insn, memop)
                 st = "wrf32" if sz == 4 else ("wrf80" if sz == 10 else "wrf64")
                 return [f"{st}({a}, *fst(c, 0)){pop}"]
             return [f"*fst(c, {self._st_idx(ops[0])}) = *fst(c, 0){pop}"]
@@ -1507,7 +1532,7 @@ class Lifter:
         # to nearest put sound-engine positions and table indices one off.
         if m in ("fist", "fistp"):
             pop = "; fpop(c);" if m == "fistp" else ";"
-            sz = memop.size; a = self.addr_expr(insn, memop)
+            sz = memop.size; a = self.acc_addr(insn, memop)
             st = {2: "wri16", 4: "wri32", 8: "wri64"}[sz]
             return [f"{st}({a}, fpu_rint(c, *fst(c, 0))){pop}"]
         # fprem truncates the implied quotient, fprem1 rounds it to nearest; both
@@ -1700,17 +1725,17 @@ class Lifter:
     def _ss(self, insn, op):
         """operand as a float (scalar single)"""
         if self._is_xmm(op): return f"c->xmm[{self._xi(op)}][0]"
-        return f"rdss({self.addr_expr(insn, op)})"
+        return f"rdss({self.acc_addr(insn, op)})"
 
     def _sd(self, insn, op):
         """operand as a double (scalar double)"""
         if self._is_xmm(op): return f"xmm_get_sd(c->xmm[{self._xi(op)}])"
-        return f"rdsd({self.addr_expr(insn, op)})"
+        return f"rdsd({self.acc_addr(insn, op)})"
 
     def _xm(self, insn, op):
         """operand as a whole 128-bit register value"""
         if self._is_xmm(op): return f"c->xmm[{self._xi(op)}]"
-        return f"rdxm({self.addr_expr(insn, op)})"
+        return f"rdxm({self.acc_addr(insn, op)})"
 
     def sse(self, insn):
         m = insn.mnemonic
@@ -1726,13 +1751,13 @@ class Lifter:
                     return [f"c->xmm[{self._xi(d)}][0] = c->xmm[{self._xi(s)}][0];"]
                 if self._is_xmm(d):
                     return [f"c->xmm[{self._xi(d)}] = sse_load_ss({self._ss(insn, s)});"]
-                return [f"wrss({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}][0]);"]
+                return [f"wrss({self.acc_addr(insn, d)}, c->xmm[{self._xi(s)}][0]);"]
             else:
                 if self._is_xmm(d) and self._is_xmm(s):
                     return [f"c->xmm[{self._xi(d)}] = xmm_movsd_reg(c->xmm[{self._xi(d)}], c->xmm[{self._xi(s)}]);"]
                 if self._is_xmm(d):
                     return [f"c->xmm[{self._xi(d)}] = sse_load_sd({self._sd(insn, s)});"]
-                return [f"wrsd({self.addr_expr(insn, d)}, xmm_get_sd(c->xmm[{self._xi(s)}]));"]
+                return [f"wrsd({self.acc_addr(insn, d)}, xmm_get_sd(c->xmm[{self._xi(s)}]));"]
 
         if m in ("pextrw", "pinsrw"):
             i = ops[2].imm & 7 if len(ops) > 2 else 0
@@ -1759,14 +1784,14 @@ class Lifter:
             if self._is_xmm(d) and self._is_xmm(s):
                 return [f"c->xmm[{self._xi(d)}] = xmm_from_u64(xmm_to_u64(c->xmm[{self._xi(s)}]));"]
             if self._is_xmm(d):
-                return [f"c->xmm[{self._xi(d)}] = xmm_from_u64(rd64({self.addr_expr(insn, s)}));"]
-            return [f"wr64({self.addr_expr(insn, d)}, xmm_to_u64(c->xmm[{self._xi(s)}]));"]
+                return [f"c->xmm[{self._xi(d)}] = xmm_from_u64(rd64({self.acc_addr(insn, s)}));"]
+            return [f"wr64({self.acc_addr(insn, d)}, xmm_to_u64(c->xmm[{self._xi(s)}]));"]
 
         # ---- 128-bit moves ----
         if m in SSE_MOV128:
             if self._is_xmm(d):
                 return [f"c->xmm[{self._xi(d)}] = {self._xm(insn, s)};"]
-            return [f"wrxm({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}]);"]
+            return [f"wrxm({self.acc_addr(insn, d)}, c->xmm[{self._xi(s)}]);"]
 
         # ---- bitwise, on the whole register ----
         if m in SSE_BITWISE:
@@ -1802,8 +1827,8 @@ class Lifter:
         if m in ("movlps", "movlpd", "movhps", "movhpd"):
             lane = 1 if m.startswith("movh") else 0
             if self._is_xmm(d):
-                return [f"c->xmm[{self._xi(d)}] = xmm_set_qword(c->xmm[{self._xi(d)}], {lane}, rd64({self.addr_expr(insn, s)}));"]
-            return [f"wr64({self.addr_expr(insn, d)}, xmm_get_qword(c->xmm[{self._xi(s)}], {lane}));"]
+                return [f"c->xmm[{self._xi(d)}] = xmm_set_qword(c->xmm[{self._xi(d)}], {lane}, rd64({self.acc_addr(insn, s)}));"]
+            return [f"wr64({self.acc_addr(insn, d)}, xmm_get_qword(c->xmm[{self._xi(s)}], {lane}));"]
 
         if m in SSE_SHIFT:
             xd = self._xi(d)

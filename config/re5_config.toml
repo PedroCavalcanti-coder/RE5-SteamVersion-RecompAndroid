@@ -62,7 +62,11 @@ elide_flag_stores = true
 # fld/fstp/fmul deixa de passar por c->st[(top+i)&7] na memória. Correto (difftest_func igual ao
 # hardware), mas sem ganho medido em 28/10 (mediana 69,7 -> 67,5, dentro do ruído): os trechos são
 # curtos e o float devolvido por chamada atravessa a fronteira pela memória de qualquer jeito.
-x87_cache = false
+x87_cache = true
+# Acesso [reg + disp] somado em 64 bits (RE5_WIDE, cpu_prelude.h) em vez de 32 bits com volta:
+# o compilador põe o deslocamento no próprio mov do host em vez de um lea antes. Difere do x86
+# só com ponteiro inválido perto de 0 ou de 4 GiB, que cai nas faixas de guarda do guest_memory.c.
+wide_addr = true
 out_dir = "generated/src"
 catalog = "work/catalog.json"
 seeds = "work/seeds_all.json"

@@ -39,4 +39,27 @@ typedef uint16_t RE5_UA_U16;
 typedef uint32_t RE5_UA_U32;
 #endif
 
+/* A imagem do re5dx9.exe não tem relocações e carrega sempre na ImageBase (dispatch.c):
+ * GVA(abs) é a constante abs. Com o g_image_delta somado, cada endereço absoluto do jogo
+ * custava uma leitura extra do delta (pela .refptr do MinGW), refeita depois de toda escrita
+ * na memória do guest, porque o may_alias acima diz que ela pode tê-lo mudado. */
+#define RECOMP_IMAGE_FIXED 1
+
+/* Endereço "largo" de um operando [reg + disp] (lift.wide_addr): base + deslocamento com
+ * sinal, sem a volta em 32 bits. Assim o compilador põe o deslocamento no próprio mov do
+ * host (mov 0x24(%rdx,%rbase)) em vez de um lea antes. Só difere do x86 quando reg + disp
+ * atravessa 0 ou 4 GiB, o que no jogo só um ponteiro inválido faz; as faixas de guarda do
+ * guest_memory.c fazem esse acesso falhar em vez de cair em memória do host.
+ *
+ * Os acessos do cpu.h (rd32, wr32, rdss...) recebem re5_gaddr por um _Generic: um uint32_t
+ * (todo chamador que já existe) continua truncado em 32 bits como antes; só re5_wide passa
+ * os 64 bits. */
+typedef uint64_t re5_gaddr;
+typedef struct { uint64_t v; } re5_wide;
+static inline re5_gaddr re5_ga_narrow(uint32_t a) { return a; }
+static inline re5_gaddr re5_ga_wide(re5_wide w) { return w.v; }
+#define RE5_GA(a) _Generic((a), re5_wide: re5_ga_wide, default: re5_ga_narrow)(a)
+#define RE5_WIDE(base, disp) ((re5_wide){(uint64_t)(uint32_t)(base) + (uint64_t)(int64_t)(int32_t)(uint32_t)(disp)})
+#define RE5_G2HW(ga) (re5_guest_base + (uintptr_t)(ga))
+
 #endif /* RE5_CPU_PRELUDE_H */

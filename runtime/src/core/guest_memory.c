@@ -119,6 +119,30 @@ static int host_protect(uint32_t va, uint32_t size, uint32_t prot)
 static void host_release(void) { munmap((void *)re5_guest_base, (size_t)GUEST_SPACE); }
 #endif
 
+/* Faixas de guarda de 2 GiB sem acesso logo abaixo e logo acima dos 4 GiB do guest. O código
+ * gerado com lift.wide_addr soma [reg + disp] em 64 bits (RE5_WIDE, cpu_prelude.h): um
+ * ponteiro inválido perto de 0 ou de 4 GiB, que no x86 daria a volta, cai aqui e falha
+ * (crash.c diz onde) em vez de ler ou escrever memória do host. Melhor esforço: sem a faixa
+ * o runtime funciona igual, só sem essa rede. Nunca liberadas (vivem até o fim do processo). */
+#define GUARD_SPACE ((uint64_t)2 << 30)
+static void host_guards(void)
+{
+    uintptr_t below = re5_guest_base - (uintptr_t)GUARD_SPACE, above = re5_guest_base + (uintptr_t)GUEST_SPACE;
+    int ok = 0;
+#if defined(RE5_HOST_WINDOWS)
+    ok += VirtualAlloc((void *)below, (SIZE_T)GUARD_SPACE, MEM_RESERVE, PAGE_NOACCESS) == (void *)below;
+    ok += VirtualAlloc((void *)above, (SIZE_T)GUARD_SPACE, MEM_RESERVE, PAGE_NOACCESS) == (void *)above;
+#else
+    void *p = mmap((void *)below, (size_t)GUARD_SPACE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p != MAP_FAILED && p != (void *)below) munmap(p, (size_t)GUARD_SPACE);
+    else ok += p == (void *)below;
+    p = mmap((void *)above, (size_t)GUARD_SPACE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p != MAP_FAILED && p != (void *)above) munmap(p, (size_t)GUARD_SPACE);
+    else ok += p == (void *)above;
+#endif
+    if (ok != 2) RE5_WARN("mem", "só %d de 2 faixas de guarda em volta do guest (lift.wide_addr sem rede)", ok);
+}
+
 int re5_mem_init(void)
 {
     if (g_reserved) return 0;
@@ -127,6 +151,7 @@ int re5_mem_init(void)
         RE5_ERROR("mem", "não foi possível reservar 4 GiB para o espaço do guest");
         return -1;
     }
+    host_guards();
     g_reserved = 1;
     RE5_DEBUG("mem", "espaço do guest em host %p", (void *)re5_guest_base);
     return 0;

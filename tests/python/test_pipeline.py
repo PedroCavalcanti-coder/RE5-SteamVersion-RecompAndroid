@@ -31,7 +31,12 @@ class GenCpuHeader(unittest.TestCase):
             text = open(dst, encoding="utf-8").read()
         self.assertIn('#include "re5/cpu_prelude.h"', text)
         self.assertIn('#include "re5/cpu_epilogue.h"', text)
-        self.assertEqual(text.count("RE5_G2H(a)"), 33)   # +1: rep_ptr (rep stos/movs em bloco)
+        # +1: rep_ptr (rep stos/movs em bloco). RE5_G2HW: endereço re5_gaddr (lift.wide_addr),
+        # cada acesso com a macro de mesmo nome que converte o argumento por RE5_GA.
+        self.assertEqual(text.count("RE5_G2HW(a)"), 33)
+        self.assertNotIn("RE5_G2H(a)", text)
+        self.assertIn("#define rd32(a) rd32(RE5_GA(a))", text)
+        self.assertIn("#define wr32(a, _p0) wr32(RE5_GA(a), _p0)", text)
         self.assertNotIn("(uintptr_t)a)", text)
         self.assertEqual(text.count("RE5_UA_U32 *"), 2)   # rd32 e wr32
 

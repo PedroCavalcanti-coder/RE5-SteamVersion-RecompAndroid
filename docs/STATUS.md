@@ -156,6 +156,31 @@ diagnóstico do `crash.c` voltaram (de `work/patches/item2_flags_e_diag_crash.pa
   Agora um intrínseco SSE por predicado (`_mm_cmpeq_ps`...), que mantém o `movups`.
   Falta: conferir no jogo se o fechamento sumiu.
 
+### Lifter e cpu.h: memória, flags e x87 (2026-10-30)
+
+O que mudou:
+
+- **`lift.x87_cache = true`:** a pilha x87 fica em variáveis locais dentro de cada trecho reto.
+- **`RECOMP_IMAGE_FIXED`:** `GVA()` virou uma constante, porque a imagem não tem relocações.
+- **`lift.wide_addr = true`:** o acesso `[reg + disp]` é somado em 64 bits (`RE5_WIDE`).
+  - Vale só quando o deslocamento é um offset de estrutura pequeno (|disp| < 16 MiB). Com
+    endereço da imagem no deslocamento, o registrador é um índice e pode ser negativo.
+  - Na primeira versão isso não existia, e o jogo fechava no variant benchmark do usuário
+    (2.686 acessos estavam nessa forma).
+  - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
+  - Há faixas de guarda de 2 GiB sem acesso em volta do guest.
+- **`flags_sub_m`:** ZF = `a == b`, e OF = SF ^ (a <ₛ b) quando os dois estão vivos. É a mesma
+  conta bit a bit, conferida exaustivamente em 8 bits e por amostragem em 16 e 32.
+
+Evidência:
+
+- **Testes:** ctest 30/30, incluindo o `difftest_cpu` contra o Unicorn. No `difftest_func`, 9
+  das 10 funções dão 670/670. A 10ª, `0x00E68C70`, para numa chamada indireta para fora do fecho,
+  e o mesmo acontece com as opções desligadas.
+- **Variant benchmark do usuário:** **74 fps sem crash** (`re5_x87b`).
+- **Dias diferentes:** 57–60 fps nas versões anteriores, mas o limite de energia STAPM do 5700U
+  derruba o fps com o tempo, então números de sessões diferentes não se comparam.
+
 ### Otimização do código gerado: -O2 (2026-10-22)
 
 `scripts/bench_re5.py` roda o benchmark variável sozinho (`RE5_INPUT_SYNC=titlelogo`

@@ -366,6 +366,31 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
 > Unicorn. A comparação cobre registradores e memória, inclusive a pilha abaixo do esp. Uma
 > mutação proposital é pega.
 >
+> **Thread principal, 29/10 (perfil com `RE5_PROFILE_THREAD=main`).** O original roda a ~130
+> fps e o P5 a ~68. Por quadro, a thread principal custa 5,0 ms no original e 10,2 ms no P5;
+> o processo inteiro, 22 ms e 67 ms de CPU. Na principal, 90% das amostras caem no código
+> gerado, espalhadas (a função mais pesada tem 4,9%). Pela linha do C:
+>
+> | Tipo de código | Amostras |
+> |---|---|
+> | acesso à memória do guest | ~30% |
+> | desvios | ~16% |
+> | x87 (pilha em `c->st`) | ~15% |
+> | SSE | ~10% |
+> | chamada, `ret` e dispatch | ~7% |
+>
+> No assembly gerado apareceram três custos extras:
+> - cada endereço absoluto recarregava o `g_image_delta` (pela `.refptr`) depois de toda escrita;
+> - cada `[reg+disp]` pagava um `lea` antes do `mov`;
+> - `cmp` + `jcc` virava `sub/and/mov/jne`.
+>
+> Build `re5_x87`, ainda sem medida:
+> - `lift.x87_cache`;
+> - `GVA()` constante (`RECOMP_IMAGE_FIXED`);
+> - `lift.wide_addr` (`RE5_WIDE`, com faixas de guarda de 2 GiB em volta do guest);
+> - em `flags_sub_m`, ZF = `a == b` e OF = SF ^ (a <ₛ b): idêntico bit a bit, conferido de forma
+>   exaustiva em 8 bits e por amostragem em 16 e 32.
+>
 > `0x00587840` (3,7%) ficou de fora: são 2,5 KB de SSE já vetorizado no lift, com 8 chamadas ao
 > `sqrtf` e comparações x87, então reescrever à mão traz risco alto e ganho incerto.
 

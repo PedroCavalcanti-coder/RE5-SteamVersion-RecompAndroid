@@ -32,6 +32,45 @@ EXPECTED_ADDR = 33   # +1: rep_ptr (rep stos/movs em bloco)
 EXPECTED_SCALAR = 6
 
 
+SIG = re.compile(r"^static inline [^\n(]*?\b(\w+) ?\(uint32_t a\b([^)\n]*)\)", re.M)
+EXPECTED_WIDE = 33   # funções com endereço do guest no 1º parâmetro (as atômicas contam 2x: #if/#else)
+
+
+def wide_accessors(text):
+    """Endereço largo (lift.wide_addr, re5/cpu_prelude.h): cada função que recebe o endereço
+    do guest em `uint32_t a` passa a receber `re5_gaddr a` (64 bits, somado à base sem
+    truncar) e ganha, logo depois da definição, uma macro com o mesmo nome que converte o
+    argumento por RE5_GA: um uint32_t continua truncado como antes, um re5_wide passa inteiro.
+    A macro vem depois da definição para não reescrever a própria definição."""
+    out, pos, n = [], 0, 0
+    for m in SIG.finditer(text):
+        if m.start() < pos:
+            continue
+        name, rest = m.group(1), m.group(2)
+        line_end = text.index("\n", m.end())
+        if text[m.start():line_end].rstrip().endswith("}"):
+            end = line_end            # função de uma linha
+        else:
+            end = text.index("\n}", m.end()) + 2
+        body = text[m.start():end]
+        if "RE5_G2H(a)" not in body:
+            continue
+        nparams = rest.count(",")
+        body = body.replace("(uint32_t a", "(re5_gaddr a", 1).replace("RE5_G2H(a)", "RE5_G2HW(a)")
+        ps = "".join(f", _p{i}" for i in range(nparams))
+        out.append(text[pos:m.start()])
+        out.append(body + f"\n#define {name}(a{ps}) {name}(RE5_GA(a){ps})")
+        pos = end
+        n += 1
+    out.append(text[pos:])
+    if n != EXPECTED_WIDE:
+        sys.exit(f"gen_cpu_header: {n} funções com endereço do guest, esperado {EXPECTED_WIDE}.")
+    text = "".join(out)
+    if "RE5_G2H(a)" in text:
+        sys.exit("gen_cpu_header: sobrou RE5_G2H(a) fora de uma função reconhecida")
+    return text
+
+
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     text = open(src, encoding="utf-8").read()
@@ -48,6 +87,7 @@ def main():
     leftovers = [l for l in out.splitlines() if "(uintptr_t)" in l and "RE5_G2H" not in l]
     if leftovers:
         sys.exit("gen_cpu_header: casts para ponteiro sem RE5_G2H:\n  " + "\n  ".join(leftovers))
+    out = wide_accessors(out)
     header = ("/* GERADO por scripts/gen_cpu_header.py a partir de tools/pcrecomp/"
               "runtime/recomp32_cpu/cpu.h - não edite. */\n"
               '#include "re5/cpu_prelude.h"\n')

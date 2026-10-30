@@ -51,5 +51,19 @@ int main(void)
     CHECK_EQ_U32(old, RE5_PAGE_READWRITE);
     CHECK(re5_mem_query(0x0F000000u, &r) != 0);
 
+    /* lift.wide_addr: um endereço uint32_t continua com a volta em 32 bits (todo chamador que
+     * já existia); RE5_WIDE soma base + deslocamento com sinal em 64 bits, sem volta. */
+    uint32_t w = b + 0x2000u;   /* depois da página que ficou só leitura */
+    wr32(w + 0x10u, 0xCAFEF00Du);
+    CHECK_EQ_U32(rd32(RE5_WIDE(w + 0x20u, 0xFFFFFFF0u)), 0xCAFEF00Du);   /* [reg - 0x10] */
+    CHECK_EQ_U32(rd32(RE5_WIDE(w, 0x10u)), 0xCAFEF00Du);
+    wrss(RE5_WIDE(w, 0x40u), 1.5f);
+    CHECK(rdss(w + 0x40u) == 1.5f);
+    CHECK_EQ_U32(rd32((uint32_t)(w + 0x100000010ull)), 0xCAFEF00Du);     /* uint32_t: volta em 4 GiB */
+    CHECK(RE5_GA(RE5_WIDE(0xFFFFFFF0u, 0x20u)) == 0x100000010ull);       /* largo: sem volta */
+    CHECK(RE5_GA(RE5_WIDE(0x10u, 0xFFFFFFE0u)) == (re5_gaddr)-0x10);
+    CHECK(RE5_GA(0xFFFFFFF0u + 0x20u) == 0x10u);
+    CHECK(GVA(0x012340A4u) == 0x012340A4u);                              /* imagem sem relocação */
+
     CHECK_DONE();
 }

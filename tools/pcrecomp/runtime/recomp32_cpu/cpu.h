@@ -253,7 +253,13 @@ static inline uint32_t pop32_r(CPU *c, uint32_t *sp) { (void)c; uint32_t v = rd3
 
 /* ---- absolute image references: abs VA at preferred base -> live address ---- */
 extern uint32_t g_image_delta;   /* live_base - PE ImageBase (0 if loaded where it wanted) */
+/* RECOMP_IMAGE_FIXED: the image always loads at its preferred base (no relocations), so
+ * GVA is the constant itself - no load of g_image_delta on every absolute reference. */
+#if defined(RECOMP_IMAGE_FIXED) && RECOMP_IMAGE_FIXED
+#define GVA(abs) ((uint32_t)(abs))
+#else
 #define GVA(abs) ((uint32_t)((abs) + g_image_delta))
+#endif
 
 /* ---- flag helpers ---- */
 static inline uint32_t parity8(uint8_t v) {
@@ -335,14 +341,19 @@ static inline uint32_t flags_logicz(CPU *c, uint32_t r, int sz) {
 
 #if defined(RE5_CACHED_REGS)
 
+/* cmp/sub: ZF is `a == b` (both masked), and when SF and OF are both live (jl/jge/jg/jle)
+ * OF is written as SF ^ (a <s b) - the same bit, since a <s b <=> SF != OF - so the
+ * compiler folds the `R_sf != R_of` of the jcc into one signed compare. (x ^ s) maps the
+ * signed order of an sz-byte value onto the unsigned order. */
 #define flags_sub_m(c, lm, a, b, sz) ({ \
     uint32_t _m = mask_sz(sz), _s = sign_sz(sz); \
     uint32_t _a = (uint32_t)(a) & _m, _b = (uint32_t)(b) & _m; \
     uint32_t _r = (_a - _b) & _m; \
     if ((lm) & RF_CF) R_cf = (_a < _b); \
-    if ((lm) & RF_ZF) R_zf = (_r == 0); \
+    if ((lm) & RF_ZF) R_zf = (_a == _b); \
     if ((lm) & RF_SF) R_sf = (_r & _s) != 0; \
-    if ((lm) & RF_OF) R_of = (((_a ^ _b) & (_a ^ _r)) & _s) != 0; \
+    if (((lm) & (RF_SF | RF_OF)) == (RF_SF | RF_OF)) R_of = (((_r & _s) != 0) ^ ((_a ^ _s) < (_b ^ _s))); \
+    else if ((lm) & RF_OF) R_of = (((_a ^ _b) & (_a ^ _r)) & _s) != 0; \
     if ((lm) & RF_AF) R_af = ((_a ^ _b ^ _r) & 0x10) != 0; \
     if ((lm) & RF_PF) R_pf = parity8((uint8_t)_r); \
     _r; \

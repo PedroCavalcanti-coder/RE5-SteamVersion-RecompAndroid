@@ -363,6 +363,9 @@ def main():
     lifter.md = md
     lifter.reloc_vas = set()
     lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+    # Os acessos [reg + disp] na forma que o jogo usa (lift.wide_addr: RE5_WIDE, sem volta em 32 bits).
+    import re5common as rc  # noqa: E402
+    lifter.wide_addr = bool(rc.load_config()["lift"].get("wide_addr", False))
 
     cases = []   # (bytes, insn text, state, C lines)
     skipped = collections.Counter()

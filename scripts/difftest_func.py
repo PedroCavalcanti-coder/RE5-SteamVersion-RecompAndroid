@@ -71,6 +71,7 @@ def main():
     lifter.cache_flags = bool(lcfg.get("cache_flags", True))
     lifter.elide_flag_stores = bool(lcfg.get("elide_flag_stores", False))
     lifter.x87_cache = bool(lcfg.get("x87_cache", False)) and "--no-x87-cache" not in sys.argv
+    lifter.wide_addr = bool(lcfg.get("wide_addr", False))
 
     # Fecho das chamadas diretas a partir das entradas.
     bodies, todo = {}, list(entries)

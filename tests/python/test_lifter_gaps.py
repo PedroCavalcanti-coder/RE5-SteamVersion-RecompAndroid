@@ -15,7 +15,7 @@ import capstone  # noqa: E402
 from lift32_cpu import Lifter  # noqa: E402
 
 
-def lift(encoding):
+def lift(encoding, wide_addr=False):
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     md.detail = True
     insn = next(iter(md.disasm(encoding, 0x1000)))
@@ -23,6 +23,7 @@ def lift(encoding):
     lifter.md = md
     lifter.reloc_vas = set()                                  # deslocamentos: constantes, não endereços
     lifter.image_lo, lifter.image_hi = 0x00400000, 0x01400000
+    lifter.wide_addr = wide_addr
     return " ".join(lifter.translate(insn, set()))
 
 
@@ -276,6 +277,21 @@ class LifterGaps(unittest.TestCase):
         self.assertIn("c->st[(R_ftop - (1)) & 7] = X_p1; R_ftop = (R_ftop - (1)) & 7;", jz)
         lifter.x87_cache = False
         self.assertNotIn("R_ftop", lifter.lift_function(code, 0x1000))
+
+    def test_wide_addr(self):
+        # lift.wide_addr: [reg + disp] vai largo (RE5_WIDE) só dentro de um acesso; o índice
+        # mantém a volta em 32 bits (índice negativo do MSVC) e o lea continua em 32 bits.
+        self.assertEqual(lift(b"\x8b\x41\x24", True), "c->eax = (uint32_t)(rd32(RE5_WIDE(c->ecx, 0x00000024u)));")
+        self.assertIn("wr32(RE5_WIDE(c->esp, 0xFFFFFFFCu), c->eax)", lift(b"\x89\x44\x24\xfc", True))   # mov [esp-4], eax
+        self.assertIn("rdss(RE5_WIDE(c->esi, 0xFFFFFFF0u))", lift(b"\xf3\x0f\x10\x46\xf0", True))      # movss xmm0, [esi-0x10]
+        self.assertIn("rdf32(RE5_WIDE(c->esp, 0x00000004u))", lift(b"\xd9\x44\x24\x04", True))         # fld dword [esp+4]
+        self.assertIn("rd32((c->ecx + c->edx*4 + 0x00000008u))", lift(b"\x8b\x44\x91\x08", True))      # com índice: igual
+        self.assertIn("rd32((c->ecx))", lift(b"\x8b\x01", True))                                       # sem deslocamento: igual
+        self.assertNotIn("RE5_WIDE", lift(b"\x8d\x41\x24", True))                                      # lea eax, [ecx+0x24]
+        # [reg + endereço da imagem]: reg é o índice da tabela e pode ser negativo (volta de propósito).
+        self.assertIn("rd8((c->eax + GVA(0x0056D902)))", lift(b"\x8a\x90\x02\xd9\x56\x00", True))    # mov dl, [eax+0x56d902]
+        self.assertIn("rd32((c->ecx + 0x20000000u))", lift(b"\x8b\x81\x00\x00\x00\x20", True))       # deslocamento grande: igual
+        self.assertEqual(lift(b"\x8b\x41\x24"), "c->eax = (uint32_t)(rd32((c->ecx + 0x00000024u)));")  # desligado: igual
 
     def test_direction_flag(self):
         # std/cld eram ignorados ("string ops assume forward"): o strrchr do CRT
