@@ -10,14 +10,18 @@ não injeta nada no processo medido.
     python scripts/thread_cpu.py --name re5.exe --secs 90         # o recompilado
 
 Espera até 5 minutos o processo aparecer (abra o jogo e entre na cena a medir), amostra a cada
---interval segundos por --secs segundos e imprime: núcleos usados em média, cada thread
-(média e pico em % de um núcleo, módulo onde a thread nasceu, nome) e o uso da GPU.
+--interval segundos por --secs segundos e imprime: núcleos usados em média (e em % da máquina),
+a RAM do processo (memória física em uso e memória privada, média e pico), cada thread (média e
+pico em % de um núcleo, módulo onde a thread nasceu, nome) e o uso da GPU. Com --fps (o fps
+médio que o benchmark mostrou) também o custo em ms de CPU por quadro, do processo e por thread:
+é a régua para comparar dois builds que rodam com fps diferentes.
 """
 import argparse
 import csv
 import ctypes
 import ctypes.wintypes as wt
 import io
+import os
 import statistics
 import subprocess
 import sys
@@ -58,6 +62,28 @@ ntdll.NtQueryInformationThread.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_voi
 ntdll.NtQueryInformationThread.restype = ctypes.c_long
 k32.GetThreadDescription.argtypes = [wt.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
 k32.GetThreadDescription.restype = ctypes.c_long
+k32.OpenProcess.restype = wt.HANDLE
+k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+
+
+class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD), ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t), ("PrivateUsage", ctypes.c_size_t)]
+
+
+k32.K32GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX), wt.DWORD]
+
+
+def memory_of(hproc):
+    """(memória física em uso, memória privada comprometida) do processo, em MB."""
+    m = PROCESS_MEMORY_COUNTERS_EX()
+    m.cb = ctypes.sizeof(m)
+    if not hproc or not k32.K32GetProcessMemoryInfo(hproc, ctypes.byref(m), m.cb):
+        return None
+    return m.WorkingSetSize / 2**20, m.PrivateUsage / 2**20
 
 
 def ft(f):
@@ -154,6 +180,7 @@ def main():
     ap.add_argument("--interval", type=float, default=2)
     ap.add_argument("--wait", type=float, default=300, help="quanto esperar o processo aparecer")
     ap.add_argument("--no-gpu", action="store_true")
+    ap.add_argument("--fps", type=float, help="fps médio do benchmark: imprime o custo de CPU por quadro")
     args = ap.parse_args()
 
     pid = args.pid
@@ -169,6 +196,8 @@ def main():
     gpu = None if args.no_gpu else gpu_sampler(pid, n, args.interval)
 
     handles, meta, last, util = {}, {}, {}, {}
+    hproc = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    mem = []
     wall_prev = time.time()
     for _ in range(n):
         time.sleep(args.interval)
@@ -176,6 +205,9 @@ def main():
         dt = now - wall_prev
         wall_prev = now
         alive = set()
+        m = memory_of(hproc)
+        if m:
+            mem.append(m)
         for tid in threads_of(pid):
             alive.add(tid)
             h = handles.get(tid)
@@ -201,18 +233,28 @@ def main():
         rows.append((statistics.mean(series), max(series), tid, series))
     rows.sort(reverse=True)
     total = sum(r[0] for r in rows) / 100.0
-    print(f"\nNúcleos usados em média (soma das threads): {total:.2f}")
+    ncpu = os.cpu_count() or 1
+    print(f"\nNúcleos usados em média (soma das threads): {total:.2f}  "
+          f"({100.0 * total / ncpu:.1f}% dos {ncpu} processadores lógicos)")
+    if mem:
+        ws, pv = [x[0] for x in mem], [x[1] for x in mem]
+        print(f"RAM: memória física em uso média {statistics.mean(ws):.0f} MB (pico {max(ws):.0f} MB); "
+              f"memória privada média {statistics.mean(pv):.0f} MB (pico {max(pv):.0f} MB)")
+    if args.fps:
+        print(f"Custo por quadro a {args.fps:g} fps: {1000.0 * total / args.fps:.2f} ms de CPU (soma das threads)")
     by_mod = {}
     for avg, _, tid, _ in rows:
         by_mod[meta[tid][0]] = by_mod.get(meta[tid][0], 0.0) + avg / 100.0
     for mod, v in sorted(by_mod.items(), key=lambda x: -x[1]):
         if v >= 0.005:
             print(f"  módulo {mod:<28} {v:5.2f} núcleos")
-    print(f"\n{'tid':>7} {'média %':>8} {'pico %':>7}  {'módulo da thread':<26} nome")
+    per_frame = f" {'ms/quadro':>9}" if args.fps else ""
+    print(f"\n{'tid':>7} {'média %':>8} {'pico %':>7}{per_frame}  {'módulo da thread':<26} nome")
     for avg, peak, tid, _ in rows[:24]:
         if avg < 1.0:
             break
-        print(f"{tid:>7} {avg:8.1f} {peak:7.1f}  {meta[tid][0]:<26} {meta[tid][1]}")
+        pf = f" {10.0 * avg / args.fps:9.2f}" if args.fps else ""
+        print(f"{tid:>7} {avg:8.1f} {peak:7.1f}{pf}  {meta[tid][0]:<26} {meta[tid][1]}")
     small = sum(1 for r in rows if r[0] < 1.0)
     print(f"  (+ {small} thread(s) abaixo de 1% de um núcleo)")
     if gpu:

@@ -6,6 +6,8 @@ cd /d "%~dp0"
 rem Dados do jogo (nativePC_MT), fora do git.
 set "GAME_DIR=%~dp0bin_input\game"
 set "RECOMP_EXE=build\windows-x64\re5.exe"
+rem Outra versao para A/B: executar_recompilado.bat re5_p5.exe (nome dentro de build\windows-x64)
+if not "%~1"=="" set "RECOMP_EXE=build\windows-x64\%~1"
 
 rem Log completo (stderr + arquivo) e enderecos que o catalogo nao achou (etapa 2.6).
 rem Para ver cada import chamado: set RE5_LOG=trace

@@ -15,6 +15,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
 
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
@@ -37,6 +43,9 @@ static void guest_main(void *p)
         RE5_ERROR("host", "sem memória do guest para a thread principal");
         return;
     }
+    t->start_va = a->entry;
+    t->is_main = 1;
+    re5_thread_set_host_name("re5-main");
     re5_guest_lock();
     a->result = re5_guest_call(t, a->entry, 0, NULL);
     re5_guest_unlock();
@@ -76,6 +85,44 @@ static void load_env_file(const char *path)
     fprintf(stderr, "[host] %s: %d variável(is) de ambiente\n", path, n);
 }
 
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+/* Aberto com dois cliques (sem o executar_recompilado.bat) a pasta atual é a do re5.exe
+ * (build/windows-x64), onde não há bin_input/. Sobe a partir da pasta do executável até achar
+ * bin_input/re5dx9.clean.exe e muda para lá, o mesmo que o .bat faz com `cd /d "%~dp0"`. */
+static void find_repo_root(const char *rel_exe)
+{
+    if (file_exists(rel_exe)) return;
+    char *base = SDL_GetBasePath();
+    if (!base) return;
+    char dir[1024], probe[1100];
+    snprintf(dir, sizeof dir, "%s", base);
+    SDL_free(base);
+    for (int up = 0; up < 6; up++) {
+        size_t n = strlen(dir);
+        while (n && (dir[n - 1] == '/' || dir[n - 1] == '\\')) dir[--n] = 0;
+        snprintf(probe, sizeof probe, "%s/%s", dir, rel_exe);
+        if (file_exists(probe)) {
+#ifdef _WIN32
+            if (_chdir(dir) == 0)
+#else
+            if (chdir(dir) == 0)
+#endif
+                fprintf(stderr, "[host] pasta do projeto: %s\n", dir);
+            return;
+        }
+        char *s = strrchr(dir, '/'), *b = strrchr(dir, '\\');
+        if (b > s) s = b;
+        if (!s) return;
+        *s = 0;
+    }
+}
+
 static void usage(void)
 {
     fprintf(stderr, "uso: re5 [--exe PATH] [--game-dir DIR] [--user-dir DIR] [--census [--missing]]\n");
@@ -84,9 +131,9 @@ static void usage(void)
 static int re5_main_entry(int argc, char **argv)
 {
     const char *exe = "bin_input/re5dx9.clean.exe", *game_dir = NULL, *user_dir = NULL;
-    int census = 0, missing = 0;
+    int census = 0, missing = 0, exe_given = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--exe") && i + 1 < argc) exe = argv[++i];
+        if (!strcmp(argv[i], "--exe") && i + 1 < argc) { exe = argv[++i]; exe_given = 1; }
         else if (!strcmp(argv[i], "--game-dir") && i + 1 < argc) game_dir = argv[++i];
         else if (!strcmp(argv[i], "--user-dir") && i + 1 < argc) user_dir = argv[++i];
         else if (!strcmp(argv[i], "--census")) census = 1;
@@ -95,6 +142,12 @@ static int re5_main_entry(int argc, char **argv)
     }
 
     char dir[1024];
+    if (!exe_given) {
+        find_repo_root(exe);
+        /* Os dados do jogo ficam em bin_input/game (o que o .bat passa em --game-dir). */
+        struct stat sb;
+        if (!game_dir && stat("bin_input/game/nativePC_MT", &sb) == 0 && S_ISDIR(sb.st_mode)) game_dir = "bin_input/game";
+    }
     if (!game_dir) {
         snprintf(dir, sizeof dir, "%s", exe);
         char *slash = strrchr(dir, '/');
@@ -119,6 +172,10 @@ static int re5_main_entry(int argc, char **argv)
     const char *err = NULL;
     if (re5_image_load(exe, &img, &err) != 0) {
         RE5_ERROR("host", "%s: %s", exe, err);
+        /* Com dois cliques o console fecha junto: o erro precisa aparecer numa janela. */
+        char msg[1400];
+        snprintf(msg, sizeof msg, "%s: %s\n\nRode pelo executar_recompilado.bat ou passe --exe e --game-dir.", exe, err);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "re5-recompiled", msg, NULL);
         return 1;
     }
     if (census) {
