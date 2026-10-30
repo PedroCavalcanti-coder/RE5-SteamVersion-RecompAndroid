@@ -1068,6 +1068,7 @@ static void poll_sockets_once(void)
 static void lan_worker(void *arg)
 {
     (void)arg;
+    re5_thread_set_host_name("re5-lan");
     uint32_t last_beacon_ms = 0;
     while (g_running) {
         poll_sockets_once();

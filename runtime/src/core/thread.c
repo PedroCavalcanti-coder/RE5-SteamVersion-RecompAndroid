@@ -199,6 +199,32 @@ void re5_thread_detach(void)
 
 re5_thread *re5_thread_current(void) { return t_self_get(); }
 
+void re5_thread_set_host_name(const char *name)
+{
+#if defined(RE5_HOST_WINDOWS)
+    /* SetThreadDescription existe a partir do Windows 10 1607: pega pelo GetProcAddress. */
+    typedef HRESULT(WINAPI * set_desc_fn)(HANDLE, PCWSTR);
+    static set_desc_fn set_desc;
+    static int looked;
+    if (!looked) {
+        set_desc = (set_desc_fn)(void (*)(void))GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadDescription");
+        looked = 1;
+    }
+    if (!set_desc) return;
+    wchar_t w[64];
+    size_t i = 0;
+    for (; name[i] && i < 63; i++) w[i] = (wchar_t)(unsigned char)name[i];
+    w[i] = 0;
+    set_desc(GetCurrentThread(), w);
+#elif defined(__linux__) || defined(__ANDROID__)
+    char n[16];
+    snprintf(n, sizeof n, "%s", name);
+    pthread_setname_np(pthread_self(), n);
+#else
+    (void)name;
+#endif
+}
+
 uint32_t re5_guest_call(re5_thread *t, uint32_t va, int argc, const uint32_t *argv)
 {
     CPU *c = &t->cpu;
@@ -806,9 +832,23 @@ static void prof_report(uint64_t total, uint64_t gen, uint64_t host, uint64_t ot
     memset((void *)g_pt_name, 0, sizeof g_pt_name);
 }
 
+/* RE5_PROFILE_THREAD: amostra só as threads que casam. "main" = a principal do jogo (a que
+ * segura o fps); um número hexadecimal = a função inicial da thread (o nome "gXXXXXXXX" que o
+ * thread_cpu.py mostra) ou o TID do guest. Vazio = todas. */
+static int g_pf_main_only;
+static uint32_t g_pf_match;
+
+static int prof_wanted(const re5_thread *t)
+{
+    if (g_pf_main_only) return t->is_main;
+    if (g_pf_match) return t->start_va == g_pf_match || t->tid == g_pf_match;
+    return 1;
+}
+
 static void profile_main(void *arg)
 {
     uint32_t secs = (uint32_t)(uintptr_t)arg;
+    re5_thread_set_host_name("re5-profile");
     uint64_t total = 0, gen = 0, host = 0, other = 0, lockw = 0, busy = 0, ticks = 0, running = 0;
     DWORD last = GetTickCount();
     uint32_t last_pc = 0;
@@ -819,7 +859,7 @@ static void profile_main(void *arg)
         re5_mutex_lock(&g_tid_mu);
         for (int i = 0; i < MAX_THREADS; i++) {
             re5_thread *t = g_threads[i];
-            if (!t || !t->host) continue;
+            if (!t || !t->host || !prof_wanted(t)) continue;
             if (t->lock_wait) {   /* parada na fila do lock: custo da serialização */
                 total++;
                 lockw++;
@@ -890,6 +930,12 @@ void re5_profile_start(void)
     if (!g_pf || !g_pf_hits) re5_fatal("profile", "sem memória");
     for (uint32_t i = 0; i < g_npf; i++) g_pf[i] = (prof_fn){(uintptr_t)re5_lifted_table[i].fn, re5_lifted_table[i].va};
     qsort(g_pf, g_npf, sizeof *g_pf, pf_cmp);
+    const char *only = getenv("RE5_PROFILE_THREAD");
+    if (only && *only) {
+        if (!strcmp(only, "main")) g_pf_main_only = 1;
+        else g_pf_match = (uint32_t)strtoul(only[0] == 'g' ? only + 1 : only, NULL, 16);
+        RE5_INFO("profile", "só as threads que casam com RE5_PROFILE_THREAD=%s", only);
+    }
     if (re5_host_thread_start(profile_main, (void *)(uintptr_t)secs, 1u << 20) != 0)
         RE5_WARN("profile", "não consegui criar a thread do perfil");
     else

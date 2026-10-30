@@ -584,6 +584,11 @@ static void guest_thread_main(void *p)
     waitable *w = p;
     re5_thread *t = re5_thread_attach(w->stack);
     if (!t) re5_fatal("kernel32", "CreateThread: sem memória do guest para pilha/TEB");
+    /* "g<função inicial>": o thread_cpu.py e o RE5_PROFILE_THREAD dizem qual thread do jogo é. */
+    t->start_va = w->start;
+    char name[16];
+    snprintf(name, sizeof name, "g%08X", w->start);
+    re5_thread_set_host_name(name);
     re5_mutex_lock(&g_mu);
     w->tid = t->tid;
     w->thr = t;

@@ -711,6 +711,7 @@ static void async_poll_once(void)
 static void async_thread(void *arg)
 {
     (void)arg;
+    re5_thread_set_host_name("re5-ws2-async");
     for (;;) {
         re5_host_sleep_ms(10);
         re5_guest_lock();

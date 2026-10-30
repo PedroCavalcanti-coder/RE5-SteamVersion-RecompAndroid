@@ -58,7 +58,14 @@ typedef struct re5_thread {
     void                *host;         /* Windows: HANDLE da thread do host (RE5_PROFILE) */
     uint64_t             stats[8];     /* RE5_FPS_LOG: contadores desta thread (re5/stats.h, RE5_ST_*) */
     uint32_t             stat_sample;  /* RE5_FPS_LOG: amostragem da contagem por thunk */
+    uint32_t             start_va;     /* função inicial no guest (CreateThread; entry point na principal) */
+    int                  is_main;      /* thread principal do jogo (RE5_PROFILE_THREAD=main) */
 } re5_thread;
+
+/* Nome da thread do host que chama (SetThreadDescription / pthread_setname_np), visto pelo
+ * scripts/thread_cpu.py, pelo Gerenciador de Tarefas e pelos depuradores. Até 15 caracteres
+ * valem em todo host. */
+void re5_thread_set_host_name(const char *name);
 
 /* Cria o PEB (uma vez por processo). image_base vai para PEB.ImageBaseAddress. */
 int re5_process_init(uint32_t image_base);
