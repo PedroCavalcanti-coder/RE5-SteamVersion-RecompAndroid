@@ -87,6 +87,28 @@ void re5_thunk_log_top(int n, double secs)
     for (int k = 0; k < n && best[k] && len < (int)sizeof line - 80; k++)
         len += snprintf(line + len, sizeof line - (size_t)len, " %s=%.0f", best[k]->name, (double)delta[k] / secs);
     RE5_INFO("thunk", "%s", line);
+
+    /* Os métodos do D3D9 que mais tempo tomam (ms por segundo): onde o d3d9_ms vai. */
+    const re5_thunk *slow[MAXN] = {0};
+    uint64_t dns[MAXN] = {0};
+    for (uint32_t i = 0; i < g_next; i++) {
+        re5_thunk *t = &g_thunks[i];
+        uint64_t d = t->ns - t->ns_prev;
+        t->ns_prev = t->ns;
+        for (int k = 0; k < n; k++) {
+            if (d > dns[k]) {
+                for (int j = n - 1; j > k; j--) { slow[j] = slow[j - 1]; dns[j] = dns[j - 1]; }
+                slow[k] = t;
+                dns[k] = d;
+                break;
+            }
+        }
+    }
+    if (!slow[0]) return;
+    len = snprintf(line, sizeof line, "d3d9 ms/s:");
+    for (int k = 0; k < n && slow[k] && len < (int)sizeof line - 80; k++)
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s=%.2f", slow[k]->name, (double)dns[k] / 1e6 / secs);
+    RE5_INFO("thunk", "%s", line);
 }
 
 void re5_thunk_set_flags(uint32_t va, uint32_t flags)
@@ -117,6 +139,12 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
     if (th) th->thunk = t->name;
     RE5_TRACE("thunk", "-> %s", t->name);
     /* RE5_GUEST_LOCK=hle: o código do guest roda solto; o lock protege só o HLE. */
+    static int census = -1;
+    if (census < 0) census = env_on("RE5_D3D9_CENSUS");
+    if (census && !(t->flags & RE5_THUNK_SEEN) && !strncmp(t->name, "IDirect3D", 9)) {
+        ((re5_thunk *)t)->flags |= RE5_THUNK_SEEN;   /* corrida inofensiva: no pior caso, duas linhas */
+        RE5_INFO("censo", "método %s", t->name);
+    }
     int d3d9_timed = 0;
     if (re5_stats_on) {
         RE5_STAT_ADD(RE5_ST_THUNKS, 1);
@@ -135,7 +163,11 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
     if (lk) re5_guest_lock();
     uint64_t t0 = d3d9_timed ? re5_stat_now_ns() : 0;
     t->fn(c);
-    if (d3d9_timed) RE5_STAT_ADD(RE5_ST_D3D9_NS, re5_stat_now_ns() - t0);
+    if (d3d9_timed) {
+        uint64_t dt = re5_stat_now_ns() - t0;
+        RE5_STAT_ADD(RE5_ST_D3D9_NS, dt);
+        ((re5_thunk *)t)->ns += dt;   /* sem trava: ordem de grandeza, como calls */
+    }
     if (lk) re5_guest_unlock();
     if (th) th->thunk = prev_name;
     t_current_set(prev);

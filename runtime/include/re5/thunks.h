@@ -38,6 +38,7 @@ typedef struct {
     void       *user;      /* dado do handler (ex.: o objeto host de um método COM) */
     uint32_t    flags;     /* RE5_THUNK_* */
     uint64_t    calls, calls_prev;   /* RE5_FPS_LOG: chamadas (contador sem trava) e total do último log */
+    uint64_t    ns, ns_prev;         /* RE5_FPS_LOG: tempo dentro do handler (só métodos do D3D9) */
 } re5_thunk;
 
 /* Handler que não precisa do lock do HLE (RE5_GUEST_LOCK=hle): só mexe no que
@@ -48,6 +49,8 @@ typedef struct {
  * a ponte tem estado compartilhado (hash de objetos, travas, sombras) e um mutex dela
  * poderia travar contra o lock do HLE quando um callback do guest chama o D3D9. */
 #define RE5_THUNK_NOLOCK_HEAP 0x2u
+/* RE5_D3D9_CENSUS: o handler já foi chamado uma vez (a primeira chamada vai para o log). */
+#define RE5_THUNK_SEEN 0x80000000u
 
 int  re5_thunks_init(void);
 uint32_t re5_thunk_new(const char *name, re5_host_fn fn, uint32_t arg_bytes, void *user);

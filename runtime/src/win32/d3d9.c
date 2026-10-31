@@ -576,6 +576,72 @@ static void d_CreateDevice(CPU *c)
 
 /* ---- IDirect3DDevice9 ---- */
 
+/* RE5_D3D9_CENSUS=1 (etapa V1 do docs/PROJETO_VULKAN_NATIVO.md): o que o RE5 usa da API.
+ * Uma linha na primeira vez de cada combinação (tipo de recurso, formato, uso, pool) e de
+ * cada versão de shader; com RE5_FPS_LOG, o total a cada 30 s. */
+static int census_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RE5_D3D9_CENSUS") && *getenv("RE5_D3D9_CENSUS") && *getenv("RE5_D3D9_CENSUS") != '0';
+    return on;
+}
+
+enum { CENSUS_MAX = 256 };
+static struct { uint32_t kind, a, b, c; uint32_t n; } g_census[CENSUS_MAX];
+static int g_census_n;
+static uint32_t g_census_vs, g_census_ps;
+
+static void census_note(uint32_t kind, uint32_t a, uint32_t b, uint32_t c, const char *what)
+{
+    if (!census_on()) return;
+    for (int i = 0; i < g_census_n; i++) {
+        if (g_census[i].kind == kind && g_census[i].a == a && g_census[i].b == b && g_census[i].c == c) {
+            g_census[i].n++;
+            return;
+        }
+    }
+    if (g_census_n < CENSUS_MAX) g_census[g_census_n++] = (typeof(g_census[0])){kind, a, b, c, 1};
+    RE5_INFO("censo", "%s", what);
+}
+
+static void census_resource(const char *type, uint32_t format, uint32_t usage, uint32_t pool)
+{
+    if (!census_on()) return;
+    char what[160];
+    snprintf(what, sizeof what, "%s formato %u (0x%08X) uso 0x%X pool %u", type, format, format, usage, pool);
+    census_note((uint32_t)type[0] | (uint32_t)type[1] << 8, format, usage, pool, what);
+}
+
+static void census_shader(const DWORD *code, int pixel)
+{
+    if (!census_on() || !code) return;
+    uint32_t v = (uint32_t)code[0];   /* 0xFFFE0300 = vs_3_0, 0xFFFF0300 = ps_3_0 */
+    if (pixel) g_census_ps++;
+    else g_census_vs++;
+    char what[96];
+    snprintf(what, sizeof what, "shader %s_%u_%u (token 0x%08X)", pixel ? "ps" : "vs", (v >> 8) & 0xFF, v & 0xFF, v);
+    census_note(pixel ? 'p' : 'v', v, 0, 0, what);
+}
+
+static void census_log_totals(void)
+{
+    if (!census_on()) return;
+    RE5_INFO("censo", "até agora: %u vertex shaders, %u pixel shaders, %d combinações distintas", g_census_vs,
+             g_census_ps, g_census_n);
+}
+
+static void d_CreateVertexShader(CPU *c)
+{
+    census_shader((const DWORD *)d9_ptr(re5_arg(c, 1)), 0);
+    d9a_IDirect3DDevice9_CreateVertexShader(c);
+}
+
+static void d_CreatePixelShader(CPU *c)
+{
+    census_shader((const DWORD *)d9_ptr(re5_arg(c, 1)), 1);
+    d9a_IDirect3DDevice9_CreatePixelShader(c);
+}
+
 static void d_CreateTexture(CPU *c)
 {
     IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
@@ -584,6 +650,7 @@ static void d_CreateTexture(CPU *c)
     D3DPOOL pool = (D3DPOOL)re5_arg(c, 6);
     uint32_t out = re5_arg(c, 7);
     d9_no_shared(re5_arg(c, 8), "IDirect3DDevice9::CreateTexture");
+    census_resource("textura", (uint32_t)format, usage, (uint32_t)pool);
     if (!out) {
         c->eax = (uint32_t)D3DERR_INVALIDCALL;
         return;
@@ -630,6 +697,7 @@ static void d_CreateCubeTexture(CPU *c)
     D3DPOOL pool = (D3DPOOL)re5_arg(c, 5);
     uint32_t out = re5_arg(c, 6);
     d9_no_shared(re5_arg(c, 7), "IDirect3DDevice9::CreateCubeTexture");
+    census_resource("cubo", (uint32_t)format, usage, (uint32_t)pool);
     if (!out) {
         c->eax = (uint32_t)D3DERR_INVALIDCALL;
         return;
@@ -749,7 +817,10 @@ static void fps_log(void)
                  (double)(pn - pn0) / 1e6 * 1000.0 / dt);
         th0 = th; d30 = d3; dr0 = dr; hp0 = hp; lw0 = lw; dp0 = dp; dn0 = dn; pn0 = pn;
         static int tick, cpu_tick;
-        if (++cpu_tick % 30 == 0) re5_log_process_cpu();   /* CPU por thread a cada 30 s */
+        if (++cpu_tick % 30 == 0) {   /* CPU por thread a cada 30 s */
+            re5_log_process_cpu();
+            census_log_totals();
+        }
         if (++tick % 10 == 0) re5_thunk_log_top(10, dt / 1000.0 * 10);   /* a cada 10 s, média desse intervalo */
         t0 = now;
         n0 = g_presents;
@@ -845,7 +916,11 @@ static void d_Present(CPU *c)
         RE5_BLOCKING_BEGIN();
         uint64_t t0 = re5_stats_on ? re5_stat_now_ns() : 0;
         hr = dev->lpVtbl->Present(dev, src, dst, over, dirty);
-        if (re5_stats_on) RE5_STAT_ADD(RE5_ST_PRESENT_NS, re5_stat_now_ns() - t0);
+        if (re5_stats_on) {
+            uint64_t dt = re5_stat_now_ns() - t0;
+            RE5_STAT_ADD(RE5_ST_PRESENT_NS, dt);
+            if (re5_thunk_current()) ((re5_thunk *)re5_thunk_current())->ns += dt;
+        }
         RE5_BLOCKING_END();
     }
     if (++g_presents == 1) RE5_INFO("d3d9", "primeiro Present -> 0x%08X", (uint32_t)hr);
@@ -1407,6 +1482,8 @@ static const d9_manual k_manual[] = {
     {D9K_DEVICE, "Present", d_Present},
     {D9K_DEVICE, "SetVertexShaderConstantF", d_SetVertexShaderConstantF},
     {D9K_DEVICE, "CreateTexture", d_CreateTexture},
+    {D9K_DEVICE, "CreateVertexShader", d_CreateVertexShader},
+    {D9K_DEVICE, "CreatePixelShader", d_CreatePixelShader},
     {D9K_DEVICE, "CreateCubeTexture", d_CreateCubeTexture},
     {D9K_SURFACE, "LockRect", s_LockRect},
     {D9K_SURFACE, "UnlockRect", s_UnlockRect},
