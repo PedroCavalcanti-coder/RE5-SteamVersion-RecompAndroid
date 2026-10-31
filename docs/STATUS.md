@@ -312,6 +312,23 @@ catálogo fechadas no caminho: `0x00E69D1C` (benchmark variável) e `0x00C212D0`
   21 que faltavam foram semeadas de uma vez (as outras 9 o laço já tinha achado).
   `work/runtime_seeds.txt` tem 35 sementes distintas.
 
+### Backend Vulkan próprio e medida da A0 (2026-10-30, em andamento)
+
+- Projeto em `docs/PROJETO_VULKAN_NATIVO.md` (PC e Android, mesmo código). Decisão: **não
+  começar o backend agora**. No PC o teto medido é pequeno: no mesmo dia (28/10), DXVK 2.6.2
+  com mediana de 63,7 fps contra 68,7 do D3D9 nativo da AMD (`work/bench/cpu-dxvk-262`,
+  `cpu-native-d3d9`). O Android não tem medida ainda.
+- Medida pronta, **ainda não rodada no aparelho** (sem celular no `adb` nesta sessão):
+  - `d3d9_ms` e `present_ms` na linha `fps` do `RE5_FPS_LOG`.
+  - CPU por thread no Linux/Android (`/proc`, grupos jogo/dxvk/driver).
+  - Threads `dxvk-*` nomeadas na DXVK native (`android/dxvk/prepare.py`).
+  - Linha duplicada no logcat corrigida (`log.c`).
+  - `scripts/android_perf.py`, com teste em `tests/python/test_android_perf.py`.
+- Compilado para ARM64 (NDK 30, `build/android-arm64`); a `libdxvk_d3d9.so` foi refeita com os
+  nomes de thread. ctest 30/30 no Windows (árvore com o stub do código gerado). O `steam_lan`
+  falhou 2 vezes em 3 corridas da suíte inteira e passa sozinho: é instável, não vem destas
+  mudanças.
+
 ### Runtime (Fase 3) feito nesta sessão
 
 - `kernel32`: heap (classes de tamanho + arenas de 32 MiB + blocos grandes em região

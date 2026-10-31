@@ -117,6 +117,7 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
     if (th) th->thunk = t->name;
     RE5_TRACE("thunk", "-> %s", t->name);
     /* RE5_GUEST_LOCK=hle: o código do guest roda solto; o lock protege só o HLE. */
+    int d3d9_timed = 0;
     if (re5_stats_on) {
         RE5_STAT_ADD(RE5_ST_THUNKS, 1);
         /* Contagem por thunk amostrada 1 em 16: um store por chamada na tabela global disputava
@@ -126,11 +127,15 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
             RE5_STAT_ADD(RE5_ST_D3D9, 1);
             const char *m = strstr(t->name, "::");
             if (m && !strncmp(m + 2, "Draw", 4)) RE5_STAT_ADD(RE5_ST_DRAWS, 1);
+            /* O Present mede a si mesmo (d3d9.c), sem a espera para retomar o lock. */
+            d3d9_timed = !(m && !strcmp(m + 2, "Present"));
         }
     }
     int lk = re5_guest_lock_mode_hle() && !(t->flags & (RE5_THUNK_NOLOCK | g_nolock_mask));
     if (lk) re5_guest_lock();
+    uint64_t t0 = d3d9_timed ? re5_stat_now_ns() : 0;
     t->fn(c);
+    if (d3d9_timed) RE5_STAT_ADD(RE5_ST_D3D9_NS, re5_stat_now_ns() - t0);
     if (lk) re5_guest_unlock();
     if (th) th->thunk = prev_name;
     t_current_set(prev);

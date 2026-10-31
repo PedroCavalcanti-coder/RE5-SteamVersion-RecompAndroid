@@ -73,8 +73,11 @@ static void vlog(re5_log_level level, const char *channel, const char *fmt, va_l
     int n = snprintf(line, sizeof line, "[%-5s] %-9s ", k_names[level], channel);
     if (n < 0) return;
     vsnprintf(line + n, sizeof line - (size_t)n, fmt, ap);
+#ifndef __ANDROID__
     fprintf(stderr, "%s\n", line);
-#ifdef __ANDROID__
+#else
+    /* No Android o stderr vai para o logcat pelo pipe (re5_log_init): escrever nos dois
+     * duplicava cada linha, e o android_perf.py contava cada segundo do RE5_FPS_LOG duas vezes. */
     static const int k_android_prio[] = {
         ANDROID_LOG_ERROR,
         ANDROID_LOG_WARN,

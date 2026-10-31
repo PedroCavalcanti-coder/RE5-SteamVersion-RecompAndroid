@@ -16,8 +16,13 @@ enum {
     RE5_ST_DRAWS,         /* ... e dos quais Draw* */
     RE5_ST_HEAP,          /* HeapAlloc + HeapFree + HeapReAlloc */
     RE5_ST_LOCKWAIT_NS,   /* tempo esperando o lock do guest/HLE, somado das threads */
+    RE5_ST_D3D9_NS,       /* tempo dentro dos métodos do Direct3D 9 (ponte + DXVK), sem o Present */
+    RE5_ST_PRESENT_NS,    /* tempo dentro do Present (a DXVK espera a GPU/latência de quadros aí) */
     RE5_ST_N
 };
+
+/* Relógio monotônico em ns (o mesmo da espera no lock). */
+uint64_t re5_stat_now_ns(void);
 
 extern int re5_stats_on;
 

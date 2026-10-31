@@ -44,6 +44,18 @@ try:
 finally:
     subprocess.check_output = real_check_output
 
+# Nome das threads (dxvk-cs, dxvk-submit, dxvk-queue...): na 1.9.2b native o setThreadName do
+# Linux é vazio, e as threads herdam o nome da thread do jogo que criou o device. O RE5_FPS_LOG
+# e o scripts/android_perf.py separam a CPU da DXVK da do jogo por esse nome.
+env_linux = args.output / "src/util/platform/util_env_linux.cpp"
+text = env_linux.read_text()
+empty = "  void setThreadName(const std::string& name) {\n  }"
+if empty not in text:
+    raise SystemExit(f"prepare: setThreadName vazio não encontrado em {env_linux}")
+env_linux.write_text(text.replace("#include <unistd.h>", "#include <pthread.h>\n#include <unistd.h>").replace(
+    empty, "  void setThreadName(const std::string& name) {\n"
+           "    pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());\n  }"))
+
 # Shaders embutidos: os .h que a DXVK inclui (gerados pelo meson no build original).
 generated = args.output / "generated"
 generated.mkdir(exist_ok=True)

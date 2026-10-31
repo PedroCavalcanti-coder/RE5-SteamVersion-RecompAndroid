@@ -556,7 +556,7 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
 
 | Item | Decisão | Motivo | Condição para reabrir |
 |---|---|---|---|
-| 1.5 Vulkan nativo na `cRenderDevice` | Adiado | É reescrever a DXVK (shaders SM3 → SPIR-V, estado D3D9 completo); contraria D4; ganho nunca medido | Depois de P1 e P6: a DXVK (thread de CS mais driver) acima de 30% do quadro **no caminho crítico** do perfil |
+| 1.5 Vulkan nativo na `cRenderDevice` | Adiado | É reescrever a DXVK (shaders SM3 → SPIR-V, estado D3D9 completo); contraria D4; ganho nunca medido. Projeto e medida: `docs/PROJETO_VULKAN_NATIVO.md` (corte no nível da API D3D9, não na `cRenderDevice`; PC e Android) | Depois de P1 e P6: a DXVK (thread de CS mais driver) acima de 30% do quadro **no caminho crítico** do perfil; no Android, o critério do §6 do projeto (`d3d9_ms` ≥ 20% do quadro depois da A1) |
 | 1.6 Havok → Jolt, física a 60 Hz com interpolação | Rejeitado | Havok estático no exe, lido diretamente pelo código da Capcom; muda a simulação (princípio 4); o bug aberto da escada perde o oráculo | Nenhuma |
 | 1.7 LOD de animação, IA alternada entre quadros | Rejeitado como padrão | Muda o jogo; o co-op PC×Android diverge | Só como opção desligada por padrão, se o perfil mostrar animação ou IA acima de 20% em cenas de horda, e nunca em partida co-op |
 | 1.7 Skinning na GPU | Rejeitado | O RE5 já faz skinning em vertex shader | Perfil mostrando skinning na CPU |

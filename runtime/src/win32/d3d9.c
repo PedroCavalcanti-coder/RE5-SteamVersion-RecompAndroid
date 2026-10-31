@@ -720,7 +720,7 @@ static void fps_log(void)
 {
     static int on = -1;
     static uint32_t t0, n0;
-    static uint64_t th0, d30, dr0, hp0, lw0, dp0;
+    static uint64_t th0, d30, dr0, hp0, lw0, dp0, dn0, pn0;
     if (on < 0) {
         on = getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") != '0';
         re5_stats_on = on;
@@ -732,16 +732,22 @@ static void fps_log(void)
         double dt = (double)(now - t0);
         uint64_t th = re5_stat_total(RE5_ST_THUNKS), d3 = re5_stat_total(RE5_ST_D3D9),
                  dr = re5_stat_total(RE5_ST_DRAWS), hp = re5_stat_total(RE5_ST_HEAP),
-                 lw = re5_stat_total(RE5_ST_LOCKWAIT_NS), dp = re5_stat_dispatches();
+                 lw = re5_stat_total(RE5_ST_LOCKWAIT_NS), dp = re5_stat_dispatches(),
+                 dn = re5_stat_total(RE5_ST_D3D9_NS), pn = re5_stat_total(RE5_ST_PRESENT_NS);
         /* Por segundo: thunks do HLE (e, deles, D3D9 e Draw*), Heap*, dispatches
-         * (call/jmp indiretos), e a espera no lock em ms somados das threads. */
-        RE5_INFO("d3d9", "fps %.1f (Present %u) thunks %llu d3d9 %llu draws %llu heap %llu dispatch %llu lock_ms %.1f",
+         * (call/jmp indiretos), a espera no lock em ms somados das threads, e os ms
+         * dentro do Direct3D do host (d3d9_ms: ponte + front-end da DXVK na thread
+         * do jogo; present_ms: o Present, onde a DXVK espera a GPU). */
+        RE5_INFO("d3d9",
+                 "fps %.1f (Present %u) thunks %llu d3d9 %llu draws %llu heap %llu dispatch %llu lock_ms %.1f "
+                 "d3d9_ms %.1f present_ms %.1f",
                  (double)(g_presents - n0) * 1000.0 / dt, g_presents,
                  (unsigned long long)((th - th0) * 1000.0 / dt), (unsigned long long)((d3 - d30) * 1000.0 / dt),
                  (unsigned long long)((dr - dr0) * 1000.0 / dt), (unsigned long long)((hp - hp0) * 1000.0 / dt),
                  (unsigned long long)(dp > dp0 ? (dp - dp0) * 1000.0 / dt : 0),
-                 (double)(lw - lw0) / 1e6 * 1000.0 / dt);
-        th0 = th; d30 = d3; dr0 = dr; hp0 = hp; lw0 = lw; dp0 = dp;
+                 (double)(lw - lw0) / 1e6 * 1000.0 / dt, (double)(dn - dn0) / 1e6 * 1000.0 / dt,
+                 (double)(pn - pn0) / 1e6 * 1000.0 / dt);
+        th0 = th; d30 = d3; dr0 = dr; hp0 = hp; lw0 = lw; dp0 = dp; dn0 = dn; pn0 = pn;
         static int tick, cpu_tick;
         if (++cpu_tick % 30 == 0) re5_log_process_cpu();   /* CPU por thread a cada 30 s */
         if (++tick % 10 == 0) re5_thunk_log_top(10, dt / 1000.0 * 10);   /* a cada 10 s, média desse intervalo */
@@ -837,7 +843,9 @@ static void d_Present(CPU *c)
     re5_det_on_present();
     {
         RE5_BLOCKING_BEGIN();
+        uint64_t t0 = re5_stats_on ? re5_stat_now_ns() : 0;
         hr = dev->lpVtbl->Present(dev, src, dst, over, dirty);
+        if (re5_stats_on) RE5_STAT_ADD(RE5_ST_PRESENT_NS, re5_stat_now_ns() - t0);
         RE5_BLOCKING_END();
     }
     if (++g_presents == 1) RE5_INFO("d3d9", "primeiro Present -> 0x%08X", (uint32_t)hr);

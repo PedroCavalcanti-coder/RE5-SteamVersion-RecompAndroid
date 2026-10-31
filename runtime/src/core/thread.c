@@ -18,6 +18,11 @@
 #if !defined(RE5_HOST_WINDOWS)
 #include <pthread.h>
 #endif
+#if defined(__linux__)
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 static uint32_t g_peb;
 static uint32_t g_next_tid = 0x1004;
@@ -51,6 +56,7 @@ uint32_t re5_tls_alloc_slow(volatile uint32_t *slot)
 static re5_thread *g_threads[MAX_THREADS];
 
 int re5_stats_on;
+_Static_assert(RE5_ST_N <= sizeof ((re5_thread *)0)->stats / sizeof(uint64_t), "re5_thread.stats pequeno");
 static uint64_t g_stat_host[RE5_ST_N];      /* threads do host sem re5_thread (atômico) */
 static uint64_t g_stat_retired[RE5_ST_N];   /* threads do guest que já saíram (sob g_tid_mu) */
 
@@ -165,6 +171,8 @@ re5_thread *re5_thread_attach(uint32_t stack_bytes)
     if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, FALSE, 0))
         t->host = h;
+#elif defined(__linux__)
+    t->host_tid = (int)syscall(SYS_gettid);
 #endif
     re5_mutex_lock(&g_tid_mu);
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -349,6 +357,8 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 #endif
+
+uint64_t re5_stat_now_ns(void) { return now_ns(); }
 
 static RE5_NOINLINE int *anon_depth_new(void)
 {
@@ -536,6 +546,117 @@ void re5_log_process_cpu(void)
         rows[bi].sec = -rows[bi].sec;   /* marca como impressa; salvo abaixo */
     }
     for (int i = 0; i < nr && i < 256; i++) { prev_tid[i] = rows[i].tid; prev_sec[i] = rows[i].sec < 0 ? -rows[i].sec : rows[i].sec; }
+    prev_wall_t = wall;
+}
+#elif defined(__linux__)
+/* Lê utime+stime (em ticks) e o núcleo da última execução de /proc/self/task/<tid>/stat. */
+static int proc_task_stat(int tid, char *name, size_t name_sz, double *sec, int *cpu)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *lp = strchr(buf, '('), *rp = strrchr(buf, ')');
+    if (!lp || !rp || rp < lp) return -1;
+    size_t len = (size_t)(rp - lp - 1) < name_sz - 1 ? (size_t)(rp - lp - 1) : name_sz - 1;
+    memcpy(name, lp + 1, len);
+    name[len] = 0;
+    /* Depois do ")": campo 3 (estado) em diante; utime = 14, stime = 15, processor = 39. */
+    unsigned long long ut = 0, st = 0;
+    int field = 3, proc = -1;
+    for (char *p = rp + 2, *tok; (tok = strsep(&p, " ")) && field <= 39; field++) {
+        if (field == 14) ut = strtoull(tok, NULL, 10);
+        else if (field == 15) st = strtoull(tok, NULL, 10);
+        else if (field == 39) proc = atoi(tok);
+    }
+    static long hz;
+    if (!hz) hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
+    *sec = (double)(ut + st) / (double)hz;
+    *cpu = proc;
+    return 0;
+}
+
+/* Grupo da thread: "jogo" (thread do guest, pelo gettid), "dxvk" (dxvk-*), "driver" (mali-*,
+ * kgsl-*, adreno: as threads que o driver Vulkan nomeia) e o nome dela no resto. */
+static const char *task_group(int tid, const char *name, const int *guest, int ng)
+{
+    for (int i = 0; i < ng; i++) if (guest[i] == tid) return "jogo";
+    if (!strncmp(name, "dxvk-", 5)) return "dxvk";
+    if (!strncmp(name, "mali-", 5) || !strncmp(name, "kgsl", 4) || strstr(name, "dreno") || !strncmp(name, "GPU", 3))
+        return "driver";
+    return name;
+}
+
+/* RE5_FPS_LOG no Linux/Android: o mesmo relatório do Windows, de /proc/self/task. As threads
+ * da DXVK native se nomeiam dxvk-* (android/dxvk/prepare.py liga o setThreadName). */
+void re5_log_process_cpu(void)
+{
+    if (!re5_stats_on) return;
+    enum { MAXR = 256, MAXG = 16 };
+    static double t_first;
+    static int prev_tid[MAXR];
+    static double prev_sec[MAXR], prev_wall_t;
+    double now = (double)now_ns() / 1e9;
+    if (!t_first) t_first = now;
+    double wall = now - t_first;   /* desde o primeiro relatório (o fps_log chama a cada 30 s) */
+    int guest[MAX_THREADS], ng = 0;
+    re5_mutex_lock(&g_tid_mu);
+    for (int i = 0; i < MAX_THREADS; i++) if (g_threads[i] && g_threads[i]->host_tid) guest[ng++] = g_threads[i]->host_tid;
+    re5_mutex_unlock(&g_tid_mu);
+    struct row { double sec, util; char name[32]; const char *grp; int tid, cpu; } rows[MAXR];
+    struct { char grp[32]; double util; } grps[MAXG];
+    int nr = 0, nm = 0;
+    double dt = wall - prev_wall_t, total_util = 0;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    for (struct dirent *e; (e = readdir(d)) && nr < MAXR;) {
+        int tid = atoi(e->d_name);
+        if (tid <= 0) continue;
+        struct row *r = &rows[nr];
+        if (proc_task_stat(tid, r->name, sizeof r->name, &r->sec, &r->cpu)) continue;
+        r->tid = tid;
+        r->grp = task_group(tid, r->name, guest, ng);
+        double before = -1;
+        for (int j = 0; j < MAXR; j++) if (prev_tid[j] == tid) before = prev_sec[j];
+        r->util = dt > 0.5 && before >= 0 ? 100.0 * (r->sec - before) / dt : -1.0;
+        if (r->util >= 0) {
+            total_util += r->util;
+            int k = 0;
+            while (k < nm && strcmp(grps[k].grp, r->grp)) k++;
+            if (k == nm && nm < MAXG) { snprintf(grps[nm].grp, sizeof grps[nm].grp, "%s", r->grp); grps[nm++].util = 0; }
+            if (k < nm) grps[k].util += r->util;
+        }
+        nr++;
+    }
+    closedir(d);
+    if (dt > 0.5) {
+        RE5_INFO("cpu", "últimos %.0f s: %.2f núcleos em todas as threads", dt, total_util / 100.0);
+        for (int i = 0; i < nm; i++)
+            RE5_INFO("cpu", "por grupo da thread: %-16s %6.1f%% de um núcleo  (%4.1f%% da CPU do processo)", grps[i].grp,
+                     grps[i].util, total_util > 0 ? 100.0 * grps[i].util / total_util : 0.0);
+    }
+    for (int k = 0; k < 16; k++) {
+        int bi = -1;
+        for (int i = 0; i < nr; i++)
+            if (rows[i].sec > 0 && (bi < 0 || rows[i].util > rows[bi].util ||
+                                    (rows[i].util == rows[bi].util && rows[i].sec > rows[bi].sec)))
+                bi = i;
+        if (bi < 0 || rows[bi].sec < 0.05) break;
+        struct row *r = &rows[bi];
+        if (r->util < 0)
+            RE5_INFO("cpu", "  thread %5d  %7.1f s total  %-6s %s", r->tid, r->sec, r->grp, r->name);
+        else
+            RE5_INFO("cpu", "  thread %5d  %7.1f s total, %5.1f%% de um núcleo agora (cpu%d)  %-6s %s", r->tid, r->sec,
+                     r->util, r->cpu, r->grp, r->name);
+        r->sec = -r->sec;   /* marca como impressa; salvo abaixo */
+    }
+    for (int i = 0; i < MAXR; i++) {
+        prev_tid[i] = i < nr ? rows[i].tid : 0;
+        prev_sec[i] = i < nr ? (rows[i].sec < 0 ? -rows[i].sec : rows[i].sec) : 0;
+    }
     prev_wall_t = wall;
 }
 #else

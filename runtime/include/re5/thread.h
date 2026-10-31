@@ -60,6 +60,7 @@ typedef struct re5_thread {
     uint32_t             stat_sample;  /* RE5_FPS_LOG: amostragem da contagem por thunk */
     uint32_t             start_va;     /* função inicial no guest (CreateThread; entry point na principal) */
     int                  is_main;      /* thread principal do jogo (RE5_PROFILE_THREAD=main) */
+    int                  host_tid;     /* Linux/Android: gettid() (RE5_FPS_LOG separa jogo de DXVK/driver) */
 } re5_thread;
 
 /* Nome da thread do host que chama (SetThreadDescription / pthread_setname_np), visto pelo
