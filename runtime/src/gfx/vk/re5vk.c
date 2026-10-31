@@ -600,6 +600,24 @@ static void swapchain_create(vk_device *d)
     VkSurfaceTransformFlagBitsKHR xf = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
                                            : caps.currentTransform;
+    /* Modo de apresentação como a DXVK: o jogo pede "sem vsync" (D3DPRESENT_INTERVAL_IMMEDIATE) ->
+     * MAILBOX, senão IMMEDIATE; com vsync, FIFO. RE5VK_PRESENT=fifo|mailbox|immediate força.
+     * Medido no PC (Radeon Vega, janela): FIFO forçado travava o menu em ~33 fps. */
+    VkPresentModeKHR modes[8];
+    uint32_t nm = 8;
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(d->phys, d->surface, &nm, modes) < 0) nm = 0;
+    const char *want = getenv("RE5VK_PRESENT");
+    VkPresentModeKHR pref[3] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_KHR};
+    if (want && !strcmp(want, "mailbox")) pref[0] = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (want && !strcmp(want, "immediate")) pref[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    else if (!(want && !strcmp(want, "fifo")) && d->pp.PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE) {
+        pref[0] = VK_PRESENT_MODE_MAILBOX_KHR;
+        pref[1] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    for (int p = 0; p < 3 && mode == VK_PRESENT_MODE_FIFO_KHR; p++)
+        for (uint32_t i = 0; i < nm; i++)
+            if (modes[i] == pref[p]) { mode = pref[p]; break; }
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = d->surface,
@@ -612,7 +630,7 @@ static void swapchain_create(vk_device *d)
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = xf,
         .compositeAlpha = alpha,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* A4: sem quadros jogados fora; o único modo garantido */
+        .presentMode = mode,
         .clipped = VK_TRUE,
         .oldSwapchain = d->swap,
     };
@@ -627,8 +645,9 @@ static void swapchain_create(vk_device *d)
         VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(d->dev, &si, NULL, &d->done[i]));
     }
-    RE5_INFO("re5vk", "swapchain %ux%u, formato %d, %u imagens, FIFO", d->swap_extent.width, d->swap_extent.height,
-             (int)d->swap_format, d->nimages);
+    RE5_INFO("re5vk", "swapchain %ux%u, formato %d, %u imagens, %s", d->swap_extent.width, d->swap_extent.height,
+             (int)d->swap_format, d->nimages,
+             mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO");
 }
 
 /* ---- back buffer e profundidade automática ---- */

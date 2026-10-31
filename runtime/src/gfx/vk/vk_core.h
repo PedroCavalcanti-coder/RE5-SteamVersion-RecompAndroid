@@ -45,7 +45,7 @@
 #define VK_INSTANCE_FNS(X)                                                                                         \
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties)                            \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceSurfaceSupportKHR)                            \
-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkCreateDevice)         \
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkCreateDevice) X(vkGetPhysicalDeviceSurfacePresentModesKHR)         \
     X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR) X(vkEnumerateDeviceExtensionProperties)                          \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFeatures2)  \
     VK_SURFACE_FN(X)
