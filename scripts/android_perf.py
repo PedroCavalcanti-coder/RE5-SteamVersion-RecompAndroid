@@ -164,11 +164,13 @@ def main():
     log.start()
     time.sleep(0.5)
     log.on = True
-    probe = (f"cat /proc/{pid}/task/*/stat 2>/dev/null; echo @@; "
-             f"cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq 2>/dev/null; echo @@; "
-             f"{'cat ' + gpu_file if gpu_file else 'echo'} 2>/dev/null; echo @@; "
-             f"{'cat ' + clk_file if clk_file else 'echo'} 2>/dev/null; echo @@; "
-             f"grep -E 'VmRSS' /proc/{pid}/status 2>/dev/null")
+    def probe_for(pid):
+        return (f"cat /proc/{pid}/task/*/stat 2>/dev/null; echo @@; "
+                f"cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq 2>/dev/null; echo @@; "
+                f"{'cat ' + gpu_file if gpu_file else 'echo'} 2>/dev/null; echo @@; "
+                f"{'cat ' + clk_file if clk_file else 'echo'} 2>/dev/null; echo @@; "
+                f"grep -E 'VmRSS' /proc/{pid}/status 2>/dev/null")
+    probe = probe_for(pid)
     hz = 100
     prev, prev_t = None, None
     util = {}    # tid -> [% de um núcleo por intervalo]
@@ -184,6 +186,20 @@ def main():
                 break
             continue
         rows = parse_stats(parts[0])
+        if not rows:
+            # O jogo fechou ou reabriu (o launcher abre um processo novo): segue o novo, do zero.
+            new = find_pid(s, args.process)
+            if new and new != pid:
+                print(f"android_perf: o processo {pid} saiu; seguindo o novo, {new}", file=sys.stderr)
+                pid, probe, prev = new, probe_for(new), None
+                util, names, cores = {}, {}, {}
+                freqs, gpu, gclk, rss = [], [], [], []
+                log.samples.clear()
+                log.cpu_lines.clear()
+            elif not new:
+                print("android_perf: o processo saiu", file=sys.stderr)
+                break
+            continue
         if prev is not None:
             dt = t - prev_t
             for tid, (name, ticks, cpu) in rows.items():

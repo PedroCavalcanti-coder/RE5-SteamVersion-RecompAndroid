@@ -12,7 +12,15 @@ crítico") e precisa da medida da fase A0.
 
 ## 1. Decisão
 
-**Não vale agora.** O backend próprio fica parado até a medida do Android mostrar o critério
+**Atualização (31/10, com a medida do aparelho, §3.4): o usuário decidiu seguir com o backend,
+e a medida mostra onde ele pode ganhar.** No A54 o quadro não é limitado pela CPU nem pela
+resolução. Ele se perde no pipeline da DXVK: só 2 quadros em voo, o `Present` com 53% do
+quadro e a GPU a 25–40% do clock máximo. Quadros em voo, apresentação e sincronização são
+exatamente o que um backend próprio controla. Antes de cada etapa, o mesmo benchmark mede o
+ganho (E1 primeiro: 3 quadros em voo na própria DXVK). A V2 (`RE5_GFX=re5vk`) está no
+`15469e27`.
+
+Decisão original (30/10, antes da medida no aparelho): **não vale agora.** O backend próprio fica parado até a medida do Android mostrar o critério
 do §6. Os motivos, em ordem de peso:
 
 1. **No PC a DXVK não é o gargalo, e isso está medido.** O fps é limitado pela thread
@@ -98,13 +106,34 @@ custa dezenas de ns no front-end da DXVK (gravar estado, empurrar um comando par
 
 ### 3.4 Resultado no aparelho
 
-*Pendente: sem aparelho no `adb` em 30/10. Preencher com a saída do `android_perf.py`.*
+Medido em 31/10 no Galaxy A54 (SM-A546E, Exynos 1380, Mali-G68), APK com o commit `15469e27`,
+DXVK native 1.9.2b, lock global. A cena é o benchmark variável, disparado sozinho pelo
+roteiro do `re5_env.txt` (`RE5_INPUT_SYNC=titlelogo` + `RE5_INPUT_SCRIPT`). Os logs estão em
+`work/android/a0_dxvk*` (fora do git, D7).
 
-| Cena | fps | quadro (ms) | `d3d9_ms`/quadro | `present_ms`/quadro | jogo (núcleos) | dxvk (núcleos) | driver | GPU | veredito |
+| Resolução do jogo | benchmark (tela) | mediana `RE5_FPS_LOG` | `d3d9_ms`/quadro | `present_ms`/quadro | thread principal | `dxvk-cs` | driver (`mali-cmar-backe`) | GPU ocupada | clock médio da GPU |
 |---|---|---|---|---|---|---|---|---|---|
-| 1-1, 720p, padrão | | | | | | | | | |
-| 1-1, resolução menor | | | | | | | | | |
-| 1-1, `RE5_GUEST_LOCK=hle` | | | | | | | | | |
+| 1920x1080 | 14,3 fps | 15,8 fps | 6,7 ms (16%) | 23,4 ms (53%) | 35–42% de um núcleo | 4–9% | 12–26% | 75% (pico 98%) | ~387 MHz |
+| 1280x720 | 15,4 fps | 15,6 fps | 5,4 ms (15%) | 18,4 ms (53%) | ~35% | ~7% | ~23% | 76% (pico 89%) | ~239 MHz |
+
+O que isso diz:
+
+- **Não é CPU.** O processo inteiro usa 1,2 a 1,6 núcleo, e nenhuma thread chega perto de 100%.
+  A thread principal passa mais da metade do quadro parada dentro do `Present`.
+- **Não é resolução.** Com 2,25× menos pixels, o fps sobe 8%.
+- **A GPU não está no máximo:** 75% ocupada a 240–390 MHz, num Mali-G68 que vai a ~950 MHz.
+  CPU e GPU revezam em vez de trabalhar ao mesmo tempo, e com 75% de ocupação o governador
+  de frequência não sobe o clock. É um problema de **pipeline** (quadros em voo, sincronização),
+  não de força bruta.
+- **Na DXVK 1.9, os quadros em voo são `min(3, BackBufferCount + 1)`** (`d3d9_swapchain.cpp`,
+  `GetActualFrameLatency`), e o RE5 pede 1 back buffer: são **2 quadros**. A swapchain em si
+  já tem 5 a 6 imagens (MAILBOX, 2340x1080).
+- **A DXVK 1.9 cai no driver Mali:** SIGSEGV em `vkCmdBindPipeline`, chamado por
+  `DxvkContext::updateGraphicsPipelineState` na `dxvk-cs` (processo 7010, logo depois do
+  primeiro `SetVertexShaderConstantB`).
+- O teste E1 (`d3d9.numBackBuffers = 3` num `dxvk.conf` pelo `DXVK_CONFIG_FILE`, 3 quadros
+  em voo) ainda não tem uma rodada limpa: a primeira foi interrompida por fora e voltou
+  para 800x600.
 
 ## 4. Onde cortar
 
