@@ -612,8 +612,44 @@ static void census_resource(const char *type, uint32_t format, uint32_t usage, u
     census_note((uint32_t)type[0] | (uint32_t)type[1] << 8, format, usage, pool, what);
 }
 
+/* Tamanho em DWORDs de um bytecode SM1-3: até o token de fim (0x0000FFFF), pulando os comentários. */
+uint32_t re5_d3d9_shader_dwords(const uint32_t *code, uint32_t max)
+{
+    uint32_t i = 1;
+    while (i < max) {
+        uint32_t t = code[i];
+        if (t == 0x0000FFFFu) return i + 1;
+        if ((t & 0xFFFFu) == 0xFFFEu) i += 1 + ((t >> 16) & 0x7FFFu);   /* comentário */
+        else i += 1 + ((t >> 24) & 0xFu);                              /* SM2+: tamanho no token */
+    }
+    return 0;
+}
+
+/* RE5_D3D9_SHADER_DUMP=<pasta>: cada shader criado vai para <pasta>/<vs|ps>_<hash>.bin (insumo dos
+ * testes do tradutor SM3 -> SPIR-V do backend re5vk). */
+static void shader_dump(const DWORD *code, int pixel)
+{
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) {
+        dir = getenv("RE5_D3D9_SHADER_DUMP");
+        if (dir && !*dir) dir = NULL;
+    }
+    if (!dir || !code) return;
+    uint32_t n = re5_d3d9_shader_dwords((const uint32_t *)code, 1u << 20);
+    if (!n) re5_fatal("d3d9", "shader sem token de fim");
+    uint32_t h = 2166136261u;   /* FNV-1a */
+    for (uint32_t i = 0; i < n * 4; i++) h = (h ^ ((const uint8_t *)code)[i]) * 16777619u;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s_%08x.bin", dir, pixel ? "ps" : "vs", h);
+    FILE *f = fopen(path, "wb");
+    if (!f) re5_fatal("d3d9", "RE5_D3D9_SHADER_DUMP: não consegui criar %s", path);
+    fwrite(code, 4, n, f);
+    fclose(f);
+}
+
 static void census_shader(const DWORD *code, int pixel)
 {
+    shader_dump(code, pixel);
     if (!census_on() || !code) return;
     uint32_t v = (uint32_t)code[0];   /* 0xFFFE0300 = vs_3_0, 0xFFFF0300 = ps_3_0 */
     if (pixel) g_census_ps++;
