@@ -127,6 +127,28 @@ static void k_Sleep(CPU *c)
     RE5_BLOCKING_END();
 }
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#include <SDL2/SDL_system.h>
+
+/* No Android o jogo é uma activity (GameActivity, processo ":game"). Se o processo morre
+ * com ela ainda aberta, o sistema a recria num processo novo e o jogo recomeça sozinho
+ * (com o roteiro do re5_env.txt, roda o benchmark de novo). Antes do exit(), a activity
+ * fecha (GameActivity.onNativeExit espera o finish() ser pedido na thread de UI). */
+static void android_finish_activity(void)
+{
+    JNIEnv *env = SDL_AndroidGetJNIEnv();
+    jobject act = env ? SDL_AndroidGetActivity() : NULL;
+    if (!act) return;
+    jclass cls = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetMethodID(env, cls, "onNativeExit", "()V");
+    if (m) (*env)->CallVoidMethod(env, act, m);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);   /* sem o método: segue para o exit() */
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, act);
+}
+#endif
+
 static void k_ExitProcess(CPU *c)
 {
     uint32_t code = re5_arg(c, 0);
@@ -136,6 +158,9 @@ static void k_ExitProcess(CPU *c)
     re5_log_process_cpu();
     re5_dispatch_trail_print();
     fflush(NULL);
+#if defined(__ANDROID__)
+    android_finish_activity();
+#endif
     exit((int)code);
 }
 

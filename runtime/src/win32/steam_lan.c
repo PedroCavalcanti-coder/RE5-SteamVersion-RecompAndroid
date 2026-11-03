@@ -1236,6 +1236,14 @@ static int read_identity(const char *path, uint32_t *id, char *name, size_t cap,
     return 1;
 }
 
+/* No Android a configuração do multiplayer fica só no launcher (o menu LAN do jogo
+ * não existe lá); no PC, F12 ou três dedos abrem o menu dentro do jogo. */
+#if defined(__ANDROID__)
+#define LAN_EDIT_WHERE "no launcher do app (Multiplayer)"
+#else
+#define LAN_EDIT_WHERE "dentro do jogo: F12 ou toque com tres dedos"
+#endif
+
 static void write_identity(const char *path)
 {
     mkdir_parents(path);
@@ -1247,7 +1255,7 @@ static void write_identity(const char *path)
     char hosts[128];
     manual_hosts_text(hosts, sizeof hosts);
     fprintf(f, "# Identidade do jogador no multiplayer LAN do RE5.\n"
-               "# Tambem editavel dentro do jogo: F12 ou toque com tres dedos.\n"
+               "# Tambem editavel %s.\n"
                "# nome:  o que os outros jogadores veem (ate %d caracteres, sem '#').\n"
                "# pais:  codigo de duas letras da bandeira (BR, PT, US...).\n"
                "# hosts: IPs de hosts para procurar direto, separados por virgula (rede sem broadcast).\n"
@@ -1257,7 +1265,7 @@ static void write_identity(const char *path)
                "pais=%s\n"
                "hosts=%s\n"
                "id=%u\n",
-            RE5_LAN_MAX_NAME_LEN, g_local_name, g_local_country, hosts, g_file_id);
+            LAN_EDIT_WHERE, RE5_LAN_MAX_NAME_LEN, g_local_name, g_local_country, hosts, g_file_id);
     fclose(f);
 }
 
@@ -1305,8 +1313,7 @@ static void load_identity(uint16_t base_p2p)
     parse_manual_hosts(hosts);
     if (need_write) {
         write_identity(g_identity_path);
-        RE5_INFO("steam_lan", "Identidade LAN criada em %s (F12 ou toque com tres dedos no jogo para editar)",
-                 g_identity_path);
+        RE5_INFO("steam_lan", "Identidade LAN criada em %s (editavel %s)", g_identity_path, LAN_EDIT_WHERE);
     } else if (have_path) {
         RE5_INFO("steam_lan", "Identidade LAN lida de %s", g_identity_path);
     }

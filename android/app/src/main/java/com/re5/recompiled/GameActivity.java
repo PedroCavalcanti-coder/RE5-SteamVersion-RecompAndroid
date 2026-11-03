@@ -1,10 +1,12 @@
 package com.re5.recompiled;
 
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -13,6 +15,7 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -112,17 +115,33 @@ public class GameActivity extends SDLActivity {
         provisionCleanExecutable();
 
         super.onCreate(savedInstanceState);
+        if (isFinishing()) return;   // recriada pelo sistema: shouldStartGame recusou
+
+        try {
+            nativeSetenv("SDL_ACCELEROMETER_AS_JOYSTICK", "0");
+        } catch (Throwable ignored) {}
 
         SharedPreferences prefs = getSharedPreferences("re5_settings", MODE_PRIVATE);
+        // Modo paralelo (experimental): o código do jogo roda em paralelo, com o lock só no HLE.
+        // Sem a ordem de memória do x86 garantida no ARM64 (fase A1, hle-tso), por isso opcional.
+        // O ambiente vence o re5_env.txt (main.c); o SDL_main ainda não começou aqui.
+        if (prefs.getBoolean("parallel_mode", false)) {
+            try {
+                nativeSetenv("RE5_GUEST_LOCK", "hle");
+            } catch (Throwable ignored) {}
+        }
         boolean touchEnabled = prefs.getBoolean("touch_enabled", true);
         float touchOpacity = prefs.getFloat("touch_opacity", 0.85f);
         float touchScale = prefs.getFloat("touch_scale", 1.0f);
         boolean hudEnabled = prefs.getBoolean("hud_enabled", true);
 
         TouchControlsView touch = new TouchControlsView(this);
+        touchView = touch;
         touch.setControlsEnabled(touchEnabled);
         touch.setControlsOpacity(touchOpacity);
         touch.setControlsScale(touchScale);
+        touch.setLookSensitivity(prefs.getFloat("touch_look_sens", 1.0f));
+        touch.setHideWithPad(prefs.getBoolean("touch_hide_with_pad", true));
         touch.setOnMenuToggleListener(this::toggleOverlay);
 
         overlay = buildOverlay();
@@ -145,13 +164,111 @@ public class GameActivity extends SDLActivity {
         }
 
         startLogReader();
+        watchInputDevices();
+    }
+
+    // ------------------------------------------------------------------ ciclo de vida
+    // O jogo não sobrevive à morte do processo ":game": recriar a activity seria começar
+    // do zero (e, com um roteiro no re5_env.txt, rodar o benchmark de novo, como se fossem
+    // "duas instâncias"). Então a activity recriada pelo sistema volta ao launcher, e a
+    // saída do jogo (ExitProcess, botão Sair) fecha a activity antes de matar o processo.
+
+    @Override
+    protected boolean shouldStartGame(Bundle savedInstanceState) {
+        if (GameSession.claimLaunch(this, getIntent().getStringExtra("LAUNCH_ID"))) return true;
+        Log.i(TAG, "activity recriada pelo sistema depois que o processo do jogo morreu: volta ao launcher");
+        android.widget.Toast.makeText(this, "O jogo foi fechado pelo Android em segundo plano. Toque em JOGAR "
+                + "para abrir de novo.", android.widget.Toast.LENGTH_LONG).show();
+        Intent i = new Intent(this, LauncherActivity.class);
+        i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        startActivity(i);
+        return false;
+    }
+
+    /** Chamado pelo runtime (ExitProcess, kernel32.c) na thread do jogo, logo antes do exit(). */
+    @SuppressWarnings("unused")
+    public void onNativeExit() {
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        runOnUiThread(() -> {
+            finish();
+            done.countDown();
+        });
+        try {
+            done.await(2, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+        }
     }
 
     @Override
     protected void onDestroy() {
         readingLog = false;
         hudHandler.removeCallbacks(hudRunnable);
+        InputManager im = (InputManager) getSystemService(INPUT_SERVICE);
+        if (im != null) im.unregisterInputDeviceListener(deviceListener);
         super.onDestroy();
+    }
+
+    // ------------------------------------------------------------------ dispositivos de entrada
+    // O toque é o padrão no celular. Ligar um controle ou um teclado físico avisa na tela
+    // (como o jogo avisa o controle no PC); o runtime troca o dispositivo ativo quando ele
+    // é usado (re5/touch.h) e os botões da tela somem até o próximo toque.
+
+    private TouchControlsView touchView;
+    private final android.util.SparseArray<String> knownDevices = new android.util.SparseArray<>();
+
+    /** "controle" ou "teclado" para um aparelho físico; null para o resto (sensores, toque, botões do corpo). */
+    private static String deviceKind(InputDevice d) {
+        if (d == null || d.isVirtual()) return null;
+        int s = d.getSources();
+        if ((s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return "controle";
+        if ((s & InputDevice.SOURCE_KEYBOARD) == InputDevice.SOURCE_KEYBOARD
+                && d.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC) return "teclado";
+        return null;
+    }
+
+    private final InputManager.InputDeviceListener deviceListener = new InputManager.InputDeviceListener() {
+        @Override
+        public void onInputDeviceAdded(int id) {
+            InputDevice d = InputDevice.getDevice(id);
+            String kind = deviceKind(d);
+            if (kind == null) return;
+            knownDevices.put(id, kind);
+            notice(("controle".equals(kind) ? "🎮 Controle conectado: " : "⌨ Teclado conectado: ") + d.getName());
+        }
+
+        @Override
+        public void onInputDeviceRemoved(int id) {
+            String kind = knownDevices.get(id);
+            if (kind == null) return;
+            knownDevices.remove(id);
+            notice(("controle".equals(kind) ? "🎮 Controle" : "⌨ Teclado") + " desconectado · voltando ao toque");
+        }
+
+        @Override
+        public void onInputDeviceChanged(int id) {}
+    };
+
+    private void watchInputDevices() {
+        InputManager im = (InputManager) getSystemService(INPUT_SERVICE);
+        if (im == null) return;
+        im.registerInputDeviceListener(deviceListener, main);
+        StringBuilder already = new StringBuilder();
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            String kind = deviceKind(d);
+            if (kind == null) continue;
+            knownDevices.put(id, kind);
+            if (already.length() > 0) already.append(", ");
+            already.append(kind).append(' ').append(d.getName());
+        }
+        // Mostrado quando a tela de carregamento sai (embaixo dela ninguém veria).
+        if (already.length() > 0) startupNotice = "Conectado: " + already;
+    }
+
+    private void notice(String text) {
+        Log.i(TAG, text);
+        if (touchView != null) touchView.showNotice(text);
     }
 
     /** Constrói a visualização do HUD de telemetria */
@@ -326,10 +443,17 @@ public class GameActivity extends SDLActivity {
     }
 
     private void quitGame() {
-        android.os.Process.killProcess(android.os.Process.myPid());
+        finish();   // sem isso o sistema recria a activity num processo novo
+        main.postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()), 300);
     }
 
+    private String startupNotice;
+
     private void hideOverlay() {
+        if (startupNotice != null) {
+            notice(startupNotice);
+            startupNotice = null;
+        }
         if (overlay.getVisibility() != View.VISIBLE) return;
         overlay.animate().alpha(0f).setDuration(350).withEndAction(() -> overlay.setVisibility(View.GONE));
     }

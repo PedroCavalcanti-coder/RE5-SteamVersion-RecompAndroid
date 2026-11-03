@@ -35,6 +35,7 @@
 #include "re5/coldebug.h"
 #include "re5/lan_menu.h"
 #include "re5/runtime.h"
+#include "re5/touch.h"
 #include "re5/user32.h"
 #include "re5_cursors.h"
 
@@ -537,6 +538,7 @@ static void sdl_init(void)
 {
     if (g_sdl_ready || getenv("RE5_HEADLESS")) return;
     SDL_SetMainReady();
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* o handler de crash do runtime fica */
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
@@ -995,9 +997,17 @@ void re5_user32_post(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lpar
     post_msg(hwnd, msg, wparam, lparam);
 }
 
+/* Toque direto na tela (re5/touch.h): o dedo é um mouse só do botão esquerdo. */
+static int g_touch_down;           /* dedo apertado (botão esquerdo para o jogo) */
+static int g_touch_cursor;         /* 1: o cursor está onde o dedo tocou por último */
+static int32_t g_touch_cx, g_touch_cy;   /* posição em coordenadas cliente do jogo */
+static uint32_t g_touch_down_ms;
+static int g_touch_up_pending;
+
 static uint32_t mouse_keys(void)
 {
     uint32_t mk = 0, b = g_sdl_ready ? SDL_GetMouseState(NULL, NULL) : 0;
+    if (g_touch_down) b |= SDL_BUTTON_LMASK;
     if (b & SDL_BUTTON_LMASK) mk |= U32_MK_LBUTTON;
     if (b & SDL_BUTTON_RMASK) mk |= U32_MK_RBUTTON;
     if (b & SDL_BUTTON_MMASK) mk |= U32_MK_MBUTTON;
@@ -1116,12 +1126,25 @@ void re5_user32_handle_event(const SDL_Event *e)
             if (ev.key.keysym.scancode == SDL_SCANCODE_F6) re5_coldebug_key();
             if (ev.key.keysym.scancode == SDL_SCANCODE_F11) re5_capture_key();
         }
+        if (ev.key.keysym.scancode != SDL_SCANCODE_AC_BACK) {   /* "voltar" do Android não */
+            if (re5_input_active() != RE5_INPUT_KBM)
+                RE5_INFO("input", "tecla %s: teclado físico", SDL_GetScancodeName(ev.key.keysym.scancode));
+            re5_input_note(RE5_INPUT_KBM);
+        }
         on_key(&ev.key, find_sdl(ev.key.windowID));
         break;
     case SDL_TEXTINPUT:
         on_text(ev.text.text, find_sdl(ev.text.windowID));
         break;
     case SDL_MOUSEMOTION:
+#if !defined(__ANDROID__)
+        /* No Android o movimento sozinho não conta: o SetCursorPos do jogo (warp do SDL)
+         * também gera SDL_MOUSEMOTION, e trocaria o toque por "mouse" sem ninguém mexer. */
+        if (ev.motion.which != SDL_TOUCH_MOUSEID) {
+            re5_input_note(RE5_INPUT_KBM);
+            g_touch_cursor = 0;   /* o mouse de verdade volta a mandar no cursor */
+        }
+#endif
         g_mouse_dx += ev.motion.xrel;
         g_mouse_dy += ev.motion.yrel;
         if ((w = find_sdl(ev.motion.windowID)) != NULL) {
@@ -1143,6 +1166,10 @@ void re5_user32_handle_event(const SDL_Event *e)
         break;
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP:
+        if (ev.button.which != SDL_TOUCH_MOUSEID) {
+            re5_input_note(RE5_INPUT_KBM);
+            g_touch_cursor = 0;
+        }
         if ((w = find_sdl(ev.button.windowID)) != NULL) {
             int down = ev.type == SDL_MOUSEBUTTONDOWN;
             uint32_t msg = ev.button.button == SDL_BUTTON_LEFT ? (down ? U32_WM_LBUTTONDOWN : U32_WM_LBUTTONUP)
@@ -1251,8 +1278,91 @@ static void apply_display_requests(void)
     update_clip_grab();
 }
 
+/* ---- toque direto na tela (re5/touch.h) ----
+ * O app manda a posição normalizada; aqui ela vira coordenada cliente do jogo (o
+ * tamanho que o jogo pediu para a janela, ou o do backbuffer em tela cheia), não a
+ * da superfície do Android, que tem outra resolução. O clique dura pelo menos
+ * TOUCH_MIN_PRESS_MS: um toque rápido não pode apertar e soltar entre duas leituras
+ * do mouse do DirectInput. */
+#define TOUCH_MIN_PRESS_MS 60u
+
+static window *touch_window(void)
+{
+    window *w = find_window(g_active);
+    for (int i = 0; !w && i < MAX_WINDOWS; i++)
+        if (g_windows[i].used) w = &g_windows[i];
+    return w;
+}
+
+static void touch_pos(window *w, float nx, float ny)
+{
+    int32_t cw, ch;
+    if (g_fs_active && g_render_w > 0 && g_render_h > 0) {
+        cw = (int32_t)g_render_w;
+        ch = (int32_t)g_render_h;
+    } else {
+        client_size(w, &cw, &ch);
+    }
+    g_touch_cx = (int32_t)(nx * (float)cw);
+    g_touch_cy = (int32_t)(ny * (float)ch);
+    if (g_touch_cx >= cw) g_touch_cx = cw - 1;
+    if (g_touch_cy >= ch) g_touch_cy = ch - 1;
+    if (g_touch_cx < 0) g_touch_cx = 0;
+    if (g_touch_cy < 0) g_touch_cy = 0;
+    g_touch_cursor = 1;
+}
+
+static void touch_send(window *w, uint32_t msg)
+{
+    post_msg(w->hwnd, msg, mouse_keys(), pack16(g_touch_cx, g_touch_cy));
+}
+
+static void touch_release(window *w)
+{
+    g_touch_down = 0;
+    g_touch_up_pending = 0;
+    touch_send(w, U32_WM_LBUTTONUP);
+}
+
+static void touch_apply(void)
+{
+    window *w = touch_window();
+    uint32_t now = SDL_GetTicks();
+    if (g_touch_up_pending) {
+        if (now - g_touch_down_ms < TOUCH_MIN_PRESS_MS) return;   /* o jogo ainda não viu o botão apertado */
+        if (w) touch_release(w);
+        else g_touch_down = g_touch_up_pending = 0;
+    }
+    re5_touch_ptr_event ev;
+    while (re5_touch_take_pointer(&ev)) {
+        if (!w) continue;   /* sem janela ainda: não há onde clicar */
+        touch_pos(w, ev.nx, ev.ny);
+        switch (ev.action) {
+        case RE5_TOUCH_PTR_DOWN:
+            if (g_touch_down) touch_release(w);
+            touch_send(w, U32_WM_MOUSEMOVE);
+            g_touch_down = 1;
+            g_touch_down_ms = now;
+            touch_send(w, U32_WM_LBUTTONDOWN);
+            break;
+        case RE5_TOUCH_PTR_MOVE:
+            touch_send(w, U32_WM_MOUSEMOVE);
+            break;
+        default:
+            if (!g_touch_down) break;
+            if (now - g_touch_down_ms < TOUCH_MIN_PRESS_MS) {
+                g_touch_up_pending = 1;   /* solta num bombeamento seguinte */
+                return;
+            }
+            touch_release(w);
+            break;
+        }
+    }
+}
+
 static void pump(void)
 {
+    touch_apply();
     if (!g_sdl_ready) return;
     apply_display_requests();
     SDL_Event ev;
@@ -1366,6 +1476,7 @@ void re5_user32_mouse_take(int32_t *dx, int32_t *dy, int32_t *dz)
 uint32_t re5_user32_mouse_buttons(void)
 {
     uint32_t b = g_sdl_ready ? SDL_GetMouseState(NULL, NULL) : 0, out = 0;
+    if (g_touch_down) b |= SDL_BUTTON_LMASK;
     if (b & SDL_BUTTON_LMASK) out |= 1u;
     if (b & SDL_BUTTON_RMASK) out |= 2u;
     if (b & SDL_BUTTON_MMASK) out |= 4u;
@@ -1543,8 +1654,11 @@ static void free_cursors(void)
     if (g_cursor_sdl_sys_arrow) { SDL_FreeCursor(g_cursor_sdl_sys_arrow); g_cursor_sdl_sys_arrow = NULL; }
 }
 
+static int g_cursor_initialized = 0;
+
 static int cursor_hidden(void)
 {
+    if (!g_cursor_initialized) return 0;   /* no início (logos/menus), o cursor NÃO está escondido */
     return !g_cursor || g_cursor == (U32_CURSOR_BASE | 104u) || g_cursor_count < 0;
 }
 
@@ -1586,6 +1700,7 @@ static void apply_cursor(void)
 
 static void u_SetCursor(CPU *c)
 {
+    g_cursor_initialized = 1;
     c->eax = g_cursor;
     g_cursor = re5_arg(c, 0);
     apply_cursor();
@@ -1593,6 +1708,7 @@ static void u_SetCursor(CPU *c)
 
 static void u_ShowCursor(CPU *c)
 {
+    g_cursor_initialized = 1;
     g_cursor_count += re5_arg(c, 0) ? 1 : -1;
     apply_cursor();
     c->eax = (uint32_t)g_cursor_count;
@@ -1601,6 +1717,15 @@ static void u_ShowCursor(CPU *c)
 static void u_GetCursorPos(CPU *c)
 {
     uint32_t pt = re5_arg(c, 0);
+    if (g_touch_cursor) {   /* último toque direto: onde o dedo está, em tela (cliente + origem) */
+        window *w = touch_window();
+        int32_t ox = 0, oy = 0;
+        if (w && !(g_fs_active && g_render_w > 0 && g_render_h > 0)) client_origin(w, &ox, &oy);
+        wr32(pt, (uint32_t)(ox + g_touch_cx));
+        wr32(pt + 4, (uint32_t)(oy + g_touch_cy));
+        c->eax = 1;
+        return;
+    }
     int x = g_cursor_x, y = g_cursor_y;
     if (g_sdl_ready && !g_rel_on) {
         SDL_GetGlobalMouseState(&x, &y);
@@ -1640,6 +1765,7 @@ static void u_SetCursorPos(CPU *c)
 {
     int32_t x = (int32_t)re5_arg(c, 0);
     int32_t y = (int32_t)re5_arg(c, 1);
+    g_touch_cursor = 0;   /* o jogo levou o cursor para outro lugar */
     window *w = find_window(g_active);
     if (!w) {
         for (int i = 0; i < MAX_WINDOWS; i++) {

@@ -93,11 +93,25 @@ opacidade, e modo (segurar/alternar). Também: sensibilidade da câmera e da mir
 separados), inverter Y, vibração, modo canhoto (espelha), restaurar padrão, perfis
 salvos. Tudo num `controls.json` na pasta do app.
 
-Como chega ao jogo: o overlay traduz toques em entrada de **teclado e mouse** no HLE
-(`dinput8`/`user32`): a câmera e a mira do RE5 de PC com mouse são contínuas e
-precisas, melhores para arrasto que o analógico emulado. Movimento usa as teclas de
-direção com intensidade pelo raio do joystick (ou XInput virtual se o andar analógico
-fizer falta). Gamepad físico continua funcionando e esconde o overlay.
+Como chega ao jogo (revisto em 2026-10-30): o toque é um **dispositivo próprio do
+runtime** (`runtime/src/win32/touch.c`, `re5/touch.h`), não teclado nem mouse do SDL.
+O app (`TouchControlsView`) chama por JNI `nativeTouchPad` (botões no formato
+`XINPUT_GAMEPAD_*`, analógicos e gatilhos já com zona morta) e `nativeTouchPointer`
+(toque direto, posição normalizada). O runtime guarda o último dispositivo usado
+(teclado/mouse, controle físico, toque; `nativeActiveInput`), e o app esconde os botões
+quando um controle físico está em uso. Para o jogo, que só conhece teclado/mouse e
+XInput: os botões e analógicos são somados ao usuário 0 do XInput (com o controle
+físico 0, se houver), então o RE5 mostra os ícones do controle - as mesmas letras dos
+botões da tela -, os QTEs pedem um botão só (no teclado pedem dois) e todos os menus
+navegam pelo analógico; o toque direto num menu é um clique na posição, convertida
+para a área cliente do jogo (não a da superfície do Android), com pelo menos 60 ms
+apertado. Teclado e mouse por teclas ficaram de fora porque o jogo troca os ícones
+para o teclado a cada movimento do mouse. O toque é o dispositivo padrão no celular;
+controle ou teclado físico conectado gera um aviso na tela (`GameActivity`, com o
+nome do aparelho), vira o dispositivo ativo quando usado e esconde os botões até o
+próximo toque. Quando o controle físico chega ou sai, o usuário 0 do XInput fica
+desligado por 500 ms (`re5_xinput_slot0_gap`) para o próprio jogo ver a conexão e
+avisar, como no PC.
 
 Desenho: ImGui com o backend D3D9, desenhado no `Present` da ponte D3D9 (passa pela
 DXVK como o resto do quadro); o editor de layout é o mesmo overlay em modo edição.

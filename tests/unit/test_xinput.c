@@ -11,6 +11,7 @@
 
 #include "check.h"
 #include "re5/runtime.h"
+#include "re5/touch.h"
 #include "re5/xinput.h"
 
 const re5_func_entry re5_lifted_table[1];
@@ -79,5 +80,61 @@ int main(void)
     CHECK_EQ_U32(s16(g + 4), 7849);
     CHECK_EQ_U32((uint16_t)s16(g + 8), (uint16_t)-8689);
     CHECK_EQ_U32(g[2], 31);
+
+    /* Controle de toque (re5/touch.h): liga o usuário 0 mesmo sem controle físico; os
+     * outros continuam desligados. Y para cima positivo, gatilhos 0..1 -> 0..255. */
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_NONE);
+    re5_touch_set_pad(RE5_TOUCH_A | RE5_TOUCH_LB, 0.5f, 1.0f, -1.0f, 0.f, 1.0f, 0.f);
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_TOUCH);
+    const uint32_t a0[2] = {0, buf};
+    CHECK_EQ_U32(call("XInputGetState", 2, a0), 0);
+    uint32_t pkt = rd32(buf);
+    const uint8_t *st = re5_g2h(buf + 4);
+    CHECK_EQ_U32(st[0] | st[1] << 8, 0x1100);   /* A | LEFT_SHOULDER */
+    CHECK_EQ_U32(st[2], 255);
+    CHECK_EQ_U32(st[3], 0);
+    CHECK_EQ_U32(s16(st + 4), 16384);           /* 0,5 * 32767 arredondado */
+    CHECK_EQ_U32(s16(st + 6), 32767);
+    CHECK_EQ_U32((uint16_t)s16(st + 8), (uint16_t)-32767);
+    CHECK_EQ_U32(call("XInputGetState", 2, a0), 0);
+    CHECK_EQ_U32(rd32(buf), pkt);               /* nada mudou: mesmo dwPacketNumber */
+    re5_input_note(RE5_INPUT_PAD);
+    re5_touch_set_pad(0, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);       /* soltar tudo não tira o controle físico */
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_PAD);
+    CHECK_EQ_U32(call("XInputGetState", 2, a0), 0);
+    CHECK(rd32(buf) != pkt);
+    CHECK_EQ_U32(call("XInputGetCapabilities", 3, caps), 0);
+    CHECK_EQ_U32(call("XInputSetState", 2, vib), 0);
+    const uint32_t a1[2] = {1, buf};
+    CHECK_EQ_U32(call("XInputGetState", 2, a1), 1167);
+
+    /* Soma com o controle físico: botões em OU, gatilho maior, analógico mais inclinado. */
+    uint8_t phys[12] = {0x01, 0x20, 10, 200, 0x10, 0x27, 0, 0, 0x00, 0x10, 0, 0};   /* LX 10000, RX 4096 */
+    uint8_t tch[12] = {0x00, 0x10, 90, 50, 0x00, 0x08, 0x00, 0x08, 0x00, 0x80, 0, 0}; /* LX=LY 2048, RX -32768 */
+    re5_touch_merge(phys, tch);
+    CHECK_EQ_U32(phys[0] | phys[1] << 8, 0x3001);
+    CHECK_EQ_U32(phys[2], 90);
+    CHECK_EQ_U32(phys[3], 200);
+    CHECK_EQ_U32(s16(phys + 4), 10000);         /* o físico estava mais inclinado */
+    CHECK_EQ_U32(s16(phys + 6), 0);
+    CHECK_EQ_U32((uint16_t)s16(phys + 8), (uint16_t)-32768);
+
+    /* Troca toque <-> controle físico no usuário 0: o usuário 0 some por 500 ms para o
+     * jogo ver o controle entrar (e avisar, como no PC). */
+    CHECK_EQ_U32(re5_xinput_slot0_gap(0, 1, 1000), 0);        /* só o toque */
+    re5_input_note(RE5_INPUT_TOUCH);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(1, 1, 2000), 1);        /* controle físico chegou */
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_PAD);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(1, 1, 2499), 1);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(1, 1, 2500), 0);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(0, 1, 9000), 1);        /* saiu: volta o toque, com a mesma lacuna */
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_TOUCH);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(0, 1, 9500), 0);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(1, 0, 9600), 0);        /* sem toque (PC): sem lacuna */
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_PAD);
+    CHECK_EQ_U32(re5_xinput_slot0_gap(0, 0, 9700), 0);
+
+    re5_touch_reset();
+    CHECK_EQ_U32(call("XInputGetState", 2, a0), 1167);
     CHECK_DONE();
 }

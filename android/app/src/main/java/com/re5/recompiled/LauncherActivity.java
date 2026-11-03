@@ -72,6 +72,7 @@ public final class LauncherActivity extends Activity {
 
     private TextView statusChip;
     private TextView rowState, rowSize, rowWhere, rowDevice;
+    private TextView rowLanProfile, rowLanHosts, rowLanIp;
     private View migrateCard, installCard, permCard, rarCleanCard, progressCard, filesActions;
     private TextView migrateText, installRarButton, rarCleanText, progressTitle, progressDetail;
     private ProgressBar progressBar;
@@ -121,6 +122,7 @@ public final class LauncherActivity extends Activity {
                 + " " + Build.MODEL + " · Android " + Build.VERSION.RELEASE + " · " + vulkanVersion());
         filesActions.setVisibility(GameStorage.hasData(dir) ? View.VISIBLE : View.GONE);
         updateSize(dir);
+        refreshLan();
 
         migrateCard.setVisibility(legacyData && !busy ? View.VISIBLE : View.GONE);
         if (legacyData) {
@@ -195,6 +197,7 @@ public final class LauncherActivity extends Activity {
         GameSession.markStarted(this);
         Intent intent = new Intent(this, GameActivity.class);
         intent.putExtra("GAME_DIR", dir.getAbsolutePath());
+        intent.putExtra("LAUNCH_ID", Long.toString(System.currentTimeMillis()) + "-" + System.nanoTime());
         startActivity(intent);
     }
 
@@ -528,11 +531,21 @@ public final class LauncherActivity extends Activity {
         inst.addView(installRarButton, buttonLp());
         inst.addView(button("Escolher arquivo…", SURFACE_2, TEXT, v -> openArchivePicker()), buttonLp());
 
-        // Configurações (Multiplayer, Controles, HUD)
+        // Multiplayer: toda a configuração da LAN fica aqui (o jogo não tem tela para isso)
+        LinearLayout mp = card(body);
+        mp.addView(cardTitle("Multiplayer cooperativo (LAN)", TEXT));
+        rowLanProfile = infoRow(mp, "Jogador");
+        rowLanHosts = infoRow(mp, "Procurar em");
+        rowLanIp = infoRow(mp, "IP deste aparelho");
+        mp.addView(text("Os dois aparelhos na mesma rede Wi-Fi (ou um no hotspot do outro). No jogo: Multiplayer > "
+                + "criar ou entrar na sessão.", 12, TEXT_DIM, false));
+        mp.addView(button("Editar multiplayer", SURFACE_2, TEXT, v -> showLanDialog()), buttonLp());
+
+        // Configurações (Controles, HUD)
         LinearLayout cfg = card(body);
-        cfg.addView(cardTitle("Configurações do Jogo", TEXT));
-        cfg.addView(text("Multiplayer Cooperativo (LAN), controles na tela e monitor de telemetria.", 13, TEXT_DIM, false));
-        cfg.addView(button("⚙ Abrir Configurações", SURFACE_2, TEXT, v -> showSettingsDialog()), buttonLp());
+        cfg.addView(cardTitle("Configurações do jogo", TEXT));
+        cfg.addView(text("Controles na tela, monitor de desempenho e opções avançadas.", 13, TEXT_DIM, false));
+        cfg.addView(button("⚙ Abrir configurações", SURFACE_2, TEXT, v -> showSettingsDialog()), buttonLp());
 
         // Arquivos do jogo
         LinearLayout info = card(body);
@@ -725,18 +738,27 @@ public final class LauncherActivity extends Activity {
         return cfg;
     }
 
+    /* Mesmo formato que o runtime grava (steam_lan.c, write_identity): ele relê no início do jogo. */
     private void saveLanConfig(String name, String country, String hosts, long existingId) {
         File f = lanConfigFile();
         File parent = f.getParentFile();
         if (parent != null && !parent.exists()) parent.mkdirs();
 
-        long id = existingId > 0 ? existingId : (100000 + (long)(Math.random() * 899999));
-        name = name != null && !name.trim().isEmpty() ? name.trim() : "Jogador";
+        long id = existingId >= 100000 && existingId < 1000000 ? existingId : (100000 + (long) (Math.random() * 900000));
+        name = name != null ? name.replace("#", "").trim() : "";
+        if (name.isEmpty()) name = "Jogador";
+        if (name.length() > LAN_NAME_MAX) name = name.substring(0, LAN_NAME_MAX);
         country = country != null && country.trim().length() >= 2 ? country.trim().substring(0, 2).toUpperCase(Locale.US) : "BR";
-        hosts = hosts != null ? hosts.trim() : "";
+        hosts = hosts != null ? hosts.replace(" ", "").replace(";", ",").trim() : "";
 
         try (FileWriter w = new FileWriter(f)) {
-            w.write("# Identidade do jogador no multiplayer LAN do RE5\n");
+            w.write("# Identidade do jogador no multiplayer LAN do RE5.\n"
+                    + "# Tambem editavel no launcher do app (Multiplayer).\n"
+                    + "# nome:  o que os outros jogadores veem (ate " + LAN_NAME_MAX + " caracteres, sem '#').\n"
+                    + "# pais:  codigo de duas letras da bandeira (BR, PT, US...).\n"
+                    + "# hosts: IPs de hosts para procurar direto, separados por virgula (rede sem broadcast).\n"
+                    + "# id:    seu codigo unico na rede; nao copie este arquivo para outro aparelho.\n"
+                    + "#        Apague a linha para gerar um novo.\n");
             w.write("nome=" + name + "\n");
             w.write("pais=" + country + "\n");
             w.write("hosts=" + hosts + "\n");
@@ -746,12 +768,101 @@ public final class LauncherActivity extends Activity {
         }
     }
 
-    private void showSettingsDialog() {
+    private static final int LAN_NAME_MAX = 24;   // RE5_LAN_MAX_NAME_LEN
+
+    private void refreshLan() {
         LanConfig lan = loadLanConfig();
+        rowLanProfile.setText(lan.name + (lan.id > 0 ? " #" + lan.id : "") + " · " + lan.country);
+        rowLanHosts.setText(lan.hosts.isEmpty() ? "rede local (automático)" : lan.hosts);
+        String ips = localIpv4();
+        rowLanIp.setText(ips.isEmpty() ? "sem rede" : ips);
+    }
+
+    /** IPv4 das interfaces ativas (Wi-Fi, hotspot): o parceiro digita um destes em "Procurar em". */
+    private static String localIpv4() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (java.net.NetworkInterface ni : java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                String n = ni.getName();
+                if (n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("dummy")) continue;   // dados móveis
+                for (java.net.InetAddress a : java.util.Collections.list(ni.getInetAddresses())) {
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
+                        if (sb.length() > 0) sb.append(", ");
+                        sb.append(a.getHostAddress());
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return sb.toString();
+    }
+
+    private static boolean validHosts(String hosts) {
+        if (hosts.isEmpty()) return true;
+        for (String h : hosts.split(",")) {
+            if (!h.matches("\\d{1,3}(\\.\\d{1,3}){3}")) return false;
+            for (String p : h.split("\\.")) if (Integer.parseInt(p) > 255) return false;
+        }
+        return true;
+    }
+
+    private void showLanDialog() {
+        LanConfig lan = loadLanConfig();
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(20), dp(16), dp(20), dp(16));
+        scroll.addView(col);
+
+        col.addView(text("Sua identidade no cooperativo em rede local. Vale na próxima vez que o jogo abrir.", 12, TEXT_DIM, false));
+
+        col.addView(dialogFieldLabel("Nome do jogador (até " + LAN_NAME_MAX + " letras)"));
+        EditText editName = dialogEditText(lan.name);
+        editName.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(LAN_NAME_MAX)});
+        col.addView(editName);
+
+        col.addView(dialogFieldLabel("País da bandeira (duas letras: BR, PT, US...)"));
+        EditText editCountry = dialogEditText(lan.country);
+        editCountry.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(2),
+                new android.text.InputFilter.AllCaps()});
+        col.addView(editCountry);
+
+        col.addView(dialogFieldLabel("Procurar sessão nestes IPs (opcional)"));
+        EditText editHosts = dialogEditText(lan.hosts);
+        editHosts.setHint("Ex.: 192.168.1.100, 192.168.43.1");
+        col.addView(editHosts);
+        String ips = localIpv4();
+        col.addView(text("Deixe vazio para achar a sessão sozinho na rede. Use só se a rede bloqueia a busca: "
+                + "o IP do aparelho que cria a sessão. O deste aparelho: " + (ips.isEmpty() ? "sem rede" : ips) + ".",
+                12, TEXT_DIM, false));
+
+        AlertDialog dlg = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Multiplayer (LAN)")
+                .setView(scroll)
+                .setPositiveButton("Salvar", null)
+                .setNegativeButton("Cancelar", null)
+                .create();
+        dlg.setOnShowListener(d -> dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String hosts = editHosts.getText().toString().replace(" ", "").replace(";", ",");
+            if (!validHosts(hosts)) {
+                editHosts.setError("IPs no formato 192.168.0.10, separados por vírgula");
+                return;
+            }
+            saveLanConfig(editName.getText().toString(), editCountry.getText().toString(), hosts, lan.id);
+            refreshLan();
+            Toast.makeText(this, "Multiplayer salvo", Toast.LENGTH_SHORT).show();
+            dlg.dismiss();
+        }));
+        dlg.show();
+    }
+
+    private void showSettingsDialog() {
         SharedPreferences prefs = getSharedPreferences("re5_settings", MODE_PRIVATE);
         boolean touchEnabled = prefs.getBoolean("touch_enabled", true);
         float touchOpacity = prefs.getFloat("touch_opacity", 0.85f);
         float touchScale = prefs.getFloat("touch_scale", 1.0f);
+        float lookSens = prefs.getFloat("touch_look_sens", 1.0f);
+        boolean hidePad = prefs.getBoolean("touch_hide_with_pad", true);
         boolean hudEnabled = prefs.getBoolean("hud_enabled", true);
 
         ScrollView scroll = new ScrollView(this);
@@ -760,33 +871,31 @@ public final class LauncherActivity extends Activity {
         col.setPadding(dp(20), dp(16), dp(20), dp(16));
         scroll.addView(col);
 
-        // --- 1. MULTIPLAYER LAN ---
-        col.addView(cardTitle("🎮 Multiplayer Cooperativo (LAN)", RED));
-        col.addView(text("Configure sua identidade para jogar em modo cooperativo na mesma rede Wi-Fi / Hotspot.", 12, TEXT_DIM, false));
-
-        col.addView(dialogFieldLabel("Nome do Jogador"));
-        EditText editName = dialogEditText(lan.name);
-        col.addView(editName);
-
-        col.addView(dialogFieldLabel("País / Bandeira (ex: BR, US, PT)"));
-        EditText editCountry = dialogEditText(lan.country);
-        col.addView(editCountry);
-
-        col.addView(dialogFieldLabel("IP do Host Parceiro (deixe vazio se você for criar a sala)"));
-        EditText editHosts = dialogEditText(lan.hosts);
-        editHosts.setHint("Ex: 192.168.1.100");
-        col.addView(editHosts);
-
-        // Divisor
-        col.addView(dialogDivider());
-
-        // --- 2. CONTROLES NA TELA ---
-        col.addView(cardTitle("🕹 Controles Virtuais na Tela", RED));
+        // --- 1. CONTROLES NA TELA ---
+        col.addView(cardTitle("🕹 Controles na tela", RED));
+        col.addView(text("Os botões levam as letras do controle (A, B, X, Y, LB, RT...), as mesmas que o jogo mostra "
+                + "nos avisos e nos QTEs.", 12, TEXT_DIM, false));
         CheckBox checkTouch = new CheckBox(this);
-        checkTouch.setText("Exibir botões táteis virtuais");
+        checkTouch.setText("Mostrar os controles na tela");
         checkTouch.setTextColor(TEXT);
         checkTouch.setChecked(touchEnabled);
         col.addView(checkTouch);
+
+        CheckBox checkHidePad = new CheckBox(this);
+        checkHidePad.setText("Esconder quando usar um controle físico (voltam ao tocar na tela)");
+        checkHidePad.setTextColor(TEXT);
+        checkHidePad.setChecked(hidePad);
+        col.addView(checkHidePad);
+
+        col.addView(dialogFieldLabel("Sensibilidade da câmera (arrastar à direita)"));
+        Spinner spinLook = new Spinner(this);
+        String[] looks = {"Baixa (60%)", "Média (80%)", "Normal (100%)", "Alta (130%)", "Muito alta (170%)"};
+        float[] lookVals = {0.6f, 0.8f, 1.0f, 1.3f, 1.7f};
+        spinLook.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, looks));
+        int lookIdx = 2;
+        for (int i = 0; i < lookVals.length; i++) if (Math.abs(lookSens - lookVals[i]) < 0.05f) lookIdx = i;
+        spinLook.setSelection(lookIdx);
+        col.addView(spinLook);
 
         col.addView(dialogFieldLabel("Opacidade dos Botões"));
         Spinner spinOpacity = new Spinner(this);
@@ -828,6 +937,21 @@ public final class LauncherActivity extends Activity {
         // Divisor
         col.addView(dialogDivider());
 
+        // --- DESEMPENHO ---
+        col.addView(cardTitle("⚡ Desempenho", RED));
+        CheckBox checkParallel = new CheckBox(this);
+        checkParallel.setText("Modo paralelo (experimental)");
+        checkParallel.setTextColor(TEXT);
+        checkParallel.setChecked(prefs.getBoolean("parallel_mode", false));
+        col.addView(checkParallel);
+        col.addView(text("As threads do jogo rodam ao mesmo tempo, como no PC: som sem atraso, menos telas de "
+                + "carregamento e cerca do dobro de fps nas cenas pesadas. Experimental: a ordem de memória do "
+                + "processador do celular ainda não é igualada à do PC, então pode haver travamento ou erro raro. "
+                + "Se acontecer, desligue.", 12, TEXT_DIM, false));
+
+        // Divisor
+        col.addView(dialogDivider());
+
         // --- 4. AVANÇADO: variáveis RE5_* (re5_env.txt, lido pelo runtime) ---
         col.addView(cardTitle("🔧 Avançado (testes de desempenho)", RED));
         col.addView(text("Uma variável por linha, ex.: RE5_FPS_LOG=1 ou RE5_CPUS=4. Vai para re5_env.txt na pasta do jogo "
@@ -843,11 +967,6 @@ public final class LauncherActivity extends Activity {
                 .setTitle("Configurações")
                 .setView(scroll)
                 .setPositiveButton("Salvar", (d, w) -> {
-                    String newName = editName.getText().toString();
-                    String newCountry = editCountry.getText().toString();
-                    String newHosts = editHosts.getText().toString();
-                    saveLanConfig(newName, newCountry, newHosts, lan.id);
-
                     boolean newTouch = checkTouch.isChecked();
                     float newOp = opVals[spinOpacity.getSelectedItemPosition()];
                     float newSc = scVals[spinScale.getSelectedItemPosition()];
@@ -859,6 +978,9 @@ public final class LauncherActivity extends Activity {
                             .putBoolean("touch_enabled", newTouch)
                             .putFloat("touch_opacity", newOp)
                             .putFloat("touch_scale", newSc)
+                            .putFloat("touch_look_sens", lookVals[spinLook.getSelectedItemPosition()])
+                            .putBoolean("touch_hide_with_pad", checkHidePad.isChecked())
+                            .putBoolean("parallel_mode", checkParallel.isChecked())
                             .putBoolean("hud_enabled", newHud)
                             .apply();
 
@@ -872,8 +994,7 @@ public final class LauncherActivity extends Activity {
         try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
             StringBuilder sb = new StringBuilder();
             String line;
-            while ((line = br.readLine()) != null) sb.append(line).append('
-');
+            while ((line = br.readLine()) != null) sb.append(line).append('\n');
             return sb.toString().trim();
         } catch (java.io.IOException e) {
             return "";
@@ -889,8 +1010,7 @@ public final class LauncherActivity extends Activity {
                 return;
             }
             try (java.io.FileWriter w = new java.io.FileWriter(f)) {
-                w.write(t + "
-");
+                w.write(t + "\n");
             }
         } catch (java.io.IOException e) {
             Toast.makeText(this, "Não consegui gravar re5_env.txt: " + e.getMessage(), Toast.LENGTH_LONG).show();

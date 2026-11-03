@@ -7,6 +7,9 @@
  * janela (RE5_HEADLESS) o SDL não é iniciado e não há controle: o mesmo que um
  * PC sem nenhum ligado.
  *
+ * O controle de toque do Android (re5/touch.h) é somado ao usuário 0: com ele
+ * ligado, o usuário 0 existe mesmo sem controle físico.
+ *
  * XInputGetState/SetState/GetCapabilities: stdcall, devolvem códigos do Win32
  * (ERROR_SUCCESS, ERROR_DEVICE_NOT_CONNECTED, ERROR_BAD_ARGUMENTS).
  */
@@ -16,6 +19,7 @@
 #include <SDL2/SDL.h>
 
 #include "re5/runtime.h"
+#include "re5/touch.h"
 #include "re5/xinput.h"
 
 #define XI_ERROR_SUCCESS              0u
@@ -28,7 +32,8 @@ typedef struct {
     SDL_Joystick       *js;
     SDL_JoystickID      id;
     uint32_t            packet;
-    uint8_t             last[12];
+    uint8_t             last[12];   /* último estado do controle físico */
+    uint8_t             sent[12];   /* último estado entregue ao jogo (físico + toque) */
 } pad;
 
 static pad g_pads[XI_USERS];
@@ -164,6 +169,29 @@ static int16_t flip(int16_t v) { return v == INT16_MIN ? INT16_MAX : (int16_t)-v
 #define XI_RIGHT_THUMB_DEADZONE 8689
 #define XI_TRIGGER_THRESHOLD    30
 
+/* Troca entre o toque e o controle físico no usuário 0 (re5/touch.h). Com o toque
+ * ligado o usuário 0 já existe; se o controle físico simplesmente "entrasse" nele,
+ * o jogo não veria conexão nenhuma e não avisaria. Então, quando o físico chega ou
+ * sai, o usuário 0 fica desligado por XI_SWAP_GAP_MS: o jogo vê o controle sair e
+ * entrar, como ao ligar um controle no PC. */
+#define XI_SWAP_GAP_MS 500u
+
+static int g_phys0 = -1;        /* controle físico no usuário 0 na última leitura (-1: nenhuma) */
+static uint32_t g_gap_until;
+
+int re5_xinput_slot0_gap(int phys, int touch, uint32_t now)
+{
+    if (g_phys0 >= 0 && phys != g_phys0 && touch) {
+        g_gap_until = now + XI_SWAP_GAP_MS;
+        RE5_INFO("xinput", "controle físico %s: usuário 0 desligado por %u ms (o jogo vê a troca)",
+                 phys ? "conectado" : "desconectado", XI_SWAP_GAP_MS);
+    }
+    if (phys && g_phys0 != 1) re5_input_note(RE5_INPUT_PAD);
+    else if (!phys && g_phys0 == 1 && touch) re5_input_note(RE5_INPUT_TOUCH);   /* tirou o controle: volta o toque */
+    g_phys0 = phys;
+    return (int32_t)(g_gap_until - now) > 0;
+}
+
 static int16_t apply_deadzone(int16_t val, int16_t deadzone)
 {
     if (val > -deadzone && val < deadzone) return 0;
@@ -222,38 +250,52 @@ static void x_GetState(CPU *c)
         return;
     }
     pad *p = pad_of(user);
-    if (!p) {
+    uint8_t touch[12];
+    int has_touch = user == 0 && re5_touch_pad(touch);   /* controle de toque: usuário 0 (re5/touch.h) */
+    if (user == 0 && re5_xinput_slot0_gap(p != NULL, has_touch, SDL_GetTicks())) {
         c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
         return;
     }
-    int16_t axis[6] = {0};
-    uint32_t buttons = 0;
-    if (p->gc) {
-        for (int a = 0; a < 6; a++) axis[a] = SDL_GameControllerGetAxis(p->gc, (SDL_GameControllerAxis)a);
-        for (int k = 0; k < SDL_CONTROLLER_BUTTON_MAX && k < 32; k++)
-            if (SDL_GameControllerGetButton(p->gc, (SDL_GameControllerButton)k)) buttons |= 1u << k;
-    } else if (p->js) {
-        int naxes = SDL_JoystickNumAxes(p->js);
-        for (int a = 0; a < 6 && a < naxes; a++) axis[a] = SDL_JoystickGetAxis(p->js, a);
-        int nbuttons = SDL_JoystickNumButtons(p->js);
-        for (int b = 0; b < nbuttons && b < 32; b++) {
-            if (SDL_JoystickGetButton(p->js, b)) buttons |= (1u << b);
-        }
-        if (SDL_JoystickNumHats(p->js) > 0) {
-            Uint8 hat = SDL_JoystickGetHat(p->js, 0);
-            if (hat & SDL_HAT_UP)    buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_UP);
-            if (hat & SDL_HAT_DOWN)  buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_DOWN);
-            if (hat & SDL_HAT_LEFT)  buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_LEFT);
-            if (hat & SDL_HAT_RIGHT) buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
-        }
+    if (!p && !has_touch) {
+        c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
+        return;
     }
-    uint8_t g[12];
-    re5_xinput_gamepad(axis, buttons, g);
-    if (memcmp(g, p->last, sizeof g) != 0) {   /* dwPacketNumber muda quando o estado muda */
+    uint8_t g[12] = {0};
+    if (p) {
+        int16_t axis[6] = {0};
+        uint32_t buttons = 0;
+        if (p->gc) {
+            for (int a = 0; a < 6; a++) axis[a] = SDL_GameControllerGetAxis(p->gc, (SDL_GameControllerAxis)a);
+            for (int k = 0; k < SDL_CONTROLLER_BUTTON_MAX && k < 32; k++)
+                if (SDL_GameControllerGetButton(p->gc, (SDL_GameControllerButton)k)) buttons |= 1u << k;
+        } else if (p->js) {
+            int naxes = SDL_JoystickNumAxes(p->js);
+            for (int a = 0; a < 6 && a < naxes; a++) axis[a] = SDL_JoystickGetAxis(p->js, a);
+            int nbuttons = SDL_JoystickNumButtons(p->js);
+            for (int b = 0; b < nbuttons && b < 32; b++) {
+                if (SDL_JoystickGetButton(p->js, b)) buttons |= (1u << b);
+            }
+            if (SDL_JoystickNumHats(p->js) > 0) {
+                Uint8 hat = SDL_JoystickGetHat(p->js, 0);
+                if (hat & SDL_HAT_UP)    buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_UP);
+                if (hat & SDL_HAT_DOWN)  buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+                if (hat & SDL_HAT_LEFT)  buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+                if (hat & SDL_HAT_RIGHT) buttons |= (1u << SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+            }
+        }
+        re5_xinput_gamepad(axis, buttons, g);
+        static const uint8_t k_rest[12];
+        if (memcmp(g, p->last, sizeof g) != 0 && memcmp(g, k_rest, sizeof g) != 0)
+            re5_input_note(RE5_INPUT_PAD);   /* mexeu no controle físico: o app esconde os botões da tela */
         memcpy(p->last, g, sizeof g);
-        p->packet++;
     }
-    wr32(out, p->packet);
+    if (has_touch) re5_touch_merge(g, touch);
+    pad *st = &g_pads[user];   /* dwPacketNumber muda quando o estado (somado) muda */
+    if (memcmp(g, st->sent, sizeof g) != 0) {
+        memcpy(st->sent, g, sizeof g);
+        st->packet++;
+    }
+    wr32(out, st->packet);
     memcpy(re5_g2h(out + 4), g, sizeof g);
     c->eax = XI_ERROR_SUCCESS;
 }
@@ -266,8 +308,9 @@ static void x_SetState(CPU *c)
         return;
     }
     pad *p = pad_of(user);
-    if (!p) {
-        c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
+    uint8_t touch[12];
+    if (!p) {   /* só o controle de toque: aceita e não vibra nada */
+        c->eax = user == 0 && re5_touch_pad(touch) ? XI_ERROR_SUCCESS : XI_ERROR_DEVICE_NOT_CONNECTED;
         return;
     }
     /* XINPUT_VIBRATION: wLeftMotorSpeed, wRightMotorSpeed. O XInput mantém até
@@ -287,7 +330,9 @@ static void x_GetCapabilities(CPU *c)
         c->eax = XI_ERROR_BAD_ARGUMENTS;
         return;
     }
-    if (!re5_det_is_enabled() && !pad_of(user)) {
+    uint8_t touch[12];
+    int in_gap = user == 0 && (int32_t)(g_gap_until - SDL_GetTicks()) > 0;
+    if (in_gap || (!re5_det_is_enabled() && !pad_of(user) && !(user == 0 && re5_touch_pad(touch)))) {
         c->eax = XI_ERROR_DEVICE_NOT_CONNECTED;
         return;
     }

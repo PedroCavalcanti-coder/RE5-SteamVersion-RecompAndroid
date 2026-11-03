@@ -14,7 +14,6 @@ import android.os.Vibrator;
 import android.util.AttributeSet;
 import android.util.TypedValue;
 import android.view.HapticFeedbackConstants;
-import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 
@@ -24,16 +23,24 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * TouchControlsView - Camada moderna e glassmórfica de controles táteis virtuais para Resident Evil 5.
- * 
- * Funcionalidades:
- * - Botões de ação aparecem APENAS durante o gameplay (cursor escondido no runtime).
- * - Nos menus (título, pausa, inventário, opções), botões de ação somem para liberar a tela.
- * - Toque direto com o dedo nos menus para clicar nos botões do jogo.
- * - Analógico virtual navega nos menus com D-Pad (Up/Down/Left/Right) com repetição suave.
- * - No gameplay, analógico move o personagem com WASD e o lado direito move a mira com trackpad relativo.
- * - Todos os botões essenciais: Mirar, Atirar, Ação/Melee, Recarregar, Faca, Corrida/Sprint,
- *   Giro Rápido 180°, Mapa/GPS, Atalhos Rápidos 1-2-3-4, Inventário, Parceiro, Pausa.
+ * Controles na tela, como um dispositivo de TOQUE do runtime (runtime/src/win32/touch.c).
+ *
+ * Nada aqui vira tecla nem mouse do SDL: os botões e os analógicos vão por
+ * {@link SDLActivity#nativeTouchPad} e o toque direto nos menus por
+ * {@link SDLActivity#nativeTouchPointer}. O runtime marca a entrada como toque, soma o
+ * "controle de toque" ao usuário 0 do XInput (o jogo mostra os ícones do controle - as
+ * mesmas letras dos botões daqui - e navega todos os menus pelo analógico) e diz qual
+ * dispositivo foi usado por último ({@link SDLActivity#nativeActiveInput}). O toque é o
+ * padrão; com um controle ou teclado físico em uso os botões somem, um aviso diz qual
+ * dispositivo está em uso, e tudo volta no primeiro toque.
+ *
+ * Layout do controle no RE5 (tipo D, o padrão): LT mira, RT atira, LB faca, RB mapa,
+ * A corre/recarrega, B parceiro, X ação, Y inventário, Back pula a cena, Start pausa,
+ * D-pad troca rápida, giro 180 = analógico para baixo + A.
+ *
+ * Gameplay x menu: o cursor escondido pelo jogo = gameplay (nativeIsCursorHidden). No
+ * menu somem os botões só de combate; tocar sem arrastar clica onde o dedo tocou, e
+ * arrastar na metade esquerda vira o analógico (navegação).
  */
 public class TouchControlsView extends View {
 
@@ -41,115 +48,153 @@ public class TouchControlsView extends View {
         void onToggleMenu();
     }
 
+    // XINPUT_GAMEPAD_* (re5/touch.h)
+    private static final int DPAD_UP = 0x0001, DPAD_DOWN = 0x0002, DPAD_LEFT = 0x0004, DPAD_RIGHT = 0x0008;
+    private static final int START = 0x0010, BACK = 0x0020, LB = 0x0100, RB = 0x0200;
+    private static final int A = 0x1000, B = 0x2000, X = 0x4000, Y = 0x8000;
+    private static final int TRIG_LT = -1, TRIG_RT = -2, QUICK_TURN = -3;
+
+    // re5_input_source
+    private static final int SRC_KBM = 1, SRC_PAD = 2;
+    // RE5_TOUCH_PTR_*
+    private static final int PTR_DOWN = 0, PTR_MOVE = 1, PTR_UP = 2;
+
+    /** Onde o botão aparece: em todo lugar ou só no gameplay. */
+    private static final int SHOW_ALWAYS = 0, SHOW_GAMEPLAY = 1;
+
+    private static final float STICK_DEADZONE = 0.10f;   // fração do raio
+    private static final long TICK_MS = 16;
+
     private OnMenuToggleListener menuToggleListener;
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint subTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF tmpRect = new RectF();
 
-    // Joystick virtual
-    private boolean joystickActive = false;
-    private int joystickPointerId = -1;
-    private float joystickBaseX, joystickBaseY;
-    private float joystickKnobX, joystickKnobY;
-    private float joystickRadius;
-    private float joystickKnobRadius;
+    static final class TouchButton {
+        final String label, gameSub, menuSub;
+        final int color, bits, show;
+        final boolean round, dragLook;
+        final RectF bounds = new RectF();
+        int pointerId = -1;
 
-    // Estado do analógico em Gameplay (WASD)
-    private boolean keyW = false;
-    private boolean keyA = false;
-    private boolean keyS = false;
-    private boolean keyD = false;
+        TouchButton(String label, String gameSub, String menuSub, int color, int bits, int show,
+                    boolean round, boolean dragLook) {
+            this.label = label;
+            this.gameSub = gameSub;
+            this.menuSub = menuSub;
+            this.color = color;
+            this.bits = bits;
+            this.show = show;
+            this.round = round;
+            this.dragLook = dragLook;
+        }
 
-    // Estado do analógico em Menus (D-Pad)
-    private int activeMenuDpadKey = 0;
-    private long lastDpadRepeatTime = 0;
-    private static final long DPAD_INITIAL_DELAY_MS = 320;
-    private static final long DPAD_REPEAT_INTERVAL_MS = 180;
+        boolean isDown() { return pointerId != -1; }
+    }
 
-    // Trackpad de mira (área direita durante gameplay)
-    private int lookPointerId = -1;
-    private float lastLookX, lastLookY;
+    private final List<TouchButton> buttons = new ArrayList<>();
+    private TouchButton btnA, btnB, btnX, btnY, btnLT, btnRT, btnLB, btnRB, btnTurn;
+    private TouchButton btnUp, btnDown, btnLeft, btnRight, btnStart, btnBack;
 
-    // Toque no menu (clique com o dedo)
-    private int menuTouchPointerId = -1;
+    // Pílulas do topo (do app, não do jogo)
+    private final RectF pillMenu = new RectF(), pillHide = new RectF();
 
-    // Verificação periódica de estado de Menu vs Gameplay
-    private final Handler stateCheckHandler = new Handler(Looper.getMainLooper());
-    private boolean inGameplay = false; // true = gameplay 3D, false = menus/inventário/pausa
+    // Analógico esquerdo flutuante
+    private int stickPointer = -1;
+    private float stickRestX, stickRestY, stickBaseX, stickBaseY, stickKnobX, stickKnobY;
+    private float stickRadius, stickKnobRadius;
+    private float lx, ly;
 
-    // Configurações personalizáveis
+    // Câmera: arrasto no lado direito (ou segurando RT) vira o analógico direito
+    private int lookPointer = -1;
+    private float lookLastX, lookLastY, lookAccX, lookAccY;
+    private long lookLastTick;
+    private float rx, ry;
+    private float lookSensitivity = 1.0f;
+
+    // Toque ainda indefinido (menu): vira clique se soltar parado, ou arrasto
+    private int pendingPointer = -1;
+    private float pendingX, pendingY;
+    private boolean pendingLeft;
+    private int dragPointer = -1;   // arrasto do "mouse" no menu
+    private float dragLastX, dragLastY;
+
+    // Giro 180: analógico para baixo e depois A
+    private long turnStart = 0;
+
+    private boolean inGameplay = false;
     private boolean controlsEnabled = true;
+    private boolean hideWithPad = true;
+    private boolean hiddenByDevice = false;
     private float controlsOpacity = 0.85f;
     private float controlsScale = 1.0f;
 
-    // Estrutura de botão de toque
-    public static class TouchButton {
-        final String id;
-        final String label;
-        final String subLabel;
-        final int color;
-        final int keycode;
-        final int mouseButton; // 0 = nenhum, 1 = esquerdo, 3 = direito
-        final boolean isQuickTurn;
-        RectF bounds = new RectF();
-        boolean isDown = false;
-        int activePointerId = -1;
+    // Último estado enviado ao runtime (só manda quando muda)
+    private int sentButtons = -1;
+    private float sentLx, sentLy, sentRx, sentRy, sentLt, sentRt;
 
-        TouchButton(String id, String label, String subLabel, int color, int keycode, int mouseButton) {
-            this(id, label, subLabel, color, keycode, mouseButton, false);
-        }
-
-        TouchButton(String id, String label, String subLabel, int color, int keycode, int mouseButton, boolean isQuickTurn) {
-            this.id = id;
-            this.label = label;
-            this.subLabel = subLabel;
-            this.color = color;
-            this.keycode = keycode;
-            this.mouseButton = mouseButton;
-            this.isQuickTurn = isQuickTurn;
-        }
-    }
-
-    private final List<TouchButton> actionButtons = new ArrayList<>();
-    private final List<TouchButton> quickSlots = new ArrayList<>();
-    private final TouchButton btnMenu = new TouchButton("MENU", "⚙", "PAINEL", 0xFF3B82F6, 0, 0);
-    private final TouchButton btnHideControls = new TouchButton("HIDE", "🎮", "", 0xFF64748B, 0, 0);
+    // Aviso de dispositivo (toque / teclado / controle) no alto da tela
+    private int lastSource = 0;
+    private String notice;
+    private long noticeAt = -10000;
+    private static final long NOTICE_MS = 3000;
 
     private Vibrator vibrator;
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private final Runnable stateCheckRunnable = new Runnable() {
+    private final Runnable stateCheck = new Runnable() {
         @Override
         public void run() {
-            boolean wasInGameplay = inGameplay;
+            // Liga o controle de toque já no início: o jogo vê o controle desde a abertura.
+            if (sentButtons == -1) sendPad();
+            boolean was = inGameplay;
             try {
-                // nativeIsCursorHidden() é true quando o jogo escondeu o cursor (gameplay)
                 inGameplay = SDLActivity.nativeIsCursorHidden();
             } catch (Throwable ignored) {
                 inGameplay = true;
             }
-
-            if (wasInGameplay != inGameplay) {
-                if (!inGameplay) {
-                    // Saiu do gameplay e entrou em menu: solta teclas WASD e mira
-                    resetGameplayInputs();
+            int src = 0;
+            try {
+                src = SDLActivity.nativeActiveInput();
+            } catch (Throwable ignored) {}
+            if (src != lastSource && src != 0) {
+                // Aviso de troca (a conexão em si o GameActivity avisa com o nome do aparelho).
+                if (SystemClock.uptimeMillis() - noticeAt > 2500) {
+                    if (src == SRC_PAD) showNotice("🎮 Usando o controle · toque na tela para voltar");
+                    else if (src == SRC_KBM) showNotice("⌨ Usando o teclado · toque na tela para voltar");
+                    else if (lastSource == SRC_PAD || lastSource == SRC_KBM) showNotice("✋ Usando o toque");
                 }
+                lastSource = src;
+            }
+            boolean hide = hideWithPad && (src == SRC_PAD || src == SRC_KBM);
+            if (hide != hiddenByDevice) {
+                hiddenByDevice = hide;
+                if (hide) releaseAll();
                 invalidate();
             }
-
-            // Atualiza repetição do D-Pad se segurado no menu
-            if (!inGameplay && joystickActive && activeMenuDpadKey != 0) {
-                long now = SystemClock.uptimeMillis();
-                if (now - lastDpadRepeatTime >= DPAD_REPEAT_INTERVAL_MS) {
-                    SDLActivity.onNativeKeyDown(activeMenuDpadKey);
-                    SDLActivity.onNativeKeyUp(activeMenuDpadKey);
-                    lastDpadRepeatTime = now;
-                }
+            if (was != inGameplay) {
+                releaseGameplayOnly();
+                invalidate();
             }
-
-            stateCheckHandler.postDelayed(this, 120);
+            handler.postDelayed(this, 120);
         }
     };
+
+    private final Runnable tick = new Runnable() {
+        @Override
+        public void run() {
+            updateLook();
+            sendPad();
+            if (lookPointer != -1 || rx != 0 || ry != 0 || turnStart != 0) {
+                handler.postDelayed(this, TICK_MS);
+            } else {
+                ticking = false;
+            }
+        }
+    };
+    private boolean ticking = false;
 
     public TouchControlsView(Context context) {
         super(context);
@@ -161,80 +206,99 @@ public class TouchControlsView extends View {
         init();
     }
 
-    public void setOnMenuToggleListener(OnMenuToggleListener listener) {
-        this.menuToggleListener = listener;
-    }
+    public void setOnMenuToggleListener(OnMenuToggleListener listener) { menuToggleListener = listener; }
 
     public void setControlsEnabled(boolean enabled) {
-        this.controlsEnabled = enabled;
+        controlsEnabled = enabled;
+        if (!enabled) releaseAll();
         invalidate();
     }
 
     public void setControlsOpacity(float opacity) {
-        this.controlsOpacity = Math.max(0.2f, Math.min(1.0f, opacity));
+        controlsOpacity = Math.max(0.2f, Math.min(1.0f, opacity));
         invalidate();
     }
 
     public void setControlsScale(float scale) {
-        this.controlsScale = Math.max(0.7f, Math.min(1.4f, scale));
+        controlsScale = Math.max(0.7f, Math.min(1.4f, scale));
         layoutButtons(getWidth(), getHeight());
         invalidate();
     }
 
+    public void setLookSensitivity(float s) { lookSensitivity = Math.max(0.3f, Math.min(3f, s)); }
+
+    public void setHideWithPad(boolean hide) { hideWithPad = hide; }
+
+    /** Aviso curto no alto da tela (controle/teclado conectado, dispositivo em uso). */
+    public void showNotice(String text) {
+        notice = text;
+        noticeAt = SystemClock.uptimeMillis();
+        invalidate();
+        handler.postDelayed(this::invalidate, NOTICE_MS + 50);
+    }
+
+    private void drawNotice(Canvas canvas) {
+        if (notice == null || SystemClock.uptimeMillis() - noticeAt > NOTICE_MS) return;
+        textPaint.setTextSize(dp(13));
+        float tw = textPaint.measureText(notice);
+        float cx = getWidth() / 2f, y = dp(96);
+        tmpRect.set(cx - tw / 2 - dp(18), y - dp(22), cx + tw / 2 + dp(18), y + dp(12));
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xE00F172A);
+        canvas.drawRoundRect(tmpRect, dp(17), dp(17), paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(1.2f));
+        paint.setColor(0xAA38BDF8);
+        canvas.drawRoundRect(tmpRect, dp(17), dp(17), paint);
+        textPaint.setColor(Color.WHITE);
+        canvas.drawText(notice, cx, y, textPaint);
+    }
+
+    private TouchButton add(String label, String gameSub, String menuSub, int color, int bits, int show,
+                            boolean round, boolean dragLook) {
+        TouchButton b = new TouchButton(label, gameSub, menuSub, color, bits, show, round, dragLook);
+        buttons.add(b);
+        return b;
+    }
+
     private void init() {
-        vibrator = getContext() != null ? (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE) : null;
-        joystickRadius = dp(65);
-        joystickKnobRadius = dp(28);
+        vibrator = (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE);
 
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setColor(Color.WHITE);
         textPaint.setFakeBoldText(true);
-
         subTextPaint.setTextAlign(Paint.Align.CENTER);
-        subTextPaint.setColor(0xCCFFFFFF);
-        subTextPaint.setFakeBoldText(false);
+        subTextPaint.setColor(0xDDFFFFFF);
 
-        // 1. Mirar (LT / Botão direito do mouse)
-        actionButtons.add(new TouchButton("AIM", "MIRA", "LT", 0xFF3B82F6, 0, 3));
-        // 2. Atirar / Ataque (RT / Botão esquerdo do mouse)
-        actionButtons.add(new TouchButton("FIRE", "TIRO", "RT", 0xFFEF4444, 0, 1));
-        // 3. Ação / Pegar / Melee (F)
-        actionButtons.add(new TouchButton("ACTION", "AÇÃO", "F", 0xFF10B981, KeyEvent.KEYCODE_F, 0));
-        // 4. Recarregar (R)
-        actionButtons.add(new TouchButton("RELOAD", "RECARREGAR", "R", 0xFFF59E0B, KeyEvent.KEYCODE_R, 0));
-        // 5. Correr / Sprint (Shift / A no controle)
-        actionButtons.add(new TouchButton("SPRINT", "CORRER", "SHIFT", 0xFF06B6D4, KeyEvent.KEYCODE_SHIFT_LEFT, 0));
-        // 6. Giro Rápido 180° (S + Space / Quick Turn)
-        actionButtons.add(new TouchButton("180", "180°", "GIRO", 0xFF8B5CF6, 0, 0, true));
-        // 7. Faca (Barra de espaço)
-        actionButtons.add(new TouchButton("KNIFE", "FACA", "SPACE", 0xFFEC4899, KeyEvent.KEYCODE_SPACE, 0));
-        // 8. Mapa / GPS (M)
-        actionButtons.add(new TouchButton("MAP", "MAPA", "M", 0xFF6366F1, KeyEvent.KEYCODE_M, 0));
-        // 9. Inventário (E)
-        actionButtons.add(new TouchButton("INV", "INV", "E", 0xFFA855F7, KeyEvent.KEYCODE_E, 0));
-        // 10. Chamar Parceiro (Q / V)
-        actionButtons.add(new TouchButton("PARTNER", "PARCEIRO", "Q", 0xFF14B8A6, KeyEvent.KEYCODE_Q, 0));
-        // 11. Pausa (ESC)
-        actionButtons.add(new TouchButton("PAUSE", "PAUSA", "ESC", 0xFF475569, KeyEvent.KEYCODE_ESCAPE, 0));
-        // 12. Confirmar / Enter (Enter)
-        actionButtons.add(new TouchButton("ENTER", "OK", "ENTER", 0xFF10B981, KeyEvent.KEYCODE_ENTER, 0));
-
-        // Atalhos Rápidos de Armas (1, 2, 3, 4)
-        quickSlots.add(new TouchButton("SLOT1", "1", "ARMA", 0xFF38BDF8, KeyEvent.KEYCODE_1, 0));
-        quickSlots.add(new TouchButton("SLOT2", "2", "ARMA", 0xFF38BDF8, KeyEvent.KEYCODE_2, 0));
-        quickSlots.add(new TouchButton("SLOT3", "3", "ARMA", 0xFF38BDF8, KeyEvent.KEYCODE_3, 0));
-        quickSlots.add(new TouchButton("SLOT4", "4", "ARMA", 0xFF38BDF8, KeyEvent.KEYCODE_4, 0));
+        // Cores do controle do Xbox nos botões de face: o jogo mostra as mesmas.
+        btnA = add("A", "CORRER", "OK", 0xFF22C55E, A, SHOW_ALWAYS, true, false);
+        btnB = add("B", "PARCEIRO", "VOLTAR", 0xFFEF4444, B, SHOW_ALWAYS, true, false);
+        btnX = add("X", "AÇÃO", "", 0xFF3B82F6, X, SHOW_ALWAYS, true, false);
+        btnY = add("Y", "INVENTÁRIO", "", 0xFFEAB308, Y, SHOW_ALWAYS, true, false);
+        btnLT = add("LT", "MIRAR", "", 0xFF94A3B8, TRIG_LT, SHOW_GAMEPLAY, true, false);
+        btnRT = add("RT", "ATIRAR", "", 0xFFF97316, TRIG_RT, SHOW_GAMEPLAY, true, true);
+        btnLB = add("LB", "FACA", "", 0xFF94A3B8, LB, SHOW_ALWAYS, true, false);
+        btnRB = add("RB", "MAPA", "", 0xFF94A3B8, RB, SHOW_ALWAYS, true, false);
+        btnTurn = add("180°", "GIRO", "", 0xFF8B5CF6, QUICK_TURN, SHOW_GAMEPLAY, true, false);
+        btnUp = add("▲", "", "", 0xFF64748B, DPAD_UP, SHOW_ALWAYS, false, false);
+        btnDown = add("▼", "", "", 0xFF64748B, DPAD_DOWN, SHOW_ALWAYS, false, false);
+        btnLeft = add("◀", "", "", 0xFF64748B, DPAD_LEFT, SHOW_ALWAYS, false, false);
+        btnRight = add("▶", "", "", 0xFF64748B, DPAD_RIGHT, SHOW_ALWAYS, false, false);
+        btnBack = add("PULAR", "BACK", "BACK", 0xFF64748B, BACK, SHOW_ALWAYS, false, false);
+        btnStart = add("PAUSA", "START", "START", 0xFF64748B, START, SHOW_ALWAYS, false, false);
     }
 
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
-        stateCheckHandler.post(stateCheckRunnable);
+        handler.post(stateCheck);
     }
 
     @Override
     protected void onDetachedFromWindow() {
-        stateCheckHandler.removeCallbacks(stateCheckRunnable);
+        handler.removeCallbacks(stateCheck);
+        handler.removeCallbacks(tick);
+        ticking = false;
         super.onDetachedFromWindow();
     }
 
@@ -244,626 +308,489 @@ public class TouchControlsView extends View {
         layoutButtons(w, h);
     }
 
+    private void circle(TouchButton b, float cx, float cy, float r) {
+        b.bounds.set(cx - r, cy - r, cx + r, cy + r);
+    }
+
     private void layoutButtons(int w, int h) {
         if (w <= 0 || h <= 0) return;
-
         float s = controlsScale;
-        joystickRadius = dp(65) * s;
-        joystickKnobRadius = dp(28) * s;
 
-        // Base do joystick: canto inferior esquerdo com margem confortável
-        joystickBaseX = dp(105) * s;
-        joystickBaseY = h - dp(105) * s;
-        joystickKnobX = joystickBaseX;
-        joystickKnobY = joystickBaseY;
+        stickRadius = dp(62) * s;
+        stickKnobRadius = dp(26) * s;
+        stickRestX = dp(115) * s;
+        stickRestY = h - dp(110) * s;
+        if (stickPointer == -1) resetStickVisual();
 
-        // Pílulas de topo (Menu do launcher e Ocultar controles)
-        float topY = dp(14);
-        btnMenu.bounds.set(w / 2f - dp(56), topY, w / 2f + dp(56), topY + dp(32));
-        btnHideControls.bounds.set(w - dp(48), topY, w - dp(14), topY + dp(32));
+        // Topo: painel do app no centro, ocultar à direita; Back e Start ao lado.
+        float topY = dp(12);
+        pillMenu.set(w / 2f - dp(52), topY, w / 2f + dp(52), topY + dp(32));
+        pillHide.set(w - dp(50), topY, w - dp(14), topY + dp(32));
+        btnStart.bounds.set(w - dp(136), topY, w - dp(60), topY + dp(32));
+        btnBack.bounds.set(w - dp(222), topY, w - dp(146), topY + dp(32));
 
-        // Botão de Pausa (ESC) no topo direito
-        findButton("PAUSE").bounds.set(w - dp(100), topY, w - dp(54), topY + dp(32));
+        // Face (losango do controle): Y em cima, B à direita, A embaixo, X à esquerda.
+        float fr = dp(29) * s, gap = dp(60) * s;
+        float fcx = w - dp(118) * s, fcy = h - dp(118) * s;
+        circle(btnA, fcx, fcy + gap, dp(32) * s);
+        circle(btnB, fcx + gap, fcy, fr);
+        circle(btnX, fcx - gap, fcy, fr);
+        circle(btnY, fcx, fcy - gap, fr);
 
-        // Botões de Ação no quadrante inferior direito (disposição ergonômica em arco)
-        float rightMargin = dp(28) * s;
-        float bottomMargin = dp(28) * s;
+        // Gatilhos: RT (atirar) acima do losango; arrastar a partir dele também mira.
+        circle(btnRT, w - dp(62) * s, fcy - gap - dp(78) * s, dp(36) * s);
+        circle(btnRB, w - dp(150) * s, fcy - gap - dp(92) * s, dp(25) * s);
+        circle(btnTurn, fcx - gap - dp(82) * s, h - dp(44) * s, dp(24) * s);
 
-        // 1. TIRO (Principal, grande)
-        float fireR = dp(38) * s;
-        float fireCX = w - rightMargin - fireR - dp(45) * s;
-        float fireCY = h - bottomMargin - fireR - dp(45) * s;
-        findButton("FIRE").bounds.set(fireCX - fireR, fireCY - fireR, fireCX + fireR, fireCY + fireR);
+        // LT (mirar) e LB (faca) acima do analógico: no RE5 não se anda mirando, o
+        // polegar esquerdo fica livre para segurar a mira.
+        circle(btnLT, dp(62) * s, stickRestY - stickRadius - dp(78) * s, dp(34) * s);
+        circle(btnLB, dp(150) * s, stickRestY - stickRadius - dp(92) * s, dp(25) * s);
 
-        // 2. MIRA (Ao lado esquerdo do Tiro)
-        float aimR = dp(34) * s;
-        float aimCX = fireCX - dp(80) * s;
-        float aimCY = fireCY - dp(24) * s;
-        findButton("AIM").bounds.set(aimCX - aimR, aimCY - aimR, aimCX + aimR, aimCY + aimR);
-
-        // 3. AÇÃO / PEGAR (Acima do Tiro)
-        float actR = dp(30) * s;
-        float actCX = fireCX + dp(15) * s;
-        float actCY = fireCY - dp(85) * s;
-        findButton("ACTION").bounds.set(actCX - actR, actCY - actR, actCX + actR, actCY + actR);
-
-        // 4. RECARREGAR (À direita do Tiro)
-        float relR = dp(26) * s;
-        float relCX = fireCX + dp(65) * s;
-        float relCY = fireCY + dp(10) * s;
-        findButton("RELOAD").bounds.set(relCX - relR, relCY - relR, relCX + relR, relCY + relR);
-
-        // 5. CORRER / SPRINT (Abaixo da Mira)
-        float sprR = dp(28) * s;
-        float sprCX = aimCX - dp(20) * s;
-        float sprCY = fireCY + dp(55) * s;
-        findButton("SPRINT").bounds.set(sprCX - sprR, sprCY - sprR, sprCX + sprR, sprCY + sprR);
-
-        // 6. GIRO 180° (Próximo à corrida)
-        float turnR = dp(24) * s;
-        float turnCX = sprCX + dp(55) * s;
-        float turnCY = sprCY + dp(10) * s;
-        findButton("180").bounds.set(turnCX - turnR, turnCY - turnR, turnCX + turnR, turnCY + turnR);
-
-        // 7. FACA (Acima da Mira)
-        float knfR = dp(26) * s;
-        float knfCX = aimCX - dp(35) * s;
-        float knfCY = aimCY - dp(60) * s;
-        findButton("KNIFE").bounds.set(knfCX - knfR, knfCY - knfR, knfCX + knfR, knfCY + knfR);
-
-        // 8. INVENTÁRIO (E)
-        float invR = dp(26) * s;
-        float invCX = actCX - dp(55) * s;
-        float invCY = actCY - dp(50) * s;
-        findButton("INV").bounds.set(invCX - invR, invCY - invR, invCX + invR, invCY + invR);
-
-        // 9. PARCEIRO (Q)
-        float partR = dp(26) * s;
-        float partCX = invCX - dp(60) * s;
-        float partCY = invCY + dp(8) * s;
-        findButton("PARTNER").bounds.set(partCX - partR, partCY - partR, partCX + partR, partCY + partR);
-
-        // 10. MAPA / GPS
-        float mapR = dp(24) * s;
-        float mapCX = partCX - dp(55) * s;
-        float mapCY = partCY + dp(10) * s;
-        findButton("MAP").bounds.set(mapCX - mapR, mapCY - mapR, mapCX + mapR, mapCY + mapR);
-
-        // 11. CONFIRMAR / OK
-        float entR = dp(24) * s;
-        float entCX = actCX + dp(50) * s;
-        float entCY = actCY - dp(45) * s;
-        findButton("ENTER").bounds.set(entCX - entR, entCY - entR, entCX + entR, entCY + entR);
-
-        // Atalhos Rápidos de Armas (1, 2, 3, 4) - Faixa elegante acima do analógico esquerdo
-        float slotW = dp(36) * s;
-        float slotH = dp(32) * s;
-        float slotY = joystickBaseY - joystickRadius - dp(45) * s;
-        float slotStartX = dp(24);
-        for (int i = 0; i < quickSlots.size(); i++) {
-            float sx = slotStartX + i * (slotW + dp(8) * s);
-            quickSlots.get(i).bounds.set(sx, slotY, sx + slotW, slotY + slotH);
-        }
+        // D-pad (troca rápida de arma; navegação nos menus) embaixo, entre os dois lados.
+        float dsz = dp(23) * s, dcx = w * 0.5f - dp(120) * s, dcy = h - dp(62) * s, dgap = dp(27) * s;
+        btnUp.bounds.set(dcx - dsz, dcy - dgap - dsz, dcx + dsz, dcy - dgap + dsz * 0.6f);
+        btnDown.bounds.set(dcx - dsz, dcy + dgap - dsz * 0.6f, dcx + dsz, dcy + dgap + dsz);
+        btnLeft.bounds.set(dcx - dgap - dsz * 1.3f, dcy - dsz * 0.8f, dcx - dgap + dsz * 0.6f, dcy + dsz * 0.8f);
+        btnRight.bounds.set(dcx + dgap - dsz * 0.6f, dcy - dsz * 0.8f, dcx + dgap + dsz * 1.3f, dcy + dsz * 0.8f);
     }
 
-    private TouchButton findButton(String id) {
-        for (TouchButton b : actionButtons) {
-            if (id.equals(b.id)) return b;
-        }
-        return actionButtons.get(0);
+    private void resetStickVisual() {
+        stickBaseX = stickKnobX = stickRestX;
+        stickBaseY = stickKnobY = stickRestY;
     }
+
+    private boolean visible(TouchButton b) {
+        if (!controlsEnabled || hiddenByDevice) return false;
+        return b.show == SHOW_ALWAYS || inGameplay;
+    }
+
+    // ------------------------------------------------------------------ desenho
 
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        drawPill(canvas, pillMenu, "⚙ PAINEL", 0xFF3B82F6, false);
+        drawPill(canvas, pillHide, controlsEnabled ? "🎮" : "✋", 0xFF64748B, false);
+        drawNotice(canvas);
+        if (!controlsEnabled || hiddenByDevice) return;
 
-        // Sempre desenha pílula de menu e botão de ocultar no topo
-        drawTopPill(canvas, btnMenu);
-        drawTopPill(canvas, btnHideControls);
-
-        if (!controlsEnabled) return;
-
-        // Se NÃO estamos em gameplay (estamos em Menus/Inventário/Pausa):
-        // Os botões de ação e slots rápidos são OCULTADOS para o usuário clicar com o dedo!
-        // O analógico virtual permanece desenhado sutilmente para navegação no menu.
-        if (!inGameplay) {
-            drawMenuHint(canvas);
-            drawVirtualJoystick(canvas, 0.45f); // 45% opacidade no menu
-            return;
+        float mod = inGameplay ? 1f : 0.8f;
+        drawStick(canvas, inGameplay ? 1f : 0.55f);
+        for (TouchButton b : buttons) {
+            if (!visible(b)) continue;
+            if (b == btnStart || b == btnBack) {
+                drawPill(canvas, b.bounds, b.label, b.color, b.isDown());
+            } else if (b.round) {
+                drawRound(canvas, b, mod);
+            } else {
+                drawRect(canvas, b, mod);
+            }
         }
-
-        // --- MODO GAMEPLAY ---
-        // Desenha o Analógico Virtual completo
-        drawVirtualJoystick(canvas, 1.0f);
-
-        // Desenha os Slots Rápidos de Armas (1, 2, 3, 4)
-        for (TouchButton slot : quickSlots) {
-            drawQuickSlot(canvas, slot);
-        }
-
-        // Desenha os Botões de Ação Ergonômicos
-        for (TouchButton b : actionButtons) {
-            drawActionButton(canvas, b);
-        }
+        if (!inGameplay) drawMenuHint(canvas);
     }
 
     private void drawMenuHint(Canvas canvas) {
-        // Indicador sutil e moderno no topo informando modo menu
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(0x800F172A);
-        float hw = getWidth() / 2f;
-        RectF r = new RectF(hw - dp(140), dp(14), hw - dp(65), dp(46));
-        canvas.drawRoundRect(r, dp(16), dp(16), paint);
-
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(dp(1));
-        paint.setColor(0x40FFFFFF);
-        canvas.drawRoundRect(r, dp(16), dp(16), paint);
-
         textPaint.setTextSize(dp(11));
+        String t = "Toque para escolher · arraste à esquerda para navegar";
+        float tw = textPaint.measureText(t);
+        float cx = getWidth() / 2f, y = dp(62);
+        tmpRect.set(cx - tw / 2 - dp(12), y - dp(15), cx + tw / 2 + dp(12), y + dp(8));
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0x990F172A);
+        canvas.drawRoundRect(tmpRect, dp(12), dp(12), paint);
         textPaint.setColor(0xEEFFFFFF);
-        canvas.drawText("Toque na tela p/ clicar", r.centerX(), r.centerY() + dp(4), textPaint);
+        canvas.drawText(t, cx, y, textPaint);
     }
 
-    private void drawVirtualJoystick(Canvas canvas, float opacityMod) {
-        float alphaMult = controlsOpacity * opacityMod;
-        int baseFillAlpha = (int) (0x33 * alphaMult);
-        int baseStrokeAlpha = (int) (0x66 * alphaMult);
-        int knobFillAlpha = (int) ((joystickActive ? 0xCC : 0x77) * alphaMult);
-        int knobStrokeAlpha = (int) (0xEE * alphaMult);
+    private int alpha(float a) { return Math.max(0, Math.min(255, (int) (a * 255))); }
 
-        // Anel base exterior com efeito glassmorphism
+    private void drawStick(Canvas canvas, float mod) {
+        float m = controlsOpacity * mod;
+        boolean on = stickPointer != -1;
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor((baseFillAlpha << 24) | 0x001E293B);
-        canvas.drawCircle(joystickBaseX, joystickBaseY, joystickRadius, paint);
-
+        paint.setColor(alpha(0.20f * m) << 24 | 0x1E293B);
+        canvas.drawCircle(stickBaseX, stickBaseY, stickRadius, paint);
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(dp(2));
-        paint.setColor((baseStrokeAlpha << 24) | 0x0038BDF8);
-        canvas.drawCircle(joystickBaseX, joystickBaseY, joystickRadius, paint);
+        paint.setColor(alpha(0.40f * m) << 24 | 0x38BDF8);
+        canvas.drawCircle(stickBaseX, stickBaseY, stickRadius, paint);
+        // zona morta
+        paint.setStrokeWidth(dp(1));
+        paint.setColor(alpha(0.20f * m) << 24 | 0xFFFFFF);
+        canvas.drawCircle(stickBaseX, stickBaseY, stickRadius * STICK_DEADZONE + stickKnobRadius * 0.2f, paint);
 
-        // Indicadores direcionais sutis
-        paint.setColor((int) (0x40 * alphaMult) << 24 | 0x00FFFFFF);
-        paint.setStrokeWidth(dp(1.2f));
-        canvas.drawLine(joystickBaseX - joystickRadius + dp(6), joystickBaseY, joystickBaseX - dp(12), joystickBaseY, paint);
-        canvas.drawLine(joystickBaseX + dp(12), joystickBaseY, joystickBaseX + joystickRadius - dp(6), joystickBaseY, paint);
-        canvas.drawLine(joystickBaseX, joystickBaseY - joystickRadius + dp(6), joystickBaseX, joystickBaseY - dp(12), paint);
-        canvas.drawLine(joystickBaseX, joystickBaseY + dp(12), joystickBaseX, joystickBaseY + joystickRadius - dp(6), paint);
-
-        // Knob central metálico com glow
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor((knobFillAlpha << 24) | (joystickActive ? 0x000284C7 : 0x001E293B));
-        canvas.drawCircle(joystickKnobX, joystickKnobY, joystickKnobRadius, paint);
-
+        paint.setColor(alpha((on ? 0.80f : 0.45f) * m) << 24 | (on ? 0x0284C7 : 0x1E293B));
+        canvas.drawCircle(stickKnobX, stickKnobY, stickKnobRadius, paint);
         paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(dp(2.2f));
-        paint.setColor((knobStrokeAlpha << 24) | 0x00FFFFFF);
-        canvas.drawCircle(joystickKnobX, joystickKnobY, joystickKnobRadius, paint);
-
-        // Ponto central do knob
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor((int) (0xAA * alphaMult) << 24 | 0x00FFFFFF);
-        canvas.drawCircle(joystickKnobX, joystickKnobY, dp(4), paint);
+        paint.setStrokeWidth(dp(2));
+        paint.setColor(alpha(0.9f * m) << 24 | 0xFFFFFF);
+        canvas.drawCircle(stickKnobX, stickKnobY, stickKnobRadius, paint);
     }
 
-    private void drawTopPill(Canvas canvas, TouchButton b) {
+    private void drawPill(Canvas canvas, RectF r, String label, int color, boolean down) {
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(b.isDown ? 0xB3000000 : 0x660F172A);
-        canvas.drawRoundRect(b.bounds, dp(16), dp(16), paint);
-
+        paint.setColor(down ? 0xCC000000 : 0x770F172A);
+        canvas.drawRoundRect(r, dp(16), dp(16), paint);
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(dp(1.2f));
-        paint.setColor(b.isDown ? Color.WHITE : b.color);
-        canvas.drawRoundRect(b.bounds, dp(16), dp(16), paint);
-
+        paint.setColor(down ? Color.WHITE : color);
+        canvas.drawRoundRect(r, dp(16), dp(16), paint);
         textPaint.setTextSize(dp(11));
         textPaint.setColor(Color.WHITE);
-        float textY = b.bounds.centerY() - ((textPaint.descent() + textPaint.ascent()) / 2);
-        canvas.drawText(b.label, b.bounds.centerX(), textY, textPaint);
+        float ty = r.centerY() - (textPaint.descent() + textPaint.ascent()) / 2;
+        canvas.drawText(label, r.centerX(), ty, textPaint);
     }
 
-    private void drawQuickSlot(Canvas canvas, TouchButton b) {
-        int fillAlpha = (int) ((b.isDown ? 0xDD : 0x55) * controlsOpacity);
-        int strokeAlpha = (int) ((b.isDown ? 0xFF : 0x88) * controlsOpacity);
-
+    private void drawRound(Canvas canvas, TouchButton b, float mod) {
+        float r = b.bounds.width() / 2f, cx = b.bounds.centerX(), cy = b.bounds.centerY();
+        float m = controlsOpacity * mod;
+        boolean down = b.isDown();
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor((fillAlpha << 24) | (b.color & 0x00FFFFFF));
-        canvas.drawRoundRect(b.bounds, dp(8), dp(8), paint);
-
+        paint.setColor(alpha((down ? 0.80f : 0.30f) * m) << 24 | (b.color & 0xFFFFFF));
+        canvas.drawCircle(cx, cy, r, paint);
         paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(dp(1.4f));
-        paint.setColor((strokeAlpha << 24) | (b.isDown ? 0x00FFFFFF : b.color));
-        canvas.drawRoundRect(b.bounds, dp(8), dp(8), paint);
-
-        textPaint.setTextSize(dp(12));
-        textPaint.setColor(Color.WHITE);
-        float textY = b.bounds.centerY() - ((textPaint.descent() + textPaint.ascent()) / 2);
-        canvas.drawText(b.label, b.bounds.centerX(), textY, textPaint);
-    }
-
-    private void drawActionButton(Canvas canvas, TouchButton b) {
-        float r = b.bounds.width() / 2f;
-        float cx = b.bounds.centerX();
-        float cy = b.bounds.centerY();
-
-        int fillAlpha = (int) ((b.isDown ? 0xCC : 0x48) * controlsOpacity);
-        int strokeAlpha = (int) ((b.isDown ? 0xFF : 0x88) * controlsOpacity);
-
-        // Fundo circular com visual moderno e translúcido
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor((fillAlpha << 24) | (b.color & 0x00FFFFFF));
+        paint.setStrokeWidth(down ? dp(2.8f) : dp(1.6f));
+        paint.setColor(alpha((down ? 1f : 0.65f) * m) << 24 | (down ? 0xFFFFFF : b.color & 0xFFFFFF));
         canvas.drawCircle(cx, cy, r, paint);
 
-        // Borda destacada com glow sutil quando pressionado
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(b.isDown ? dp(2.8f) : dp(1.6f));
-        paint.setColor((strokeAlpha << 24) | (b.isDown ? 0x00FFFFFF : b.color));
-        canvas.drawCircle(cx, cy, r, paint);
-
-        // Rótulos de texto
-        float baseTextSize = r > dp(32) ? 12.5f : r > dp(25) ? 10.5f : 9.0f;
-        textPaint.setTextSize(dp(baseTextSize));
-        textPaint.setColor(Color.WHITE);
-
-        if (b.subLabel != null && !b.subLabel.isEmpty()) {
-            float textY = cy - dp(2.5f);
-            canvas.drawText(b.label, cx, textY, textPaint);
-
-            subTextPaint.setTextSize(dp(Math.max(7.5f, baseTextSize - 3.5f)));
-            canvas.drawText(b.subLabel, cx, cy + dp(9f), subTextPaint);
+        String sub = inGameplay ? b.gameSub : b.menuSub;
+        textPaint.setColor(alpha(Math.min(1f, m + 0.15f)) << 24 | 0xFFFFFF);
+        textPaint.setTextSize(r > dp(30) ? dp(17) : dp(14));
+        if (sub != null && !sub.isEmpty()) {
+            canvas.drawText(b.label, cx, cy + dp(1), textPaint);
+            subTextPaint.setTextSize(dp(r > dp(26) ? 8.5f : 7.5f));
+            subTextPaint.setColor(alpha(Math.min(1f, m + 0.1f)) << 24 | 0xFFFFFF);
+            canvas.drawText(sub, cx, cy + dp(13), subTextPaint);
         } else {
-            float textY = cy - ((textPaint.descent() + textPaint.ascent()) / 2);
-            canvas.drawText(b.label, cx, textY, textPaint);
+            canvas.drawText(b.label, cx, cy - (textPaint.descent() + textPaint.ascent()) / 2, textPaint);
         }
     }
 
-    @Override
-    public boolean onTouchEvent(MotionEvent event) {
-        int action = event.getActionMasked();
-        int actionIndex = event.getActionIndex();
-        int pointerId = event.getPointerId(actionIndex);
-        float x = event.getX(actionIndex);
-        float y = event.getY(actionIndex);
+    private void drawRect(Canvas canvas, TouchButton b, float mod) {
+        float m = controlsOpacity * mod;
+        boolean down = b.isDown();
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(alpha((down ? 0.80f : 0.30f) * m) << 24 | (b.color & 0xFFFFFF));
+        canvas.drawRoundRect(b.bounds, dp(7), dp(7), paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(1.4f));
+        paint.setColor(alpha((down ? 1f : 0.6f) * m) << 24 | 0xFFFFFF);
+        canvas.drawRoundRect(b.bounds, dp(7), dp(7), paint);
+        textPaint.setTextSize(dp(12));
+        textPaint.setColor(alpha(Math.min(1f, m + 0.15f)) << 24 | 0xFFFFFF);
+        canvas.drawText(b.label, b.bounds.centerX(), b.bounds.centerY() - (textPaint.descent() + textPaint.ascent()) / 2, textPaint);
+    }
 
+    // ------------------------------------------------------------------ toque
+
+    @Override
+    public boolean onTouchEvent(MotionEvent e) {
+        int action = e.getActionMasked();
+        int idx = e.getActionIndex();
         switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN:
-                handlePointerDown(pointerId, x, y);
+                onDown(e.getPointerId(idx), e.getX(idx), e.getY(idx));
                 break;
-
             case MotionEvent.ACTION_MOVE:
-                for (int i = 0; i < event.getPointerCount(); i++) {
-                    int pId = event.getPointerId(i);
-                    handlePointerMove(pId, event.getX(i), event.getY(i));
-                }
+                for (int i = 0; i < e.getPointerCount(); i++) onMove(e.getPointerId(i), e.getX(i), e.getY(i));
                 break;
-
             case MotionEvent.ACTION_POINTER_UP:
             case MotionEvent.ACTION_UP:
-                handlePointerUp(pointerId);
+                onUp(e.getPointerId(idx), e.getX(idx), e.getY(idx));
                 break;
-
             case MotionEvent.ACTION_CANCEL:
-                resetAllInputs();
+                releaseAll();
                 break;
         }
-
+        sendPad();
         invalidate();
         return true;
     }
 
-    private void handlePointerDown(int pointerId, float x, float y) {
-        // 1. Checa botões de Topo fixos (Menu e Ocultar)
-        if (btnMenu.bounds.contains(x, y)) {
+    private TouchButton hit(float x, float y) {
+        TouchButton best = null;
+        float bestD = Float.MAX_VALUE;
+        for (TouchButton b : buttons) {
+            if (!visible(b)) continue;
+            float cx = b.bounds.centerX(), cy = b.bounds.centerY();
+            float d;
+            if (b.round) {
+                float r = b.bounds.width() / 2f * 1.15f;   // folga para o polegar
+                float dx = x - cx, dy = y - cy;
+                d = dx * dx + dy * dy;
+                if (d > r * r) continue;
+            } else {
+                tmpRect.set(b.bounds);
+                tmpRect.inset(-dp(5), -dp(5));
+                if (!tmpRect.contains(x, y)) continue;
+                d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+            }
+            if (d < bestD) {
+                bestD = d;
+                best = b;
+            }
+        }
+        return best;
+    }
+
+    private void onDown(int id, float x, float y) {
+        if (pillMenu.contains(x, y)) {
             vibrateClick();
             if (menuToggleListener != null) menuToggleListener.onToggleMenu();
             return;
         }
-
-        if (btnHideControls.bounds.contains(x, y)) {
+        if (pillHide.contains(x, y)) {
             vibrateClick();
-            controlsEnabled = !controlsEnabled;
-            invalidate();
+            setControlsEnabled(!controlsEnabled);
+            return;
+        }
+        noteTouch();
+        // Voltou para o toque depois do controle físico: os botões reaparecem já neste toque.
+        hiddenByDevice = false;
+        if (!controlsEnabled) {
+            // Sem botões: a tela inteira é toque direto (clique onde tocar).
+            startPending(id, x, y, false);
             return;
         }
 
-        if (!controlsEnabled) return;
+        TouchButton b = hit(x, y);
+        if (b != null) {
+            b.pointerId = id;
+            vibrateClick();
+            if (b == btnTurn) {
+                turnStart = SystemClock.uptimeMillis();
+                startTick();
+            }
+            if (b.dragLook && lookPointer == -1) startLook(id, x, y);
+            return;
+        }
 
-        // 2. Se ESTAMOS EM MENU (não em gameplay):
-        // Permite clique direto com o dedo em qualquer item do menu!
-        // O analógico no lado esquerdo inferior continua disponível para navegar.
-        if (!inGameplay) {
-            // Se o toque for na área do joystick à esquerda, ativa navegação de menu por D-Pad
-            if (x < getWidth() * 0.38f && y > getHeight() * 0.45f) {
-                if (!joystickActive) {
-                    joystickActive = true;
-                    joystickPointerId = pointerId;
-                    joystickBaseX = x;
-                    joystickBaseY = y;
-                    joystickKnobX = x;
-                    joystickKnobY = y;
-                    updateMenuJoystick(0, 0);
+        if (inGameplay) {
+            if (x < getWidth() * 0.45f) {
+                if (stickPointer == -1) startStick(id, x, y);
+            } else if (lookPointer == -1) {
+                startLook(id, x, y);
+            }
+            return;
+        }
+        // Menu: só decide depois (toque parado = clique; arrasto à esquerda = analógico).
+        startPending(id, x, y, x < getWidth() * 0.45f);
+    }
+
+    private void startPending(int id, float x, float y, boolean left) {
+        if (pendingPointer != -1 || dragPointer != -1) return;
+        pendingPointer = id;
+        pendingX = x;
+        pendingY = y;
+        pendingLeft = left;
+    }
+
+    private void startStick(int id, float x, float y) {
+        stickPointer = id;
+        // A base vai para onde o dedo tocou, sem passar da borda da tela.
+        stickBaseX = Math.max(stickRadius * 0.6f, x);
+        stickBaseY = Math.min(getHeight() - stickRadius * 0.6f, Math.max(stickRadius, y));
+        stickKnobX = x;
+        stickKnobY = y;
+        updateStick(x, y);
+    }
+
+    private void startLook(int id, float x, float y) {
+        lookPointer = id;
+        lookLastX = x;
+        lookLastY = y;
+        lookAccX = lookAccY = 0;
+        lookLastTick = SystemClock.uptimeMillis();
+        startTick();
+    }
+
+    private void onMove(int id, float x, float y) {
+        if (id == stickPointer) {
+            updateStick(x, y);
+        }
+        if (id == lookPointer) {
+            lookAccX += x - lookLastX;
+            lookAccY += y - lookLastY;
+            lookLastX = x;
+            lookLastY = y;
+        }
+        if (id == pendingPointer) {
+            float dx = x - pendingX, dy = y - pendingY;
+            if (dx * dx + dy * dy > dp(14) * dp(14)) {
+                pendingPointer = -1;
+                if (pendingLeft) {
+                    startStick(id, pendingX, pendingY);
+                    updateStick(x, y);
+                } else {
+                    dragPointer = id;
+                    dragLastX = x;
+                    dragLastY = y;
+                    pointer(PTR_DOWN, pendingX, pendingY);
+                    pointer(PTR_MOVE, x, y);
                 }
-                return;
             }
+        }
+        if (id == dragPointer) {
+            dragLastX = x;
+            dragLastY = y;
+            pointer(PTR_MOVE, x, y);
+        }
+    }
 
-            // Toque em qualquer outro lugar do menu: ENVIA CLIQUE REAL DE MOUSE COM O DEDO!
-            menuTouchPointerId = pointerId;
+    private void onUp(int id, float x, float y) {
+        if (id == pendingPointer) {   // toque parado: clique onde tocou
+            pendingPointer = -1;
             vibrateClick();
-            // Move o cursor para a posição tocada e aperta botão esquerdo
-            SDLActivity.onNativeMouse(0, MotionEvent.ACTION_MOVE, x, y, false);
-            SDLActivity.onNativeMouse(MotionEvent.BUTTON_PRIMARY, MotionEvent.ACTION_DOWN, x, y, false);
-            return;
+            pointer(PTR_DOWN, pendingX, pendingY);
+            pointer(PTR_UP, pendingX, pendingY);
         }
-
-        // 3. MODO GAMEPLAY:
-        // A) Checa botões de ação
-        for (TouchButton b : actionButtons) {
-            float r = b.bounds.width() / 2f;
-            float dx = x - b.bounds.centerX();
-            float dy = y - b.bounds.centerY();
-            if (dx * dx + dy * dy <= r * r) {
-                b.isDown = true;
-                b.activePointerId = pointerId;
-                vibrateClick();
-                dispatchButtonDown(b);
-                return;
-            }
+        if (id == dragPointer) {
+            dragPointer = -1;
+            pointer(PTR_UP, x, y);
         }
-
-        // B) Checa atalhos rápidos de armas (1, 2, 3, 4)
-        for (TouchButton slot : quickSlots) {
-            if (slot.bounds.contains(x, y)) {
-                slot.isDown = true;
-                slot.activePointerId = pointerId;
-                vibrateClick();
-                dispatchButtonDown(slot);
-                return;
-            }
+        for (TouchButton b : buttons) if (b.pointerId == id) b.pointerId = -1;
+        if (id == stickPointer) {
+            stickPointer = -1;
+            lx = ly = 0;
+            resetStickVisual();
         }
-
-        // C) Lado Esquerdo: Ativa Joystick Virtual (WASD)
-        if (x < getWidth() * 0.42f) {
-            if (!joystickActive) {
-                joystickActive = true;
-                joystickPointerId = pointerId;
-                joystickBaseX = x;
-                joystickBaseY = y;
-                joystickKnobX = x;
-                joystickKnobY = y;
-                updateGameplayJoystick(0, 0);
-            }
-            return;
-        }
-
-        // D) Lado Direito (fora dos botões): Trackpad de rotação da câmera
-        if (lookPointerId == -1) {
-            lookPointerId = pointerId;
-            lastLookX = x;
-            lastLookY = y;
-        }
+        if (id == lookPointer) lookPointer = -1;
     }
 
-    private void handlePointerMove(int pointerId, float x, float y) {
-        if (!controlsEnabled) return;
+    /** Analógico com zona morta radial e reescala (sem degrau na saída da zona morta). */
+    private void updateStick(float x, float y) {
+        float dx = x - stickBaseX, dy = y - stickBaseY;
+        float dist = (float) Math.sqrt(dx * dx + dy * dy);
+        if (dist > stickRadius) {
+            // Passou da borda: a base acompanha o dedo (não "trava" o analógico).
+            float over = dist - stickRadius;
+            stickBaseX += dx / dist * over;
+            stickBaseY += dy / dist * over;
+            dx = x - stickBaseX;
+            dy = y - stickBaseY;
+            dist = stickRadius;
+        }
+        stickKnobX = stickBaseX + dx;
+        stickKnobY = stickBaseY + dy;
+        float mag = dist / stickRadius;
+        if (mag < STICK_DEADZONE || dist == 0) {
+            lx = ly = 0;
+            return;
+        }
+        float out = Math.min(1f, (mag - STICK_DEADZONE) / (1f - STICK_DEADZONE));
+        lx = dx / dist * out;
+        ly = -dy / dist * out;   // XInput: Y para cima positivo
+    }
 
-        // Joystick (comportamento varia se está em Menu ou Gameplay)
-        if (pointerId == joystickPointerId && joystickActive) {
-            float dx = x - joystickBaseX;
-            float dy = y - joystickBaseY;
-            float dist = (float) Math.sqrt(dx * dx + dy * dy);
-            if (dist > joystickRadius) {
-                dx = (dx / dist) * joystickRadius;
-                dy = (dy / dist) * joystickRadius;
-            }
-            joystickKnobX = joystickBaseX + dx;
-            joystickKnobY = joystickBaseY + dy;
+    /** Arrasto -> analógico direito proporcional à velocidade do dedo. */
+    private void updateLook() {
+        long now = SystemClock.uptimeMillis();
+        float dt = Math.max(1, now - lookLastTick);
+        lookLastTick = now;
+        float vx = lookAccX / dp(1) / dt, vy = lookAccY / dp(1) / dt;   // dp por ms
+        lookAccX = lookAccY = 0;
+        float tx = lookCurve(vx), ty = -lookCurve(vy);
+        if (lookPointer == -1) tx = ty = 0;
+        // suaviza: subir rápido, descer rápido também (o dedo parado para a câmera)
+        rx += (tx - rx) * 0.6f;
+        ry += (ty - ry) * 0.6f;
+        if (Math.abs(rx) < 0.01f) rx = 0;
+        if (Math.abs(ry) < 0.01f) ry = 0;
+    }
 
-            float nx = dx / joystickRadius;
-            float ny = dy / joystickRadius;
+    private float lookCurve(float v) {
+        float a = Math.abs(v) * lookSensitivity;
+        if (a < 0.015f) return 0;
+        // 0,22 = logo acima da zona morta do jogo; deflexão total a ~1 dp/ms.
+        float out = 0.22f + 0.78f * Math.min(1f, a / 1.0f);
+        return Math.signum(v) * out;
+    }
 
-            if (inGameplay) {
-                updateGameplayJoystick(nx, ny);
+    private void startTick() {
+        if (ticking) return;
+        ticking = true;
+        handler.postDelayed(tick, TICK_MS);
+    }
+
+    // ------------------------------------------------------------------ para o runtime
+
+    private void sendPad() {
+        int bits = 0;
+        float lt = 0, rt = 0, sx = lx, sy = ly;
+        for (TouchButton b : buttons) {
+            if (!b.isDown()) continue;
+            if (b.bits > 0) bits |= b.bits;
+            else if (b.bits == TRIG_LT) lt = 1f;
+            else if (b.bits == TRIG_RT) rt = 1f;
+        }
+        if (turnStart != 0) {   // giro 180: analógico para baixo, A depois de 50 ms, tudo por 200 ms
+            long t = SystemClock.uptimeMillis() - turnStart;
+            if (t < 200) {
+                sx = 0;
+                sy = -1f;
+                if (t >= 50) bits |= A;
             } else {
-                updateMenuJoystick(nx, ny);
-            }
-            return;
-        }
-
-        // Toque no menu: arrastar o dedo move o mouse
-        if (pointerId == menuTouchPointerId && !inGameplay) {
-            SDLActivity.onNativeMouse(MotionEvent.BUTTON_PRIMARY, MotionEvent.ACTION_MOVE, x, y, false);
-            return;
-        }
-
-        // Câmera no gameplay (trackpad relativo)
-        if (pointerId == lookPointerId && inGameplay) {
-            float deltaX = x - lastLookX;
-            float deltaY = y - lastLookY;
-            lastLookX = x;
-            lastLookY = y;
-
-            if (Math.abs(deltaX) > 0.05f || Math.abs(deltaY) > 0.05f) {
-                SDLActivity.onNativeMouse(0, MotionEvent.ACTION_MOVE, deltaX * 1.6f, deltaY * 1.6f, true);
+                turnStart = 0;
             }
         }
+        if (bits == sentButtons && sx == sentLx && sy == sentLy && rx == sentRx && ry == sentRy
+                && lt == sentLt && rt == sentRt) return;
+        sentButtons = bits;
+        sentLx = sx;
+        sentLy = sy;
+        sentRx = rx;
+        sentRy = ry;
+        sentLt = lt;
+        sentRt = rt;
+        try {
+            SDLActivity.nativeTouchPad(bits, sx, sy, rx, ry, lt, rt);
+        } catch (Throwable ignored) {}
     }
 
-    private void handlePointerUp(int pointerId) {
-        // Soltou toque no menu (solta botão do mouse)
-        if (pointerId == menuTouchPointerId) {
-            menuTouchPointerId = -1;
-            SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, 0, 0, false);
-        }
-
-        // Soltou botão de ação
-        for (TouchButton b : actionButtons) {
-            if (b.activePointerId == pointerId) {
-                b.isDown = false;
-                b.activePointerId = -1;
-                dispatchButtonUp(b);
-            }
-        }
-
-        // Soltou slot rápido
-        for (TouchButton slot : quickSlots) {
-            if (slot.activePointerId == pointerId) {
-                slot.isDown = false;
-                slot.activePointerId = -1;
-                dispatchButtonUp(slot);
-            }
-        }
-
-        // Soltou Joystick
-        if (pointerId == joystickPointerId) {
-            joystickActive = false;
-            joystickPointerId = -1;
-            joystickKnobX = joystickBaseX;
-            joystickKnobY = joystickBaseY;
-            if (inGameplay) {
-                updateGameplayJoystick(0, 0);
-            } else {
-                updateMenuJoystick(0, 0);
-            }
-        }
-
-        // Soltou Trackpad de câmera
-        if (pointerId == lookPointerId) {
-            lookPointerId = -1;
-        }
+    private void noteTouch() {
+        try {
+            SDLActivity.nativeTouchNote();   // o runtime marca o toque como dispositivo ativo
+        } catch (Throwable ignored) {}
     }
 
-    private void resetAllInputs() {
-        if (menuTouchPointerId != -1) {
-            menuTouchPointerId = -1;
-            SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, 0, 0, false);
-        }
-        for (TouchButton b : actionButtons) {
-            if (b.isDown) {
-                b.isDown = false;
-                b.activePointerId = -1;
-                dispatchButtonUp(b);
-            }
-        }
-        for (TouchButton slot : quickSlots) {
-            if (slot.isDown) {
-                slot.isDown = false;
-                slot.activePointerId = -1;
-                dispatchButtonUp(slot);
-            }
-        }
-        resetGameplayInputs();
-        joystickActive = false;
-        joystickPointerId = -1;
-        lookPointerId = -1;
+    private void pointer(int action, float x, float y) {
+        float w = Math.max(1, getWidth()), h = Math.max(1, getHeight());
+        try {
+            SDLActivity.nativeTouchPointer(action, x / w, y / h);
+        } catch (Throwable ignored) {}
     }
 
-    private void resetGameplayInputs() {
-        syncKey(KeyEvent.KEYCODE_W, keyW, false);
-        syncKey(KeyEvent.KEYCODE_S, keyS, false);
-        syncKey(KeyEvent.KEYCODE_A, keyA, false);
-        syncKey(KeyEvent.KEYCODE_D, keyD, false);
-        keyW = keyA = keyS = keyD = false;
-
-        if (activeMenuDpadKey != 0) {
-            SDLActivity.onNativeKeyUp(activeMenuDpadKey);
-            activeMenuDpadKey = 0;
-        }
+    /** Solta o que só existe no gameplay (troca menu <-> jogo). */
+    private void releaseGameplayOnly() {
+        for (TouchButton b : buttons) if (b.show == SHOW_GAMEPLAY) b.pointerId = -1;
+        if (lookPointer != -1) lookPointer = -1;
+        rx = ry = 0;
+        sendPad();
     }
 
-    /** Atualiza movimento do personagem no gameplay via WASD */
-    private void updateGameplayJoystick(float nx, float ny) {
-        float deadzone = 0.22f;
-        boolean newW = ny < -deadzone;
-        boolean newS = ny > deadzone;
-        boolean newA = nx < -deadzone;
-        boolean newD = nx > deadzone;
-
-        syncKey(KeyEvent.KEYCODE_W, keyW, newW);
-        syncKey(KeyEvent.KEYCODE_S, keyS, newS);
-        syncKey(KeyEvent.KEYCODE_A, keyA, newA);
-        syncKey(KeyEvent.KEYCODE_D, keyD, newD);
-
-        keyW = newW;
-        keyS = newS;
-        keyA = newA;
-        keyD = newD;
-    }
-
-    /** Navegação precisa nos menus usando D-Pad com repetição */
-    private void updateMenuJoystick(float nx, float ny) {
-        float threshold = 0.38f;
-        int targetKey = 0;
-
-        // Prioriza o eixo com maior deflexão
-        if (Math.abs(ny) >= Math.abs(nx)) {
-            if (ny < -threshold) targetKey = KeyEvent.KEYCODE_DPAD_UP;
-            else if (ny > threshold) targetKey = KeyEvent.KEYCODE_DPAD_DOWN;
-        } else {
-            if (nx < -threshold) targetKey = KeyEvent.KEYCODE_DPAD_LEFT;
-            else if (nx > threshold) targetKey = KeyEvent.KEYCODE_DPAD_RIGHT;
-        }
-
-        if (targetKey != activeMenuDpadKey) {
-            if (activeMenuDpadKey != 0) {
-                SDLActivity.onNativeKeyUp(activeMenuDpadKey);
-            }
-            activeMenuDpadKey = targetKey;
-            if (activeMenuDpadKey != 0) {
-                vibrateClick();
-                SDLActivity.onNativeKeyDown(activeMenuDpadKey);
-                lastDpadRepeatTime = SystemClock.uptimeMillis() + (DPAD_INITIAL_DELAY_MS - DPAD_REPEAT_INTERVAL_MS);
-            }
-        }
-    }
-
-    private void syncKey(int keycode, boolean oldState, boolean newState) {
-        if (!oldState && newState) {
-            SDLActivity.onNativeKeyDown(keycode);
-        } else if (oldState && !newState) {
-            SDLActivity.onNativeKeyUp(keycode);
-        }
-    }
-
-    private void dispatchButtonDown(TouchButton b) {
-        if (b.isQuickTurn) {
-            // Giro 180° no RE5 PC: Tecla S + Espaço juntas
-            SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_S);
-            SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_SPACE);
-            return;
-        }
-
-        if (b.mouseButton == 1) {
-            SDLActivity.onNativeMouse(MotionEvent.BUTTON_PRIMARY, MotionEvent.ACTION_DOWN, 0, 0, false);
-        } else if (b.mouseButton == 3) {
-            SDLActivity.onNativeMouse(MotionEvent.BUTTON_SECONDARY, MotionEvent.ACTION_DOWN, 0, 0, false);
-        } else if (b.keycode > 0) {
-            SDLActivity.onNativeKeyDown(b.keycode);
-        }
-    }
-
-    private void dispatchButtonUp(TouchButton b) {
-        if (b.isQuickTurn) {
-            SDLActivity.onNativeKeyUp(KeyEvent.KEYCODE_SPACE);
-            SDLActivity.onNativeKeyUp(KeyEvent.KEYCODE_S);
-            return;
-        }
-
-        if (b.mouseButton > 0) {
-            // Para soltar o mouse no SDL, passa 0 como estado do botão no ACTION_UP!
-            SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, 0, 0, false);
-        } else if (b.keycode > 0) {
-            SDLActivity.onNativeKeyUp(b.keycode);
-        }
+    private void releaseAll() {
+        for (TouchButton b : buttons) b.pointerId = -1;
+        if (dragPointer != -1) pointer(PTR_UP, dragLastX, dragLastY);
+        dragPointer = pendingPointer = -1;
+        stickPointer = lookPointer = -1;
+        lx = ly = rx = ry = 0;
+        turnStart = 0;
+        resetStickVisual();
+        sendPad();
     }
 
     private void vibrateClick() {
         try {
             if (vibrator != null && vibrator.hasVibrator()) {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK));
+                if (Build.VERSION.SDK_INT >= 29) {
+                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK));
+                } else if (Build.VERSION.SDK_INT >= 26) {
+                    vibrator.vibrate(VibrationEffect.createOneShot(12, VibrationEffect.DEFAULT_AMPLITUDE));
                 } else {
-                    vibrator.vibrate(18);
+                    vibrator.vibrate(12);
                 }
             } else {
                 performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
@@ -871,7 +798,7 @@ public class TouchControlsView extends View {
         } catch (Exception ignored) {}
     }
 
-    private float dp(float value) {
-        return TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, getResources().getDisplayMetrics());
+    private float dp(float v) {
+        return TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
     }
 }

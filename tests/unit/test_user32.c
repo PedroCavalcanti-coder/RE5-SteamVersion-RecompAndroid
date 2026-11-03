@@ -8,8 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <SDL2/SDL_timer.h>
+
 #include "check.h"
 #include "re5/runtime.h"
+#include "re5/touch.h"
 #include "re5/user32.h"
 
 const re5_func_entry re5_lifted_table[1];
@@ -189,6 +192,34 @@ int main(void)
     CHECK(saw(0x0018u) && saw(0x0006u));   /* WM_SHOWWINDOW, WM_ACTIVATE */
     CHECK_EQ_U32(call("GetForegroundWindow", 0), hwnd);
     CHECK_EQ_U32(call("ShowWindow", 2, hwnd, 1u), 1);
+
+    /* Toque direto (re5/touch.h): posição normalizada -> cliente do jogo (800x600 aqui,
+     * não o tamanho da tela do aparelho), e o clique dura pelo menos 60 ms. */
+    uint32_t tm = gbuf(28);
+    re5_touch_pointer(RE5_TOUCH_PTR_DOWN, 0.5f, 0.25f);
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_TOUCH);
+    CHECK_EQ_U32(call("PeekMessageW", 5, tm, 0u, 0x0200u, 0x020Fu, 1u), 1);
+    CHECK_EQ_U32(rd32(tm + 4), 0x0200u);                     /* WM_MOUSEMOVE antes do clique */
+    CHECK_EQ_U32(rd32(tm + 12), (150u << 16) | 400u);
+    CHECK_EQ_U32(call("PeekMessageW", 5, tm, 0u, 0x0200u, 0x020Fu, 1u), 1);
+    CHECK_EQ_U32(rd32(tm + 4), 0x0201u);                     /* WM_LBUTTONDOWN */
+    CHECK_EQ_U32(rd32(tm + 8), 1u);                          /* MK_LBUTTON */
+    CHECK_EQ_U32(rd32(tm + 12), (150u << 16) | 400u);
+    CHECK_EQ_U32(re5_user32_mouse_buttons() & 1u, 1);        /* o DirectInput vê o botão */
+    uint32_t tp = gbuf(8);
+    CHECK_EQ_U32(call("GetCursorPos", 1, tp), 1);
+    CHECK_EQ_U32(rd32(tp), 503);                             /* origem do cliente (103, 75) + toque */
+    CHECK_EQ_U32(rd32(tp + 4), 225);
+    re5_touch_pointer(RE5_TOUCH_PTR_UP, 0.5f, 0.25f);        /* toque rápido: ainda segura */
+    CHECK_EQ_U32(call("PeekMessageW", 5, tm, 0u, 0x0200u, 0x020Fu, 1u), 0);
+    CHECK_EQ_U32(re5_user32_mouse_buttons() & 1u, 1);
+    SDL_Delay(80);
+    CHECK_EQ_U32(call("PeekMessageW", 5, tm, 0u, 0x0200u, 0x020Fu, 1u), 1);
+    CHECK_EQ_U32(rd32(tm + 4), 0x0202u);                     /* WM_LBUTTONUP */
+    CHECK_EQ_U32(rd32(tm + 8), 0u);
+    CHECK_EQ_U32(re5_user32_mouse_buttons() & 1u, 0);
+    re5_input_note(RE5_INPUT_KBM);
+    CHECK_EQ_U32(re5_input_active(), RE5_INPUT_KBM);
 
     /* Fila: WM_QUIT só depois de PostQuitMessage, e uma vez só. */
     uint32_t msg = gbuf(28);

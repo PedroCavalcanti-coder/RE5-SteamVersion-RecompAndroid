@@ -100,6 +100,13 @@ public class SDLControllerManager
         if ((device == null) || (deviceId < 0)) {
             return false;
         }
+        String devName = device.getName();
+        if (devName != null) {
+            String lower = devName.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("accelerometer") || lower.contains("sensor")) {
+                return false;
+            }
+        }
         int sources = device.getSources();
 
         /* This is called for every button press, so let's not spam the logs */
@@ -233,10 +240,14 @@ class SDLJoystickHandler_API16 extends SDLJoystickHandler {
                         }
                     }
 
+                    int btnMask = getButtonMask(joystickDevice);
+                    if (btnMask == 0 && joystick.hats.isEmpty() && (joystickDevice.getSources() & InputDevice.SOURCE_GAMEPAD) == 0) {
+                        continue;
+                    }
                     mJoysticks.add(joystick);
                     SDLControllerManager.nativeAddJoystick(joystick.device_id, joystick.name, joystick.desc,
                             getVendorId(joystickDevice), getProductId(joystickDevice), false,
-                            getButtonMask(joystickDevice), joystick.axes.size(), getAxisMask(joystick.axes), joystick.hats.size()/2, 0);
+                            btnMask, joystick.axes.size(), getAxisMask(joystick.axes), joystick.hats.size()/2, 0);
                 }
             }
         }

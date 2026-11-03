@@ -326,6 +326,15 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         Log.v(TAG, "onCreate()");
         super.onCreate(savedInstanceState);
 
+        // re5: a subclasse pode recusar a partida (activity recriada pelo sistema depois que o
+        // processo do jogo morreu). Nada do SDL é carregado; mBrokenLibraries faz os outros
+        // métodos do ciclo de vida não tocarem no código nativo.
+        if (!shouldStartGame(savedInstanceState)) {
+            mBrokenLibraries = true;
+            finish();
+            return;
+        }
+
         try {
             Thread.currentThread().setName("SDLActivity");
         } catch (Exception e) {
@@ -429,6 +438,11 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                 SDLActivity.onNativeDropFile(filename);
             }
         }
+    }
+
+    /** re5: false = não iniciar (ver onCreate). */
+    protected boolean shouldStartGame(Bundle savedInstanceState) {
+        return true;
     }
 
     protected void pauseNativeThread() {
@@ -962,6 +976,11 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     public static native void onNativeLocaleChanged();
     public static native boolean nativeIsCursorHidden();
     public static native int nativeGetPresents();
+    /* Dispositivo de toque do runtime (runtime/src/win32/touch.c, re5/touch.h). */
+    public static native void nativeTouchPad(int buttons, float lx, float ly, float rx, float ry, float lt, float rt);
+    public static native void nativeTouchPointer(int action, float nx, float ny);
+    public static native void nativeTouchNote();
+    public static native int nativeActiveInput();
 
     /**
      * This method is called by SDL using JNI.

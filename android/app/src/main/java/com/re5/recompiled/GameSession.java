@@ -57,6 +57,32 @@ public final class GameSession {
         return start;
     }
 
+    private static final String CLAIMED = "game_launch_claimed";
+
+    /**
+     * Partida nova ou activity recriada pelo sistema? O launcher manda um LAUNCH_ID único;
+     * o GameActivity o "consome" aqui. Se o processo do jogo morre (Android o matou em
+     * segundo plano, ou um exit() com a activity aberta), o sistema recria o GameActivity
+     * com a MESMA intent, e o ID já consumido denuncia isso. Sem ID (aberto pelo adb) vale
+     * sempre.
+     */
+    public static boolean claimLaunch(Context ctx, String launchId) {
+        if (launchId == null) return true;
+        File f = new File(ctx.getFilesDir(), CLAIMED);
+        String last = "";
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String line = r.readLine();
+            if (line != null) last = line.trim();
+        } catch (IOException ignored) {
+        }
+        if (launchId.equals(last)) return false;
+        try (FileWriter w = new FileWriter(f)) {
+            w.write(launchId);
+        } catch (IOException ignored) {
+        }
+        return true;
+    }
+
     /** Últimas linhas do log do runtime (RE5Native) e do SDL desde {@code since}. */
     public static String readRecentLog(String since, int maxLines) {
         Deque<String> lines = new ArrayDeque<>();
