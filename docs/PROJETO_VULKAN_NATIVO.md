@@ -12,6 +12,14 @@ crítico") e precisa da medida da fase A0.
 
 ## 1. Decisão
 
+**Atualização (03/11): o backend está guardado na branch `re5vk-nativo`; o `master` volta à DXVK.**
+Na branch: tradutor SM3 -> SPIR-V (os 164 shaders do benchmark passam no `spirv-val`) e o device
+inteiro (`runtime/src/gfx/vk/`, `RE5_GFX=re5vk`). Resultado no A54 em 720p: ~16 fps, contra 15,4
+da DXVK. Menus e vídeo saem certos, mas a cena 3D do benchmark sai quase toda preta (causa não
+achada). No PC, o primeiro teste rodou 2.408 Presents. Decisão do usuário: seguir otimizando a
+DXVK; o backend pode voltar da branch depois. No `master` ficam a medida (A0), o censo
+(`RE5_D3D9_CENSUS`), o tempo por método D3D9 e o despejo de shaders (`RE5_D3D9_SHADER_DUMP`).
+
 **Atualização (31/10, com a medida do aparelho, §3.4): o usuário decidiu seguir com o backend,
 e a medida mostra onde ele pode ganhar.** No A54 o quadro não é limitado pela CPU nem pela
 resolução. Ele se perde no pipeline da DXVK: só 2 quadros em voo, o `Present` com 53% do

@@ -23,7 +23,6 @@
 
 #include "re5/runtime.h"
 #include "re5/d3d9_bridge.h"
-#include "re5/re5vk.h"
 #include "re5/user32.h"
 
 #if defined(RE5_HOST_WINDOWS)
@@ -211,25 +210,10 @@ static void load(void)
 #endif
 }
 
-int re5vk_enabled(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *g = getenv("RE5_GFX");
-        if (!g || !*g || !strcmp(g, "dxvk")) on = 0;
-        else if (!strcmp(g, "re5vk")) on = 1;
-        else re5_fatal("d3d9", "RE5_GFX=%s: valores aceitos: dxvk (padrão), re5vk", g);
-    }
-    return on;
-}
-
-/* RE5_GFX=re5vk: o IDirect3D9 da DXVK continua respondendo as consultas do adaptador e o
- * device é o Vulkan próprio (runtime/src/gfx/vk/re5vk.c). */
 static void *host_create9(uint32_t sdk)
 {
     load();
-    void *d3d = g_create9(sdk);
-    return d3d && re5vk_enabled() ? re5vk_wrap_d3d9(d3d) : d3d;
+    return g_create9(sdk);
 }
 
 static void *host_window(uint32_t hwnd)
