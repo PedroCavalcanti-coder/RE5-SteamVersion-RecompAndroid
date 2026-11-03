@@ -23,6 +23,7 @@ static inline int re5_mutex_trylock(re5_mutex *m) { return TryEnterCriticalSecti
  * sem prazo. Devolve 0 se acordou, 1 se o prazo venceu. */
 typedef struct { CONDITION_VARIABLE cv; } re5_cond;
 static inline void re5_cond_init(re5_cond *c) { InitializeConditionVariable(&c->cv); }
+static inline void re5_cond_destroy(re5_cond *c) { (void)c; }   /* CONDITION_VARIABLE não tem destrutor */
 static inline void re5_cond_broadcast(re5_cond *c) { WakeAllConditionVariable(&c->cv); }
 static inline void re5_cond_signal(re5_cond *c) { WakeConditionVariable(&c->cv); }
 static inline int re5_cond_wait_ms(re5_cond *c, re5_mutex *m, uint32_t ms)
@@ -59,6 +60,7 @@ static inline void re5_cond_init(re5_cond *c)
     pthread_cond_init(&c->cv, &a);
     pthread_condattr_destroy(&a);
 }
+static inline void re5_cond_destroy(re5_cond *c) { pthread_cond_destroy(&c->cv); }
 static inline void re5_cond_broadcast(re5_cond *c) { pthread_cond_broadcast(&c->cv); }
 static inline void re5_cond_signal(re5_cond *c) { pthread_cond_signal(&c->cv); }
 static inline int re5_cond_wait_ms(re5_cond *c, re5_mutex *m, uint32_t ms)

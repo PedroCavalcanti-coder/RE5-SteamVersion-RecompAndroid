@@ -10,9 +10,12 @@
  *                     RecursionCount), protegido por mutexes do host por faixa
  *                     de endereço, sem o lock do HLE; quem espera dorme numa
  *                     fila e o Leave passa a seção direto para o primeiro.
- *   eventos etc.      objetos do host atrás de HANDLEs; um mutex e uma variável
- *                     de condição globais para todas as esperas (acordar todo
- *                     mundo a cada sinal é simples e correto; desempenho é Fase 6).
+ *   eventos etc.      objetos do host atrás de HANDLEs; um mutex global (g_mu)
+ *                     guarda o estado de todos (o WaitAll vê todos de uma vez).
+ *                     Cada espera tem variável de condição própria e se inscreve
+ *                     na lista do objeto: o sinal acorda só quem espera aquele
+ *                     objeto. Antes, uma variável de condição global com
+ *                     broadcast acordava toda thread parada a cada SetEvent.
  *                     Sinalizar e esperar não pegam o lock do HLE: g_mu e o
  *                     mutex da tabela de handles já protegem tudo o que mexem
  *                     (SetEvent segurava o lock global; RE5_PROFILE, Fase 4).
@@ -274,7 +277,15 @@ static void k_InterlockedExchangeAdd(CPU *c)
 
 /* ---- objetos de espera ---- */
 
+/* Uma thread parada em wait_objects (na pilha dela) e a inscrição dela num objeto. */
+typedef struct k32_waiter { re5_cond cv; } k32_waiter;
+typedef struct k32_wnode {
+    k32_waiter       *who;
+    struct k32_wnode *next;
+} k32_wnode;
+
 typedef struct waitable {
+    k32_wnode *waiters;            /* sob g_mu: quem espera este objeto agora */
     re5_handle_type type;
     int      manual, signaled;     /* evento; thread: terminou */
     uint32_t owner, recursion;     /* mutex */
@@ -289,9 +300,20 @@ typedef struct waitable {
 } waitable;
 
 static re5_mutex g_mu;
-static re5_cond g_cv;
+static re5_cond g_cv;              /* só criação/retomada de thread (tid, suspend) */
 static int g_ready;
 static waitable *g_named;
+static uint64_t g_idle_wakeups;    /* sob g_mu: acordou numa espera e nada estava pronto */
+
+uint64_t re5_k32_idle_wakeups(void) { return __atomic_load_n(&g_idle_wakeups, __ATOMIC_RELAXED); }
+
+/* Sob g_mu: o estado de `w` mudou; quem o espera reavalia. Acorda todos os inscritos
+ * (não só um): um acordado pode estar num WaitAll que ainda não fecha, ou pegar outro
+ * objeto do WaitAny, e o sinal não pode se perder. */
+static void wake_waiters(waitable *w)
+{
+    for (k32_wnode *n = w->waiters; n; n = n->next) re5_cond_signal(&n->who->cv);
+}
 
 static void ensure_init(void)
 {
@@ -374,7 +396,7 @@ int k32_event_signal(uint32_t h)
     if (!w) return 0;
     re5_mutex_lock(&g_mu);
     w->signaled = 1;
-    re5_cond_broadcast(&g_cv);
+    wake_waiters(w);
     re5_mutex_unlock(&g_mu);
     return 1;
 }
@@ -418,7 +440,7 @@ static void k_ReleaseMutex(CPU *c)
     }
     if (--w->recursion == 0) {
         w->owner = 0;
-        re5_cond_broadcast(&g_cv);
+        wake_waiters(w);
     }
     re5_mutex_unlock(&g_mu);
     c->eax = 1;
@@ -458,7 +480,7 @@ static void k_ReleaseSemaphore(CPU *c)
     }
     if (prev_va) k32_w32(prev_va, (uint32_t)w->count);
     w->count += n;
-    re5_cond_broadcast(&g_cv);
+    wake_waiters(w);
     re5_mutex_unlock(&g_mu);
     c->eax = 1;
 }
@@ -514,6 +536,9 @@ static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint3
     uint32_t tid = cur_tid(), result = K32_WAIT_TIMEOUT;
     uint64_t deadline = ms == K32_INFINITE_MS ? 0 : now_ms() + ms;
     int pump = re5_thread_has_pump();
+    k32_waiter me;
+    k32_wnode nodes[MAX_WAIT];
+    int enrolled = 0, woke = 0;
     RE5_BLOCKING_BEGIN();
     re5_mutex_lock(&g_mu);
     for (;;) {
@@ -534,19 +559,37 @@ static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint3
                 break;
             }
         }
+        if (woke) g_idle_wakeups++;   /* acordou e nada estava pronto */
         uint32_t left = K32_INFINITE_MS;
         if (ms != K32_INFINITE_MS) {
             uint64_t now = now_ms();
             if (now >= deadline) break;
             left = (uint32_t)(deadline - now);
         }
+        if (!enrolled) {   /* só quem vai dormir se inscreve; o caminho rápido não paga */
+            re5_cond_init(&me.cv);
+            for (uint32_t i = 0; i < n; i++) {
+                nodes[i].who = &me;
+                nodes[i].next = w[i]->waiters;
+                w[i]->waiters = &nodes[i];
+            }
+            enrolled = 1;
+        }
         if (pump && left > PUMP_SLICE_MS) left = PUMP_SLICE_MS;
-        re5_cond_wait_ms(&g_cv, &g_mu, left);
+        woke = !re5_cond_wait_ms(&me.cv, &g_mu, left);
         if (pump) {   /* a thread da janela trata as mensagens do Windows durante a espera */
             re5_mutex_unlock(&g_mu);
             re5_thread_pump();
             re5_mutex_lock(&g_mu);
         }
+    }
+    if (enrolled) {
+        for (uint32_t i = 0; i < n; i++) {
+            for (k32_wnode **pp = &w[i]->waiters; *pp; pp = &(*pp)->next) {
+                if (*pp == &nodes[i]) { *pp = nodes[i].next; break; }
+            }
+        }
+        re5_cond_destroy(&me.cv);
     }
     re5_mutex_unlock(&g_mu);
     RE5_BLOCKING_END();
@@ -605,7 +648,7 @@ static void guest_thread_main(void *p)
     re5_mutex_lock(&g_mu);
     w->exit_code = code;
     w->signaled = 1;
-    re5_cond_broadcast(&g_cv);
+    wake_waiters(w);
     re5_mutex_unlock(&g_mu);
     uint32_t h = w->handle;
     re5_thread_detach();

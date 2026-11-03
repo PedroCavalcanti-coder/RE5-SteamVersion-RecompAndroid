@@ -372,6 +372,66 @@ static void test_hle(void)
     CHECK_EQ_U32(rd32(counter), 400000);
 }
 
+/* Thundering herd: um sinal acorda só quem espera aquele objeto. */
+uint64_t re5_k32_idle_wakeups(void);   /* kernel32_sync.c: acordou numa espera e nada estava pronto */
+
+static volatile uint32_t g_ev_idle, g_ev_ping, g_ev_pong;
+#define HERD_ROUNDS 2000
+
+static uint32_t k32_call(const char *name, int n, uint32_t *args)
+{
+    return re5_guest_call(re5_thread_current(), re5_import_bind("kernel32.dll", name, 0), n, args);
+}
+
+static void idle_thread_fn(CPU *c)
+{
+    uint32_t a[2] = {g_ev_idle, 0xFFFFFFFFu};
+    c->eax = k32_call("WaitForSingleObject", 2, a);
+}
+
+static void pong_thread_fn(CPU *c)
+{
+    for (int i = 0; i < HERD_ROUNDS; i++) {
+        uint32_t w[2] = {g_ev_ping, 0xFFFFFFFFu}, s[1] = {g_ev_pong};
+        k32_call("WaitForSingleObject", 2, w);
+        k32_call("SetEvent", 1, s);
+    }
+    c->eax = 0;
+}
+
+static void test_herd(void)
+{
+    g_ev_idle = call("CreateEventA", 4, 0u, 1u, 0u, 0u);   /* manual, não sinalizado */
+    g_ev_ping = call("CreateEventA", 4, 0u, 0u, 0u, 0u);   /* auto-reset */
+    g_ev_pong = call("CreateEventA", 4, 0u, 0u, 0u, 0u);
+    uint32_t idle = re5_thunk_new("teste!ocioso", idle_thread_fn, 4, NULL);
+    uint32_t pong = re5_thunk_new("teste!pong", pong_thread_fn, 4, NULL);
+    re5_thunk_set_flags(idle, RE5_THUNK_NOLOCK);
+    re5_thunk_set_flags(pong, RE5_THUNK_NOLOCK);
+    uint32_t hs[6];
+    for (int i = 0; i < 6; i++) hs[i] = call("CreateThread", 6, 0u, 0u, idle, 0u, 0u, 0u);
+    uint32_t hp = call("CreateThread", 6, 0u, 0u, pong, 0u, 0u, 0u);
+    call("Sleep", 1, 100u);   /* as ociosas chegam à espera */
+    uint64_t w0 = re5_k32_idle_wakeups();
+    for (int i = 0; i < HERD_ROUNDS; i++) {
+        CHECK_EQ_U32(call("SetEvent", 1, g_ev_ping), 1);
+        CHECK_EQ_U32(call("WaitForSingleObject", 2, g_ev_pong, 5000u), 0);
+    }
+    uint64_t idle_wakes = re5_k32_idle_wakeups() - w0;
+    /* Com a variável de condição global eram ~6 acordadas inúteis por sinal (~24000). */
+    CHECK(idle_wakes < 200);   /* medido 2026-11-03: 0 (antes: 16787) */
+    CHECK_EQ_U32(call("WaitForSingleObject", 2, hp, 5000u), 0);
+    CHECK_EQ_U32(call("SetEvent", 1, g_ev_idle), 1);       /* manual: solta as 6 */
+    for (int i = 0; i < 6; i++) {
+        CHECK_EQ_U32(call("WaitForSingleObject", 2, hs[i], 5000u), 0);
+        call("CloseHandle", 1, hs[i]);
+    }
+    call("CloseHandle", 1, hp);
+    call("CloseHandle", 1, g_ev_idle);
+    call("CloseHandle", 1, g_ev_ping);
+    call("CloseHandle", 1, g_ev_pong);
+}
+
 static void test_nls(void)
 {
     CHECK_EQ_U32(call("GetACP", 0), 1252);
@@ -608,6 +668,7 @@ int main(int argc, char **argv)
     test_sync();
     test_threads();
     test_hle();
+    test_herd();
     test_nls();
     test_env();
     if (argc > 1) test_files(argv[1]);

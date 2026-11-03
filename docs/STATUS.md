@@ -176,6 +176,14 @@ O que mudou:
     (`work/lift_fpu.log`); `re5.exe` 1.499.440.440 -> 1.402.786.068 bytes (com depuração).
     `test_lifter_gaps` cobre; `ctest` 30/30. Fps no jogo (usuário, 1080p, mesmo trecho, A/B
     contra `re5_antes_fpu.exe`): **50 -> 53,7 fps (+7,4%)**, com uso de CPU e RAM um pouco menor.
+- **Esperas sem thundering herd (2026-11-03, `kernel32_sync.c`):** eventos, mutexes, semáforos
+  e threads acordavam quem esperava por uma variável de condição global com broadcast, então
+  todo `SetEvent`/`ReleaseSemaphore` acordava toda thread parada em qualquer objeto. Agora
+  cada espera tem variável de condição própria e se inscreve na lista do objeto; o sinal acorda
+  só os inscritos dele (`g_mu` continua global para o WaitAll). Teste `test_herd` (6 threads
+  paradas num evento + ping-pong de 2000 rodadas): acordadas sem nada pronto **16.787 -> 0**.
+  `ctest` 30/30. Fps no jogo (usuário, 1080p, mesmo trecho): **53,7 -> 55,9 fps (+4,1%)**;
+  somado à correção do `fpu_top`, 50 -> 55,9 (+11,8%).
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
   - Há faixas de guarda de 2 GiB sem acesso em volta do guest.
 - **`flags_sub_m`:** ZF = `a == b`, e OF = SF ^ (a <ₛ b) quando os dois estão vivos. É a mesma
