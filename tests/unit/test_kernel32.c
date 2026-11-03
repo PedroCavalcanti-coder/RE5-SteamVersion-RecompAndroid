@@ -341,6 +341,20 @@ static void incr_thread_fn(CPU *c)
     c->eax = 0;
 }
 
+/* Handler COM o lock do HLE: incremento não atômico, que só soma certo com exclusão mútua. */
+static uint32_t g_plain_sum;
+static void plain_add_fn(CPU *c) { uint32_t v = g_plain_sum; g_plain_sum = v + 1; c->eax = 0; }
+
+static void locked_thread_fn(CPU *c)
+{
+    static uint32_t add;
+    if (!add) add = re5_thunk_new("teste!soma", plain_add_fn, 0, NULL);   /* corrida inofensiva: mesmo efeito */
+    re5_thread *t = re5_thread_current();
+    for (int i = 0; i < 100000; i++) re5_guest_call(t, add, 0, NULL);
+    __atomic_add_fetch(&g_done, 1u, __ATOMIC_SEQ_CST);
+    c->eax = 0;
+}
+
 static void test_hle(void)
 {
     if (!re5_guest_lock_mode_hle()) return;
@@ -370,6 +384,20 @@ static void test_hle(void)
     }
     CHECK_EQ_U32(g_done, 4);
     CHECK_EQ_U32(rd32(counter), 400000);
+
+    /* Lock do HLE (caminho rápido com CAS): 4 threads x 100000 handlers com lock. */
+    g_plain_sum = 0;
+    g_done = 0;
+    re5_guest_call(T, re5_thunk_new("teste!soma0", plain_add_fn, 0, NULL), 0, NULL);   /* 1 */
+    uint32_t lockd = re5_thunk_new("teste!comlock", locked_thread_fn, 4, NULL);
+    re5_thunk_set_flags(lockd, RE5_THUNK_NOLOCK);   /* o laço roda solto; só a soma pega o lock */
+    for (int i = 0; i < 4; i++) hs[i] = call("CreateThread", 6, 0u, 0u, lockd, 0u, 0u, 0u);
+    for (int i = 0; i < 4; i++) {
+        CHECK_EQ_U32(call("WaitForSingleObject", 2, hs[i], 0xFFFFFFFFu), 0);
+        call("CloseHandle", 1, hs[i]);
+    }
+    CHECK_EQ_U32(g_done, 4);
+    CHECK_EQ_U32(g_plain_sum, 400001);
 }
 
 /* Thundering herd: um sinal acorda só quem espera aquele objeto. */

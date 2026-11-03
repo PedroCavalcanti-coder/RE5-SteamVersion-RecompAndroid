@@ -260,6 +260,10 @@ uint32_t re5_get_last_error(void) { return t_self_get() ? r32(t_self_get()->teb 
 /* Suspensa (SuspendThread), a thread espera aqui sem o lock do guest. */
 static void wait_resumed(re5_thread *t)
 {
+    /* Quase nunca suspensa: sem o mutex global no caminho comum (cada thunk com lock
+     * passava aqui). Uma suspensão que chegue logo depois é vista no ponto de
+     * suspensão do re5_guest_lock, que relê t->suspend com o lock na mão. */
+    if (__atomic_load_n(&t->suspend, __ATOMIC_ACQUIRE) <= 0) return;
     re5_mutex_lock(&g_susp_mu);
     while (t->suspend > 0) re5_cond_wait_ms(&g_susp_cv, &g_susp_mu, 0xFFFFFFFFu);
     re5_mutex_unlock(&g_susp_mu);
@@ -311,32 +315,46 @@ int re5_guest_lock_mode_hle(void)
  * pode parar sem tratar mensagens e acorda também a cada 10 ms para bombear.
  * Antes ela tentava, cedia e dormia 1 ms em laço: medido no demo do jogo
  * (RE5_PROFILE), 7% das amostras eram threads esperando com o lock livre. */
+/* Caminho rápido (2026-11-03): lock livre = um CAS, soltar = um store, e o mutex só
+ * entra quando há disputa. RE5_PROFILE no benchmark: 2,9% das amostras eram threads
+ * "esperando" com o lock livre - o custo dos dois pares lock/unlock de g_hle_mu (mais
+ * o g_susp_mu) em cada uma das ~350 mil chamadas D3D9 por segundo. Furar a fila
+ * continua possível, como antes (quem pegava o mutex primeiro levava). Sem perder
+ * sinal: quem espera conta-se em g_hle_waiting (seq_cst) antes de reler g_hle_held;
+ * quem solta zera g_hle_held (seq_cst) antes de ler g_hle_waiting, e sinaliza sob o
+ * mutex, que quem espera só larga dentro do cond_wait. */
+static int hle_try(void)
+{
+    int z = 0;
+    return __atomic_compare_exchange_n(&g_hle_held, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
 static void hle_take(void)
 {
+    if (hle_try()) return;
     re5_mutex_lock(&g_hle_mu);
-    if (g_hle_held) {
-        g_hle_waiting++;
-        while (g_hle_held) {
-            if (!t_pump_get()) {
-                re5_cond_wait_ms(&g_hle_cv, &g_hle_mu, 0xFFFFFFFFu);
-            } else if (re5_cond_wait_ms(&g_hle_cv, &g_hle_mu, 10) && g_hle_held) {
-                re5_mutex_unlock(&g_hle_mu);   /* o bombeamento roda sem o mutex */
-                t_pump_get()();
-                re5_mutex_lock(&g_hle_mu);
-            }
+    __atomic_add_fetch(&g_hle_waiting, 1, __ATOMIC_SEQ_CST);
+    while (!hle_try()) {
+        if (!t_pump_get()) {
+            re5_cond_wait_ms(&g_hle_cv, &g_hle_mu, 0xFFFFFFFFu);
+        } else if (re5_cond_wait_ms(&g_hle_cv, &g_hle_mu, 10) && __atomic_load_n(&g_hle_held, __ATOMIC_SEQ_CST)) {
+            re5_mutex_unlock(&g_hle_mu);   /* o bombeamento roda sem o mutex */
+            t_pump_get()();
+            re5_mutex_lock(&g_hle_mu);
         }
-        g_hle_waiting--;
     }
-    g_hle_held = 1;
+    __atomic_sub_fetch(&g_hle_waiting, 1, __ATOMIC_SEQ_CST);
     re5_mutex_unlock(&g_hle_mu);
 }
 
 static void hle_give(void)
 {
-    re5_mutex_lock(&g_hle_mu);
-    g_hle_held = 0;
-    if (g_hle_waiting) re5_cond_signal(&g_hle_cv);
-    re5_mutex_unlock(&g_hle_mu);
+    __atomic_store_n(&g_hle_held, 0, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_hle_waiting, __ATOMIC_SEQ_CST)) {
+        re5_mutex_lock(&g_hle_mu);
+        re5_cond_signal(&g_hle_cv);
+        re5_mutex_unlock(&g_hle_mu);
+    }
 }
 
 #if defined(RE5_HOST_WINDOWS)

@@ -184,6 +184,20 @@ O que mudou:
   paradas num evento + ping-pong de 2000 rodadas): acordadas sem nada pronto **16.787 -> 0**.
   `ctest` 30/30. Fps no jogo (usuário, 1080p, mesmo trecho): **53,7 -> 55,9 fps (+4,1%)**;
   somado à correção do `fpu_top`, 50 -> 55,9 (+11,8%).
+- **Lock do HLE com caminho rápido (2026-11-03, `thread.c`):** `RE5_PROFILE` no benchmark
+  variável (`work/bench/herd_prof`) mostrou que o D3D9 quase não espera por outra thread
+  (0,1% das amostras com dono real), mas 2,9% eram threads "esperando" com o lock livre: o
+  custo de `g_susp_mu` + dois pares de `g_hle_mu` em cada uma das ~350 mil chamadas D3D9/s.
+  Agora lock livre = um CAS, soltar = um store (mutex e sinal só com alguém esperando) e
+  `wait_resumed` não pega mutex se a thread não está suspensa. Espera do lock no perfil:
+  3,3-4,8% -> 0,8-1,5% (`work/bench/hlefast_prof`). Teste em `test_kernel32` (4 threads x
+  100000 handlers com lock somando num contador não atômico = 400001; com o CAS quebrado de
+  propósito deu 335.709). `ctest` 30/30. Benchmark variável do jogo (usuário, 1080p): 90,1 fps
+  de média (áreas 104,9 / 83,8 / 87,5 / 89,1), CPU ~25%. Não há medida do usuário no mesmo
+  benchmark antes desta mudança; o `bench_re5.py` deu 93,1 de média (antes, a base sem perfil
+  oscilou demais para comparar).
+- **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
+  benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
   - Há faixas de guarda de 2 GiB sem acesso em volta do guest.
 - **`flags_sub_m`:** ZF = `a == b`, e OF = SF ^ (a <ₛ b) quando os dois estão vivos. É a mesma

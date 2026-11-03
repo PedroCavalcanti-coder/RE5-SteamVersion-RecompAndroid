@@ -53,7 +53,8 @@ cache_flags = true
 # Desligado: no A/B do usuário (28/10) o melhor build foi sem tail_calls e com RE5_HEAP_NOLOCK=1.
 tail_calls = false
 # Laço de espera pura (só lê a memória e compara, endereço fixo) ganha uma pausa de CPU na
-# cabeça (fase P7); desligado até o A/B. Não se aplica a laço que avança um ponteiro (strlen etc.).
+# cabeça (fase P7). Não se aplica a laço que avança um ponteiro (strlen etc.). A/B do usuário
+# (2026-11-03, benchmark variável 1080p, 47 laços com a pausa): 90,1 sem / 89,2 com - empate, desligado.
 spin_pause = false
 # call/jmp/ret de função do jogo (abaixo de flags_dead_at_ret_below) deixam de gravar cf..of na CPU:
 # quem retorna e quem é chamado nunca as lê (mesma premissa da análise de flags no ret).
