@@ -20,6 +20,18 @@ achada). No PC, o primeiro teste rodou 2.408 Presents. Decisão do usuário: seg
 DXVK; o backend pode voltar da branch depois. No `master` ficam a medida (A0), o censo
 (`RE5_D3D9_CENSUS`), o tempo por método D3D9 e o despejo de shaders (`RE5_D3D9_SHADER_DUMP`).
 
+**DXVK 2.6.2 no A54 (A4.3, 03/11): não roda sem um porte grande.** Medido com `tools/vkprobe`
+(Mali-G68, Vulkan 1.3.219, driver 0x9801000):
+- **Bloqueio principal:** sem `VK_EXT_robustness2`. A DXVK 2.x exige a extensão e usa o
+  `nullDescriptor` dela em todo descritor não ligado.
+- **Ligados sem condição pela 2.6.2 e ausentes no Mali:** `multiDrawIndirect`, `fillModeNonSolid`,
+  `multiViewport`, `textureCompressionBC`, `shaderClipDistance`/`shaderCullDistance`, `wideLines`.
+- **Sem `VK_EXT_graphics_pipeline_library`:** a principal melhoria da 2.x contra travadas de
+  compilação não existe aqui.
+- **Presentes:** o núcleo do 1.3 (`dynamicRendering`, `synchronization2`, `timelineSemaphore`,
+  `maintenance4`), ETC2/ASTC, `transform_feedback`, `custom_border_color`,
+  `swapchain_maintenance1`.
+
 **Atualização (31/10, com a medida do aparelho, §3.4): o usuário decidiu seguir com o backend,
 e a medida mostra onde ele pode ganhar.** No A54 o quadro não é limitado pela CPU nem pela
 resolução. Ele se perde no pipeline da DXVK: só 2 quadros em voo, o `Present` com 53% do
