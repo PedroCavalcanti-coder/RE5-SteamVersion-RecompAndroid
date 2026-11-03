@@ -146,4 +146,20 @@ static inline void re5_dxt_decode(int mode, uint32_t width, uint32_t height,
     }
 }
 
+/* DXT1 -> A1R5G5B5 (16 bits por pixel, D3DFMT_A1R5G5B5): as cores do DXT1 já são 5:6:5 e o alfa
+ * é de 1 bit, então a perda é só o bit mais baixo do verde. Metade da banda e da memória do
+ * RGBA8 na GPU sem BC (Mali). `tmp` tem width * height * 4 bytes. */
+static inline void re5_dxt1_decode_1555(uint32_t width, uint32_t height, const uint8_t *source, uint32_t src_pitch,
+                                        uint8_t *dst, uint32_t dst_pitch, uint8_t *tmp)
+{
+    re5_dxt_decode(1, width, height, source, src_pitch, tmp, width * 4, 0);
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *s = tmp + (size_t)y * width * 4;
+        uint16_t *d = (uint16_t *)(dst + (size_t)y * dst_pitch);
+        for (uint32_t x = 0; x < width; x++, s += 4)
+            d[x] = (uint16_t)((s[3] >= 128 ? 0x8000u : 0u) | ((uint32_t)(s[0] >> 3) << 10) |
+                              ((uint32_t)(s[1] >> 3) << 5) | (uint32_t)(s[2] >> 3));
+    }
+}
+
 #endif /* RE5_DXT_DECODE_H */

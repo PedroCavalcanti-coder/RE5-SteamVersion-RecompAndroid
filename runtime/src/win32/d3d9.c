@@ -89,7 +89,7 @@ typedef struct {
 
 typedef struct {
     uint32_t  orig_format;   /* D3DFMT_DXT1, DXT3, DXT5, ou 0 se nativo */
-    uint32_t  fallback_fmt;  /* D3DFMT_A8B8G8R8 ou D3DFMT_A8R8G8B8 */
+    uint32_t  fallback_fmt;  /* D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8 ou (DXT1) D3DFMT_A1R5G5B5 */
     uint32_t  width, height;
     uint32_t  levels, faces;
     uint8_t **levels_data;   /* faces * levels buffers com os dados brutos DXT */
@@ -472,7 +472,18 @@ static int host_supports_format(IDirect3DDevice9 *dev, D3DFORMAT fmt, DWORD usag
     return SUCCEEDED(hr);
 }
 
-static D3DFORMAT get_dxt_fallback_format(IDirect3DDevice9 *dev, DWORD usage, D3DRESOURCETYPE rtype)
+/* RE5_DXT1_16=0: DXT1 descompactado em RGBA8 como antes; o padrão é A1R5G5B5 (16 bits). */
+static int dxt1_16(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RE5_DXT1_16");
+        v = !(e && *e == '0');
+    }
+    return v;
+}
+
+static D3DFORMAT get_dxt_fallback_format(IDirect3DDevice9 *dev, DWORD usage, D3DRESOURCETYPE rtype, int dxt1)
 {
     if (!dev || !dev->lpVtbl || !dev->lpVtbl->GetDirect3D) return D3DFMT_A8B8G8R8;
     IDirect3D9 *d3d = NULL;
@@ -483,6 +494,11 @@ static D3DFORMAT get_dxt_fallback_format(IDirect3DDevice9 *dev, DWORD usage, D3D
     memset(&dm, 0, sizeof dm);
     dev->lpVtbl->GetCreationParameters(dev, &cp);
     d3d->lpVtbl->GetAdapterDisplayMode(d3d, cp.AdapterOrdinal, &dm);
+    if (dxt1 && dxt1_16() &&
+        SUCCEEDED(d3d->lpVtbl->CheckDeviceFormat(d3d, cp.AdapterOrdinal, cp.DeviceType, dm.Format, usage, rtype, D3DFMT_A1R5G5B5))) {
+        d3d->lpVtbl->Release(d3d);
+        return D3DFMT_A1R5G5B5;
+    }
     /* No Vulkan/Android/Mali, A8B8G8R8 (VK_FORMAT_R8G8B8A8_UNORM) é universal. */
     if (SUCCEEDED(d3d->lpVtbl->CheckDeviceFormat(d3d, cp.AdapterOrdinal, cp.DeviceType, dm.Format, usage, rtype, D3DFMT_A8B8G8R8))) {
         d3d->lpVtbl->Release(d3d);
@@ -695,7 +711,7 @@ static void d_CreateTexture(CPU *c)
     int need_dxt_fallback = 0;
     if (is_dxt(format) && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) {
         if (force_cpu_dxt() || !host_supports_format(dev, format, usage, D3DRTYPE_TEXTURE)) {
-            host_format = get_dxt_fallback_format(dev, usage, D3DRTYPE_TEXTURE);
+            host_format = get_dxt_fallback_format(dev, usage, D3DRTYPE_TEXTURE, format == D3DFMT_DXT1);
             need_dxt_fallback = 1;
         }
     }
@@ -742,7 +758,7 @@ static void d_CreateCubeTexture(CPU *c)
     int need_dxt_fallback = 0;
     if (is_dxt(format) && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) {
         if (force_cpu_dxt() || !host_supports_format(dev, format, usage, D3DRTYPE_CUBETEXTURE)) {
-            host_format = get_dxt_fallback_format(dev, usage, D3DRTYPE_CUBETEXTURE);
+            host_format = get_dxt_fallback_format(dev, usage, D3DRTYPE_CUBETEXTURE, format == D3DFMT_DXT1);
             need_dxt_fallback = 1;
         }
     }
@@ -1028,10 +1044,18 @@ static void lock_finish(d9_obj *o, int idx)
                            (const uint8_t *)re5_g2h(l.guest) + (size_t)r * l.dxt_guest_pitch,
                            l.dxt_guest_pitch);
             }
-            /* 2) Descompacta DXT para os pixels RGBA8 do host */
-            re5_dxt_decode(dxt_mode((D3DFORMAT)l.dxt_orig_format), l.dxt_region_w, l.dxt_region_h,
-                           (const uint8_t *)re5_g2h(l.guest), l.dxt_guest_pitch,
-                           l.host, l.pitch, (l.dxt_fallback_fmt == D3DFMT_A8R8G8B8));
+            /* 2) Descompacta DXT para os pixels do host (RGBA8, ou A1R5G5B5 para DXT1) */
+            if (l.dxt_fallback_fmt == D3DFMT_A1R5G5B5) {
+                uint8_t *tmp = malloc((size_t)l.dxt_region_w * l.dxt_region_h * 4);
+                if (!tmp) re5_fatal("d3d9", "sem memória");
+                re5_dxt1_decode_1555(l.dxt_region_w, l.dxt_region_h, (const uint8_t *)re5_g2h(l.guest),
+                                     l.dxt_guest_pitch, l.host, l.pitch, tmp);
+                free(tmp);
+            } else {
+                re5_dxt_decode(dxt_mode((D3DFORMAT)l.dxt_orig_format), l.dxt_region_w, l.dxt_region_h,
+                               (const uint8_t *)re5_g2h(l.guest), l.dxt_guest_pitch,
+                               l.host, l.pitch, (l.dxt_fallback_fmt == D3DFMT_A8R8G8B8));
+            }
         } else {
             const uint8_t *g = re5_g2h(l.guest);
             for (uint32_t z = 0; z < (l.slices ? l.slices : 1); z++) {

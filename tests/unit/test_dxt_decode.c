@@ -146,5 +146,22 @@ int main(void)
         }
     }
 
+    /* DXT1 -> A1R5G5B5: vermelho, azul e o índice 3 transparente (c0 <= c1) */
+    {
+        uint8_t block[8];
+        uint16_t c0 = 0x001F, c1 = 0xF800;   /* c0 <= c1: modo de 3 cores + transparente */
+        memcpy(block, &c0, 2);
+        memcpy(block + 2, &c1, 2);
+        uint32_t indices = 0xC4;   /* p0 = 0 (azul), p1 = 1 (vermelho), p2 = 0, p3 = 3 (transparente) */
+        memcpy(block + 4, &indices, 4);
+        uint8_t out[4 * 4 * 2], tmp[4 * 4 * 4];
+        re5_dxt1_decode_1555(4, 4, block, 8, out, 8, tmp);
+        uint16_t px[4];
+        memcpy(px, out, 8);
+        CHECK_EQ_U32(px[0], 0x801Fu);   /* azul opaco */
+        CHECK_EQ_U32(px[1], 0xFC00u);   /* vermelho opaco */
+        CHECK_EQ_U32(px[3], 0x0000u);   /* transparente */
+    }
+
     CHECK_DONE();
 }

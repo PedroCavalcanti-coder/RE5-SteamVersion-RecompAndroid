@@ -56,6 +56,40 @@ env_linux.write_text(text.replace("#include <unistd.h>", "#include <pthread.h>\n
     empty, "  void setThreadName(const std::string& name) {\n"
            "    pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());\n  }"))
 
+def patch(rel, old, new):
+    path = args.output / rel
+    text = path.read_text()
+    if old not in text:
+        raise SystemExit(f"prepare: trecho não encontrado em {rel}: {old[:60]!r}")
+    path.write_text(text.replace(old, new, 1))
+
+# AFBC no Mali (docs/PROJETO_VULKAN_NATIVO.md, otimização da 1.9.2b): a DXVK marca toda textura
+# de formato com par sRGB como VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, e com isso o driver do Mali
+# desliga a compressão de textura e de framebuffer (AFBC) em quase todas as imagens do jogo.
+# Sem DXVK_RE5_SRGB=1, as imagens não são mutáveis e um pedido de vista sRGB sai linear.
+patch("src/d3d9/d3d9_common_texture.cpp", '#include <algorithm>',
+      '#include <algorithm>\n#include <cstdlib>\n\n'
+      'namespace dxvk {\n'
+      '  static bool re5SrgbViews() {\n'
+      '    static int v = -1;\n'
+      '    if (v < 0) { const char* e = std::getenv("DXVK_RE5_SRGB"); v = e && e[0] == \'1\'; }\n'
+      '    return v != 0;\n'
+      '  }\n'
+      '}')
+patch("src/d3d9/d3d9_common_texture.cpp",
+      'bool isMutable     = m_mapping.FormatSrgb != VK_FORMAT_UNDEFINED;',
+      'bool isMutable     = m_mapping.FormatSrgb != VK_FORMAT_UNDEFINED && re5SrgbViews();')
+patch("src/d3d9/d3d9_common_texture.cpp",
+      '          bool                   Srgb) {\n    DxvkImageViewCreateInfo viewInfo;',
+      '          bool                   Srgb) {\n'
+      '    if (Srgb && !re5SrgbViews()) {\n'
+      '      static bool warned = false;\n'
+      '      if (!warned) Logger::warn("re5: vista sRGB pedida; sai linear (DXVK_RE5_SRGB=1 liga, sem AFBC)");\n'
+      '      warned = true;\n'
+      '      Srgb = false;\n'
+      '    }\n'
+      '    DxvkImageViewCreateInfo viewInfo;')
+
 # Shaders embutidos: os .h que a DXVK inclui (gerados pelo meson no build original).
 generated = args.output / "generated"
 generated.mkdir(exist_ok=True)
