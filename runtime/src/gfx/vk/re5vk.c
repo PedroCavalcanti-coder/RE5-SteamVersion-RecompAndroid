@@ -972,6 +972,8 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
         g_dev_vtbl.CreateVertexShader = re5vk_CreateVertexShader;
         g_dev_vtbl.CreatePixelShader = re5vk_CreatePixelShader;
         g_dev_vtbl.CreateQuery = re5vk_CreateQuery;
+        g_dev_vtbl.CreateOffscreenPlainSurface = re5vk_CreateOffscreenPlainSurface;
+        g_dev_vtbl.GetRenderTargetData = re5vk_GetRenderTargetData;
         re5vk_draw_vtable(&g_dev_vtbl);
     }
     d->lpVtbl = &g_dev_vtbl;

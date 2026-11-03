@@ -359,6 +359,64 @@ static HRESULT STDMETHODCALLTYPE s_GetDesc(IDirect3DSurface9 *self, D3DSURFACE_D
     return D3D_OK;
 }
 
+/* Superfície de memória do sistema (CreateOffscreenPlainSurface + GetRenderTargetData): só
+ * CPU, o que basta para o RE5_D3D9_SHOT da ponte. */
+static HRESULT STDMETHODCALLTYPE s_LockRect(IDirect3DSurface9 *self, D3DLOCKED_RECT *lr, const RECT *r, DWORD flags)
+{
+    vk_surface *s = (vk_surface *)self;
+    if (!lr) return D3DERR_INVALIDCALL;
+    if (s->img) re5_fatal("re5vk", "LockRect de superfície na GPU sem implementação");
+    const vk_format *f = re5vk_format(s->desc.Format);
+    uint32_t pitch = s->desc.Width * f->bytes;
+    lr->Pitch = (INT)pitch;
+    lr->pBits = s->lock + (r ? (size_t)r->top * pitch + (size_t)r->left * f->bytes : 0);
+    return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE s_UnlockRect(IDirect3DSurface9 *self) { return D3D_OK; }
+
+HRESULT STDMETHODCALLTYPE re5vk_CreateOffscreenPlainSurface(IDirect3DDevice9 *self, UINT w, UINT h, D3DFORMAT format,
+                                                            D3DPOOL pool, IDirect3DSurface9 **out, HANDLE *sh)
+{
+    const vk_format *f = re5vk_format(format);
+    if (!out || sh || !f || f->bw != 1) return D3DERR_INVALIDCALL;
+    if (pool != D3DPOOL_SYSTEMMEM) re5_fatal("re5vk", "CreateOffscreenPlainSurface fora de D3DPOOL_SYSTEMMEM");
+    vk_surface *s = calloc(1, sizeof *s);
+    if (!s) re5_fatal("re5vk", "sem memória");
+    obj_init(&s->o, &g_vt_surface, (vk_device *)self, VKO_SURFACE);
+    s->desc = (D3DSURFACE_DESC){format, D3DRTYPE_SURFACE, 0, pool, D3DMULTISAMPLE_NONE, 0, w, h};
+    s->lock = calloc((size_t)w * h, f->bytes);
+    if (!s->lock) re5_fatal("re5vk", "sem memória");
+    *out = (IDirect3DSurface9 *)s;
+    return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE re5vk_GetRenderTargetData(IDirect3DDevice9 *self, IDirect3DSurface9 *rt,
+                                                    IDirect3DSurface9 *dst)
+{
+    vk_device *d = (vk_device *)self;
+    vk_surface *s = (vk_surface *)rt, *t = (vk_surface *)dst;
+    if (!s || !t || !s->img || t->img || s->desc.Width != t->desc.Width || s->desc.Height != t->desc.Height)
+        return D3DERR_INVALIDCALL;
+    const vk_format *f = s->img->fmt;
+    VkDeviceSize size = (VkDeviceSize)s->desc.Width * s->desc.Height * f->bytes;
+    re5vk_lock(d);
+    re5vk_end_rendering(d);
+    VkBuffer buf;
+    VkDeviceSize off;
+    uint8_t *p = re5vk_stage(d, size, 16, &buf, &off);
+    VkCommandBuffer cb = re5vk_cmd(d);
+    re5vk_barrier_all(cb);
+    VkBufferImageCopy c = {.bufferOffset = off,
+                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, s->level, s->layer, 1},
+                           .imageExtent = {s->desc.Width, s->desc.Height, 1}};
+    vkCmdCopyImageToBuffer(cb, s->img->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
+    re5vk_barrier_all(cb);
+    re5vk_flush(d, 1);   /* espera a GPU: o staging do envio anterior só volta a ser usado 8 envios depois */
+    memcpy(t->lock, p, (size_t)size);
+    re5vk_unlock(d);
+    return D3D_OK;
+}
+
 /* ---- texturas ---- */
 
 static vk_texture *tex_new(vk_device *d, int kind, const void *vt, D3DFORMAT format, DWORD usage, D3DPOOL pool,
@@ -905,6 +963,8 @@ void re5vk_res_vtables(vk_device *d)
     RESOURCE(g_vt_surface);
     g_vt_surface.GetType = s_GetType;
     g_vt_surface.GetDesc = s_GetDesc;
+    g_vt_surface.LockRect = s_LockRect;
+    g_vt_surface.UnlockRect = s_UnlockRect;
 
     RESOURCE(g_vt_texture);
     g_vt_texture.GetType = t_GetType;

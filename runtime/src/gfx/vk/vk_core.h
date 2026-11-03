@@ -59,7 +59,7 @@
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory)                    \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory)                        \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler)                              \
-    X(vkCmdCopyBufferToImage) X(vkCmdBlitImage) X(vkCmdCopyImage) X(vkCmdClearDepthStencilImage)                   \
+    X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdCopyImage) X(vkCmdClearDepthStencilImage)                   \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout)                                \
     X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)                           \
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreatePipelineCache) X(vkDestroyPipelineCache)           \
@@ -369,6 +369,9 @@ HRESULT STDMETHODCALLTYPE re5vk_CreateVertexDeclaration(IDirect3DDevice9 *, cons
                                                         IDirect3DVertexDeclaration9 **);
 HRESULT STDMETHODCALLTYPE re5vk_CreateVertexShader(IDirect3DDevice9 *, const DWORD *, IDirect3DVertexShader9 **);
 HRESULT STDMETHODCALLTYPE re5vk_CreatePixelShader(IDirect3DDevice9 *, const DWORD *, IDirect3DPixelShader9 **);
+HRESULT STDMETHODCALLTYPE re5vk_CreateOffscreenPlainSurface(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DPOOL,
+                                                            IDirect3DSurface9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE re5vk_GetRenderTargetData(IDirect3DDevice9 *, IDirect3DSurface9 *, IDirect3DSurface9 *);
 HRESULT STDMETHODCALLTYPE re5vk_CreateQuery(IDirect3DDevice9 *, D3DQUERYTYPE, IDirect3DQuery9 **);
 
 /* vk_draw.c */
