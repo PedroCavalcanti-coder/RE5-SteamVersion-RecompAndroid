@@ -100,6 +100,10 @@ add_library(re5_runtime STATIC
     src/core/trace.c
     src/core/vfs.c
     src/gfx/d3d9_host.c
+    src/gfx/vk/re5vk.c
+    src/gfx/vk/vk_draw.c
+    src/gfx/vk/vk_dxso.c
+    src/gfx/vk/vk_res.c
     src/win32/advapi32.c
     src/win32/avifil32.c
     src/win32/coldebug.c
@@ -140,6 +144,10 @@ if(NOT WIN32)
     target_link_libraries(re5_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(re5_runtime PRIVATE re5_d3d9_headers)
+# re5vk (RE5_GFX=re5vk): só os headers do Vulkan (os da DXVK 2.6.2, com Win32 e Android);
+# o carregador é aberto em tempo de execução, nada a linkar.
+set_source_files_properties(src/gfx/vk/re5vk.c src/gfx/vk/vk_draw.c src/gfx/vk/vk_res.c PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")
 if(WIN32)
     target_link_libraries(re5_runtime PUBLIC ws2_32 winmm)   # sockets do Winsock; timeBeginPeriod do host
 endif()

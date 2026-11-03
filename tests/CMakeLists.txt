@@ -26,6 +26,10 @@ add_test(NAME d3d9 COMMAND test_d3d9)
 add_executable(test_dxt_decode unit/test_dxt_decode.c)
 add_test(NAME dxt_decode COMMAND test_dxt_decode)
 
+# Tradutor SM3 -> SPIR-V do backend re5vk (RE5_GFX=re5vk). Com o spirv-val do NDK
+# (shader-tools/<host>/spirv-val) em RE5_SPIRV_VAL, cada SPIR-V passa pelo validador da Khronos.
+add_executable(test_vk_dxso unit/test_vk_dxso.c "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk/vk_dxso.c")
+add_test(NAME vk_dxso COMMAND test_vk_dxso)
 
 # Estouro da pilha do host com relatório (filtro com pilha de reserva).
 if(WIN32)
