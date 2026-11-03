@@ -552,7 +552,12 @@ def _sync_kind(text):
     kind = None
     if "RECOMP_TODO(" in text or "re5_recomp_todo(" in text:
         return "full"                  # aborts: the crash report reads the struct
-    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(\s*&?c\b", text):
+    # `c` sozinho é a CPU; `c->ebx` / `&c->xmm[1]` é um campo dela (valor ou ponteiro de
+    # registrador) e não dá ao chamado acesso ao resto. Sem o (?!->), RE5_WIDE(c->ebx, d)
+    # (lift.wide_addr, macro fora de _CPU_H_NAMES) virava sync completo em quase todo
+    # acesso à memória e o x87_cache gravava/relia c->fpu_top em volta de cada um
+    # (2,4 milhões de pares no código gerado).
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(\s*&?c\b(?!\s*->)", text):
         name = m.group(1)
         if name in _FULL_SYNC:
             return "full"

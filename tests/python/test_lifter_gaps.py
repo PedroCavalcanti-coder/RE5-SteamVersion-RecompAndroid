@@ -275,8 +275,28 @@ class LifterGaps(unittest.TestCase):
         c2 = lifter.lift_function(code2, 0x1000)
         jz = [l for l in c2.splitlines() if ": je " in l][0]
         self.assertIn("c->st[(R_ftop - (1)) & 7] = X_p1; R_ftop = (R_ftop - (1)) & 7;", jz)
+        # Com wide_addr, RE5_WIDE(c->esp, d) não é chamada que vê a CPU: o trecho continua em
+        # locais e nenhum acesso à memória grava/relê c->fpu_top.
+        lifter.wide_addr = True
+        cw = lifter.lift_function(code, 0x1000)
+        lw = {l.split("/* ")[1][:8]: l for l in cw.splitlines() if "/* 0000" in l}
+        self.assertIn("RE5_WIDE(", lw["00001000"])
+        self.assertIn("X_p1 = (rdf32(RE5_WIDE(R_esp, 0x00000004u)))", lw["00001000"])
+        for k in ("00001000", "00001004", "00001008", "0000100A", "0000100C", "0000100E"):
+            self.assertNotIn("fpu_top", lw[k])
+        self.assertIn("c->fpu_top = R_ftop;", lw["00001012"])                       # a chamada ainda sincroniza
+        lifter.wide_addr = False
         lifter.x87_cache = False
         self.assertNotIn("R_ftop", lifter.lift_function(code, 0x1000))
+
+    def test_sync_kind_field_is_not_the_cpu(self):
+        from lift32_cpu import _sync_kind
+        self.assertIsNone(_sync_kind("c->eax = rd32(RE5_WIDE(c->ebx, 0x00000A80u));"))
+        self.assertIsNone(_sync_kind("FOO(&c->xmm[1]);"))
+        self.assertEqual(_sync_kind("FOO(c, 1);"), "full")                         # desconhecido com a CPU
+        self.assertEqual(_sync_kind("FOO(&c);"), "full")
+        self.assertEqual(_sync_kind("dispatch(c, 0x00401000u);"), "full")
+        self.assertEqual(_sync_kind("rep_movs(c, 4);"), "rep_movs")
 
     def test_wide_addr(self):
         # lift.wide_addr: [reg + disp] vai largo (RE5_WIDE) só dentro de um acesso; o índice

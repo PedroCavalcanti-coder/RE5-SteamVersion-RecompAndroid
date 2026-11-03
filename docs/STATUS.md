@@ -167,6 +167,15 @@ O que mudou:
     endereço da imagem no deslocamento, o registrador é um índice e pode ser negativo.
   - Na primeira versão isso não existia, e o jogo fechava no variant benchmark do usuário
     (2.686 acessos estavam nessa forma).
+  - **Correção 2026-11-03 (lifter):** a regex de `_sync_kind` casava `RE5_WIDE(c->ebx, ...)`
+    como chamada que vê a CPU (macro fora de `_CPU_H_NAMES`). Como o `x87_cache` roda antes
+    do `cache_registers`, sobre o texto ainda com `c->`, quase todo acesso à memória numa
+    função com x87 virava sync completo: `c->fpu_top` gravado e relido em volta, e o
+    `fld [mem]` saía do cache. Agora `c->campo`/`&c->campo` não conta como a CPU
+    (`(?!\s*->)`). No código gerado, `R_ftop = c->fpu_top;` caiu de 2.407.396 para 535.035
+    (`work/lift_fpu.log`); `re5.exe` 1.499.440.440 -> 1.402.786.068 bytes (com depuração).
+    `test_lifter_gaps` cobre; `ctest` 30/30. Fps no jogo (usuário, 1080p, mesmo trecho, A/B
+    contra `re5_antes_fpu.exe`): **50 -> 53,7 fps (+7,4%)**, com uso de CPU e RAM um pouco menor.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
   - Há faixas de guarda de 2 GiB sem acesso em volta do guest.
 - **`flags_sub_m`:** ZF = `a == b`, e OF = SF ^ (a <ₛ b) quando os dois estão vivos. É a mesma
