@@ -247,7 +247,15 @@ O que mudou:
     ignorado em silêncio, e as texturas que o jogo lê como sRGB entravam sem a conversão para
     linear (ambiente estourado na fase 3 do variável). Imagens com par sRGB (BGRA8, RGBA8,
     BC1-3) nascem mutáveis, com lista de formatos, e ganham a vista sRGB no primeiro uso.
-    `RE5VK_SRGB=0` desliga (Mali: imagem mutável perde AFBC). Visual: pendente.
+    `RE5VK_SRGB=0` desliga (Mali: imagem mutável perde AFBC). Visual: pendente. Fixo com o
+    sRGB: **90,2 fps** (usuário).
+  - **Perfil depois disso** (`work/perf/re5vk_main.log`, `re5vk_render.log`, 04/11): a principal
+    roda 52-55% do tempo (era 44%); parada, `WaitForMultipleObjects` 27%, `EnterCriticalSection`
+    25% (era 45%; seções `0x337516B0` e `0x2F715334`, donas os workers), cópia do
+    `VertexBuffer::Unlock` 19%, `Present` 11%, `SetEvent` 10%. A render: 74% em handlers D3D9
+    (`DrawIndexedPrimitive` 32%). O perfil liga o `RE5_FPS_LOG`, que lê o relógio ~4 vezes por
+    chamada D3D9; parte das amostras "paradas dentro de um método D3D9" é esse custo, que as
+    rodadas normais não pagam.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
