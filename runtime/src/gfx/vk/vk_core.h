@@ -294,6 +294,9 @@ struct vk_device {
     int32_t vsi[16][4], psi[16][4];
     uint32_t vsb, psb;
     int vs_dirty, ps_dirty;
+    /* o que a região atual do UBO tem (prepare copia só o que o shader lê): c[0..n-1], i[], b */
+    uint16_t vs_ubo_f, ps_ubo_f;
+    uint8_t vs_ubo_ib, ps_ubo_ib;
     VkDeviceSize vs_ubo_off, ps_ubo_off;
     VkBuffer vs_ubo_buf, ps_ubo_buf;
     int in_scene;

@@ -173,6 +173,22 @@ static void run_builtin(void)
     CHECK_EQ_U32(s.inputs, 0x7);
     CHECK_EQ_U32(s.in_usage[1], 5);
     CHECK_EQ_U32(s.pixel, 0);
+    CHECK_EQ_U32(s.const_f, 256);   /* c[a0.x+10]: endereçamento relativo, o banco inteiro */
+    CHECK_EQ_U32(s.uses_i, 0);
+    {   /* mov oC0, c7 (+ c200 por def, que não vem do UBO): só c0..c7 */
+        static const uint32_t ps_c7[] = {
+            PS3,
+            INS(81, 5), DST(CONST, 200, 0xF), 0u, 0u, 0u, 0u,
+            INS(2, 3), DST(COLOROUT, 0, 0xF), SRC(CONST, 7), SRC(CONST, 200),
+            END,
+        };
+        re5vk_shader c7;
+        CHECK(re5vk_dxso_compile(ps_c7, sizeof ps_c7 / 4, &plain, &c7, err, sizeof err) == 0);
+        CHECK_EQ_U32(c7.const_f, 8);
+        CHECK_EQ_U32(c7.uses_i, 0);
+        CHECK_EQ_U32(c7.uses_b, 0);
+        free(c7.spv);
+    }
     free(s.spv);
     CHECK(re5vk_dxso_compile(ps_basic, sizeof ps_basic / 4, &plain, &s, err, sizeof err) == 0);
     CHECK_EQ_U32(s.samplers, 0xF);

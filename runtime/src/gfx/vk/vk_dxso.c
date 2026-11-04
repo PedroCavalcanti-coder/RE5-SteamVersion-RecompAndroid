@@ -402,6 +402,8 @@ static uint32_t read_const(cx *c, uint32_t n, uint32_t idx_id)
     uint32_t nf = c->pixel ? 224u : 256u;
     if (!idx_id && n >= nf) { fail(c, "c%u fora do limite", n); return kv4(c, 0, 0, 0, 0); }
     uint32_t ix = idx_id ? idx_id : ki(c, (int32_t)n);
+    uint32_t need = idx_id ? nf : n + 1u;   /* relativo: qualquer um do banco */
+    if (need > c->out->const_f) c->out->const_f = (uint16_t)need;
     ensure_open(c);
     uint32_t p = id(c);
     OP(&c->body, SOpAccessChain, c->ubo_ptr_v4, p, c->ubo, ki(c, 0), ix);
@@ -411,6 +413,7 @@ static uint32_t read_const(cx *c, uint32_t n, uint32_t idx_id)
 static uint32_t read_int(cx *c, uint32_t n)   /* ivec4 */
 {
     if (n < 16 && c->def_i_on[n]) return kv4i(c, c->def_i[n]);
+    c->out->uses_i = 1;
     ensure_open(c);
     uint32_t p = id(c);
     OP(&c->body, SOpAccessChain, c->ubo_ptr_i4, p, c->ubo, ki(c, 1), ki(c, (int32_t)n));
@@ -419,6 +422,7 @@ static uint32_t read_int(cx *c, uint32_t n)   /* ivec4 */
 
 static uint32_t read_bool(cx *c, uint32_t n)
 {
+    c->out->uses_b = 1;
     ensure_open(c);
     uint32_t p = id(c);
     OP(&c->body, SOpAccessChain, c->ubo_ptr_u, p, c->ubo, ki(c, 2));

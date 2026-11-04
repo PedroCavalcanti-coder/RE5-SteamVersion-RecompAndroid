@@ -49,6 +49,10 @@ typedef struct {
     uint16_t  samplers;
     uint8_t   sampler_type[16];
     uint8_t   writes_depth;
+    /* Constantes que o shader lê do UBO: c[0 .. const_f-1] (o banco inteiro com endereçamento
+     * relativo) e se lê i[] / b. O prepare() do device copia só isso a cada draw. */
+    uint16_t  const_f;
+    uint8_t   uses_i, uses_b;
 } re5vk_shader;
 
 /* Location de uma semântica D3DDECLUSAGE (uso, índice) entre o VS e o PS. */

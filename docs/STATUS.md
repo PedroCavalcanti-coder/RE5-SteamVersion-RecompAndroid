@@ -204,6 +204,20 @@ O que mudou:
   do Android reveza as threads por elas). Testes: `test_dispatch` (o mesmo call alternando entre
   duas funções geradas e um thunk) e `test_run_lift_post`. `ctest` 30/30. A/B do usuário (mesmo
   benchmark): 89,4 com contra 90,1 sem - empate; fica desligado (o código fica, atrás da chave).
+- **Perfil por thread no re5vk (2026-11-03, `work/perf/re5vk_main.log`, `re5vk_render.log`):** a
+  thread principal roda ~44% do tempo e a de render (`g00457C60`, a que chama o D3D9) ~46%; cada
+  uma espera a outra a outra metade. Na render, 82% do que roda é handler D3D9
+  (`DrawIndexedPrimitive` 34%, `SetStreamSource` 9%, `SetTexture` 8,5%) e 7% é código do jogo;
+  parada, 56% em `WaitForSingleObject`. A principal, parada: `EnterCriticalSection` 45%,
+  `SetEvent` 15%, cópia do `Unlock` de vertex buffer 12%. Duas correções:
+  - **Tabela de handles com leitura sem mutex** (`handle_table.c`): toda chamada D3D9 resolve
+    `this` e argumentos por ela (~1 milhão/s) e o `SetEvent`/esperas da principal também; um
+    mutex global as fazia disputar a mesma linha. Blocos fixos (sem realloc), publicação com
+    release e releitura do tipo. Teste `test_handle_table` (3000 handles em vários blocos; uma
+    thread cria/fecha alternando tipo e objeto, outra lê sem nunca ver tipo e objeto misturados).
+  - **re5vk copia só as constantes que o shader lê** (`vk_dxso.c` registra `const_f`/`uses_i`/
+    `uses_b`; `prepare()` copia isso): antes eram os bancos inteiros, ~8 KB por draw. Teste
+    `test_vk_dxso` (relativo = banco inteiro; `c7` = 8). `ctest` 31/31. Fps: pendente.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.

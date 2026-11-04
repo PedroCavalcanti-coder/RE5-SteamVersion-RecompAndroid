@@ -1027,20 +1027,29 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     set_dynamic(d, pt);
 
     /* constantes */
-    if (d->vs_dirty) {
+    /* Só o que o shader lê (vsi/psi->const_f, uses_i, uses_b): antes eram os bancos inteiros,
+     * ~8 KB por draw com ~1000 draws por quadro, na thread de render que é o caminho crítico
+     * (RE5_PROFILE, 2026-11-03). A região nova é refeita também quando o shader atual lê mais do
+     * que a região corrente recebeu (troca de shader sem constante nova). */
+    uint8_t vs_ib = (uint8_t)(vsi->uses_i | vsi->uses_b << 1), ps_ib = (uint8_t)(psi->uses_i | psi->uses_b << 1);
+    if (d->vs_dirty || vsi->const_f > d->vs_ubo_f || (vs_ib & ~d->vs_ubo_ib)) {
         uint8_t *u = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
-        memcpy(u, d->vsf, sizeof d->vsf);
-        memcpy(u + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
-        memcpy(u + RE5VK_VS_UBO_B, &d->vsb, 4);
+        memcpy(u, d->vsf, (size_t)vsi->const_f * 16u);
+        if (vsi->uses_i) memcpy(u + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
+        if (vsi->uses_b) memcpy(u + RE5VK_VS_UBO_B, &d->vsb, 4);
+        d->vs_ubo_f = vsi->const_f;
+        d->vs_ubo_ib = vs_ib;
         d->vs_dirty = 0;
     }
-    if (d->ps_dirty) {
+    if (d->ps_dirty || psi->const_f > d->ps_ubo_f || (ps_ib & ~d->ps_ubo_ib)) {
         uint8_t *u = re5vk_ubo(d, RE5VK_PS_UBO_SIZE, &d->ps_ubo_buf, &d->ps_ubo_off);
-        memcpy(u, d->psf, sizeof d->psf);
-        memcpy(u + RE5VK_PS_UBO_I, d->psi, sizeof d->psi);
-        memcpy(u + RE5VK_PS_UBO_B, &d->psb, 4);
+        memcpy(u, d->psf, (size_t)psi->const_f * 16u);
+        if (psi->uses_i) memcpy(u + RE5VK_PS_UBO_I, d->psi, sizeof d->psi);
+        if (psi->uses_b) memcpy(u + RE5VK_PS_UBO_B, &d->psb, 4);
         float aref = (float)(RS(d, D3DRS_ALPHAREF) & 0xFF) / 255.0f;
         memcpy(u + RE5VK_PS_UBO_AREF, &aref, 4);
+        d->ps_ubo_f = psi->const_f;
+        d->ps_ubo_ib = ps_ib;
         d->ps_dirty = 0;
     }
     /* descritores: reaproveitados enquanto texturas, samplers e shaders não mudam */
