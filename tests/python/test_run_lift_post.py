@@ -53,6 +53,15 @@ class RunLiftPost(unittest.TestCase):
         self.assertEqual(m, ["00402000", "00403000"])
         self.assertIsNone(run_lift.DIRECT_RE.search("dispatch(c, _ct);"))
 
+    def test_call_site_cache_only_indirect_calls(self):
+        src = ("{ uint32_t _ct = R_eax; push32_r(c, &R_esp, 0x00401005u); dispatch(c, _ct); }\n"
+               "dispatch(c, 0x00402000u); dispatch_jmp(c, _jt); dispatch_tail(c, R_eax);\n")
+        out = run_lift.call_site_cache(src)
+        self.assertIn("RE5_DISPATCH_IC(c, _ct);", out)
+        self.assertNotIn("dispatch(c, _ct)", out)
+        for keep in ("dispatch(c, 0x00402000u)", "dispatch_jmp(c, _jt)", "dispatch_tail(c, R_eax)"):
+            self.assertIn(keep, out)
+
 
 if __name__ == "__main__":
     unittest.main()

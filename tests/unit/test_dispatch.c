@@ -27,11 +27,30 @@ static void L_00401100(CPU *c)
     c->esp += 12; return;                              /* ret 8 */
 }
 
+/* call indireto com cache no ponto de chamada (lift.call_site_cache): o alvo vem da memória. */
+#define VA_IC_CALLER 0x00401200u
+#define VA_RET_111   0x00401300u
+#define VA_RET_222   0x00401400u
+#define VA_IC_AT     0x00500010u
+
+static void L_00401200(CPU *c)
+{
+    { uint32_t _ct = rd32(VA_IC_AT); push32(c, 0x00401209u); RE5_DISPATCH_IC(c, _ct); }
+    c->esp += 4; return;
+}
+static void L_00401300(CPU *c) { c->eax = 111; c->esp += 4; }
+static void L_00401400(CPU *c) { c->eax = 222; c->esp += 4; }
+
 const re5_func_entry re5_lifted_table[] = {
     {VA_ADD_CDECL, L_00401000},
     {VA_CALLS_HOST, L_00401100},
+    {VA_IC_CALLER, L_00401200},
+    {VA_RET_111, L_00401300},
+    {VA_RET_222, L_00401400},
 };
-const uint32_t re5_lifted_count = 2;
+const uint32_t re5_lifted_count = 5;
+
+static void host_333(CPU *c) { c->eax = 333; }
 
 static void host_mul(CPU *c) { c->eax = re5_arg(c, 0) * re5_arg(c, 1); }
 
@@ -80,6 +99,17 @@ int main(void)
     uint32_t args2[2] = {6, 7};
     CHECK_EQ_U32(re5_guest_call(t, VA_CALLS_HOST, 2, args2), 43);
     CHECK_EQ_U32(t->cpu.esp, esp0);
+
+    /* RE5_DISPATCH_IC: o mesmo ponto de chamada com o alvo mudando entre funções geradas e
+     * um thunk; o cache nunca devolve o alvo da vez anterior. */
+    static const uint32_t ic_seq[] = {VA_RET_111, VA_RET_111, VA_RET_222, 0, VA_RET_111, VA_RET_222, VA_RET_222};
+    static const uint32_t ic_want[] = {111, 111, 222, 333, 111, 222, 222};
+    uint32_t k333 = re5_thunk_new("teste!333", host_333, 0, NULL);
+    for (unsigned i = 0; i < sizeof ic_seq / sizeof ic_seq[0]; i++) {
+        wr32(VA_IC_AT, ic_seq[i] ? ic_seq[i] : k333);
+        CHECK_EQ_U32(re5_guest_call(t, VA_IC_CALLER, 0, NULL), ic_want[i]);
+        CHECK_EQ_U32(t->cpu.esp, esp0);
+    }
 
     /* Chamada direta de um thunk pelo host (o caminho de uma vtable COM). */
     CHECK_EQ_U32(re5_guest_call(t, mul, 2, args2), 42);

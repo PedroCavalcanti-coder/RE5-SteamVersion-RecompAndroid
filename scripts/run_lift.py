@@ -280,6 +280,16 @@ def loop_barriers(text, spin=False):
 # call/jmp com alvo constante, como o lift32_cpu o escreve.
 DIRECT_RE = re.compile(r"dispatch\(c, 0x([0-9A-F]{8})u\)")
 TAIL_RE = re.compile(r"dispatch_tail\(c, 0x([0-9A-F]{8})u\)")
+# call indireto (alvo num registrador ou na memória), como o lift32_cpu o escreve.
+IC_RE = re.compile(r"\bdispatch\(c, _ct\)")
+
+
+def call_site_cache(text):
+    """lift.call_site_cache: call indireto com cache no ponto de chamada (RE5_DISPATCH_IC,
+    cpu_epilogue.h). O jmp indireto (dispatch_jmp) e os alvos constantes ficam como estão."""
+    return IC_RE.sub("RE5_DISPATCH_IC(c, _ct)", text)
+
+
 TODO_RE = re.compile(r'RECOMP_TODO\(0x[0-9A-Fa-f]+, "([^" ]+)')
 
 
@@ -440,6 +450,7 @@ def cmd_lift(args, cfg):
     # do chamador ser refeita.
     direct = cfg["lift"].get("direct_calls", True)
     spin_pause = bool(cfg["lift"].get("spin_pause", False))
+    call_ic = bool(cfg["lift"].get("call_site_cache", False))
     known = {fd["address"] for fd in funcs}
 
     def direct_calls(text):
@@ -468,7 +479,7 @@ def cmd_lift(args, cfg):
     done = reused = 0
     for idx, fds in groups.items():
         name = f"{prefix}_{idx:04d}.c"
-        key = hashlib.sha256(tool_hash.digest() + repr((direct, spin_pause)).encode() + repr(
+        key = hashlib.sha256(tool_hash.digest() + repr((direct, spin_pause, call_ic)).encode() + repr(
             [(fd["address"], fd["size"], fd["address"] in overrides, fd["address"] in excluded,
               fd["address"] in traced, hot_rank.get(fd["address"])) for fd in fds]
         ).encode()).hexdigest()
@@ -524,6 +535,8 @@ def cmd_lift(args, cfg):
         if direct:
             body, used = direct_calls(body)
             decls = [f"void L_{va:08X}(CPU *c);" for va in sorted(used)] + [""]
+        if call_ic:
+            body = call_site_cache(body)
         emit(name, "\n".join(header + decls) + body)
         file_cache[name] = {"key": key, "todo": dict(ftodo), "counts": dict(fcounts), "failures": ffail}
         todo.update(ftodo)
