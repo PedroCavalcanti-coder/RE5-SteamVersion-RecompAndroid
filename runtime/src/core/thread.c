@@ -812,6 +812,11 @@ static uint32_t g_pt_hits[PROF_THUNKS];
  * num guest_call de dentro de handler). */
 static const char *g_pw_name[PROF_THUNKS], *g_ph_name[PROF_THUNKS];
 static uint32_t g_pw_hits[PROF_THUNKS], g_ph_hits[PROF_THUNKS];
+/* Parada num handler sem lock (espera de evento, Sleep, seção crítica...): em qual. O tempo
+ * fora do "rodando" de uma thread mora aqui; sem esta tabela ele sumia do relatório. */
+static const char *g_pi_name[PROF_THUNKS];
+static uint32_t g_pi_hits[PROF_THUNKS];
+static uint64_t g_pi_total;
 /* Fora do código gerado e fora de handler: RIP (em blocos de 16 bytes) para o nm. */
 #define PROF_OTHER 4096
 static uintptr_t g_po_rip[PROF_OTHER];
@@ -963,6 +968,13 @@ static void prof_report(uint64_t total, uint64_t gen, uint64_t host, uint64_t ot
     }
     tab_report("esperando para entrar em", g_pw_name, g_pw_hits, total, 10);
     tab_report("enquanto o lock está com", g_ph_name, g_ph_hits, total, 10);
+    /* Em % das amostras "paradas" (não entram no total acima): onde a thread espera. */
+    if (g_pi_total) {
+        RE5_INFO("profile", "  parada em handler sem lock: %llu amostras (%.1f%% do que rodou)",
+                 (unsigned long long)g_pi_total, 100.0 * (double)g_pi_total / (double)total);
+        tab_report("parada em", g_pi_name, g_pi_hits, g_pi_total, 10);
+        g_pi_total = 0;
+    }
     pr_dump();
     memset(g_po_rip, 0, sizeof g_po_rip);
     memset(g_po_hits, 0, sizeof g_po_hits);
@@ -1012,7 +1024,10 @@ static void profile_main(void *arg)
             const char *th = t->thunk;
             /* Sem o lock dentro de um handler: bloqueada numa espera (ou um handler
              * NOLOCK curto), não conta. No modo global, sem o lock = parada. */
-            if (t->lock_depth <= 0 && (th || g_mode != 1)) continue;
+            if (t->lock_depth <= 0 && (th || g_mode != 1)) {
+                if (th) { g_pi_total++; tab_hit(g_pi_name, g_pi_hits, th); }
+                continue;
+            }
             any++;
             CONTEXT ctx;
             memset(&ctx, 0, sizeof ctx);
@@ -1025,6 +1040,7 @@ static void profile_main(void *arg)
             th = t->thunk;
             int idle = t->lock_depth <= 0 && th && g_mode == 1;
             ResumeThread((HANDLE)t->host);
+            if (idle) { g_pi_total++; tab_hit(g_pi_name, g_pi_hits, th); }
             if (!ok || idle) continue;
             total++;
             int f = pf_find((uintptr_t)ctx.Rip);
