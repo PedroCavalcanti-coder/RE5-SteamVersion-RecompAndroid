@@ -6,6 +6,7 @@
  * (o teste confere que o stdcall limpa os argumentos certos).
  */
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -125,6 +126,7 @@ static void test_sync(void)
     call("LeaveCriticalSection", 1, cs);
     CHECK_EQ_U32(rd32(cs + 12), 0);
     call("DeleteCriticalSection", 1, cs);
+    CHECK_EQ_U32(re5_k32_cs_contend_count(cs), 0);
 
     uint32_t slot = call("TlsAlloc", 0);
     CHECK(slot < RE5_TLS_SLOTS);
@@ -262,8 +264,13 @@ static void test_threads(void)
     call("SleepEx", 2, 30u, 0u);   /* a outra thread chega no Enter e entra na fila */
     CHECK_EQ_U32(g_cs_in, 0);
     call("LeaveCriticalSection", 1, cs);
-    CHECK_EQ_U32(rd32(cs + 12), g_cs_tid);   /* OwningThread: já é dela */
-    CHECK_EQ_U32(rd32(cs + 8), 1);           /* RecursionCount */
+    if (!re5_guest_lock_mode_hle()) {
+        CHECK_EQ_U32(rd32(cs + 12), g_cs_tid);   /* OwningThread: já é dela */
+        CHECK_EQ_U32(rd32(cs + 8), 1);           /* RecursionCount */
+    } else {
+        /* hle, como no Windows: o Leave solta e acorda a outra, que pega a seção ao acordar. */
+        for (int i = 0; i < 2000 && !g_cs_in; i++) call("SleepEx", 2, 1u, 0u);
+    }
     call("EnterCriticalSection", 1, cs);     /* espera ela sair */
     CHECK_EQ_U32(g_cs_in, 1);
     call("LeaveCriticalSection", 1, cs);
@@ -271,6 +278,7 @@ static void test_threads(void)
     CHECK_EQ_U32(call("WaitForSingleObject", 2, h, 0xFFFFFFFFu), 0);
     CHECK_EQ_U32(call("CloseHandle", 1, h), 1);
     call("DeleteCriticalSection", 1, cs);
+    CHECK(re5_k32_cs_contend_count(cs) >= 1);
 
     /* Lock do guest justo + preempção: com o lock em mãos a outra thread não anda;
      * depois de 2 ms, re5_guest_preempt dá a vez a quem está na fila. Só no modo
@@ -682,8 +690,60 @@ static void test_files(const char *root)
     CHECK_EQ_U32(call("GetFileAttributesA", 1, gstr("C:\\RE5\\teste.bin")), 0xFFFFFFFFu);
 }
 
+/* Seção crítica disputada (nos dois modos): incremento não atômico dentro dela, com recursão e
+ * TryEnter no meio, de 4 threads ao mesmo tempo; só soma certo com exclusão mútua. */
+static volatile uint32_t g_csx_va, g_cs_sum, g_cs_done;
+#define CS_ITERS 50000
+
+static void cs_thread_fn(CPU *c)
+{
+    uint32_t cs = g_csx_va;
+    for (int i = 0; i < CS_ITERS; i++) {
+        k32_call("EnterCriticalSection", 1, &cs);
+        if (i % 7 == 0) k32_call("EnterCriticalSection", 1, &cs);   /* recursão */
+        uint32_t v = g_cs_sum;
+        g_cs_sum = v + 1;
+        if (i % 7 == 0) k32_call("LeaveCriticalSection", 1, &cs);
+        k32_call("LeaveCriticalSection", 1, &cs);
+        if (i % 13 == 0 && k32_call("TryEnterCriticalSection", 1, &cs)) {
+            g_cs_sum = g_cs_sum + 1;
+            k32_call("LeaveCriticalSection", 1, &cs);
+            __atomic_add_fetch(&g_cs_done, 1u << 16, __ATOMIC_SEQ_CST);   /* conta os TryEnter que entraram */
+        }
+    }
+    __atomic_add_fetch(&g_cs_done, 1u, __ATOMIC_SEQ_CST);
+    c->eax = 0;
+}
+
+static void test_cs_stress(void)
+{
+    uint32_t cs = gbuf(24);
+    call("InitializeCriticalSectionAndSpinCount", 2, cs, 4000u);
+    g_csx_va = cs;
+    g_cs_sum = 0;
+    g_cs_done = 0;
+    uint32_t fn = re5_thunk_new("teste!cs", cs_thread_fn, 4, NULL);
+    re5_thunk_set_flags(fn, RE5_THUNK_NOLOCK);
+    uint32_t hs[4];
+    for (int i = 0; i < 4; i++) hs[i] = call("CreateThread", 6, 0u, 0u, fn, 0u, 0u, 0u);
+    for (int i = 0; i < 4; i++) {
+        CHECK_EQ_U32(call("WaitForSingleObject", 2, hs[i], 30000u), 0);
+        call("CloseHandle", 1, hs[i]);
+    }
+    CHECK_EQ_U32(g_cs_done & 0xFFFFu, 4);
+    CHECK_EQ_U32(g_cs_sum, 4u * CS_ITERS + (g_cs_done >> 16));
+    CHECK_EQ_U32(rd32(cs + 12), 0);   /* livre no fim */
+    CHECK_EQ_U32(rd32(cs + 8), 0);
+    call("DeleteCriticalSection", 1, cs);
+}
+
 int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+    _putenv("RE5_CS_STATS=1");   /* o diagnóstico de contenção é coberto em test_threads */
+#else
+    setenv("RE5_CS_STATS", "1", 1);
+#endif
     CHECK(re5_runtime_init() == 0);
     CHECK(re5_process_init(0x00400000u) == 0);
     T = re5_thread_attach(1u << 20);
@@ -697,6 +757,7 @@ int main(int argc, char **argv)
     test_threads();
     test_hle();
     test_herd();
+    test_cs_stress();
     test_nls();
     test_env();
     if (argc > 1) test_files(argv[1]);

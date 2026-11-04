@@ -405,6 +405,8 @@ static void slot_begin(vk_device *d, int i)
     VK_CHECK(vkBeginCommandBuffer(s->cmd, &bi));
     d->cur = i;
     d->bound_pipe = VK_NULL_HANDLE;
+    d->vb_valid = 0;   /* command buffer novo: nenhum vertex/index buffer ligado */
+    d->bound_ib = VK_NULL_HANDLE;
     /* UBO, descritores e estado dinâmico são por envio (o pool do set anterior é zerado na volta) */
     d->vs_dirty = d->ps_dirty = d->desc_dirty = d->dyn_dirty = 1;
     d->set = VK_NULL_HANDLE;

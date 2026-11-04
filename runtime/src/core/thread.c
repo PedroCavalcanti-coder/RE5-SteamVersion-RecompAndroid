@@ -8,6 +8,7 @@
 #include "re5/d3d9_bridge.h"
 #include "re5/fast_tls.h"
 #include "re5/guest_memory.h"
+#include "re5/image.h"
 #include "re5/log.h"
 #include "re5/runtime.h"
 #include "re5/stats.h"
@@ -817,6 +818,29 @@ static uint32_t g_pw_hits[PROF_THUNKS], g_ph_hits[PROF_THUNKS];
 static const char *g_pi_name[PROF_THUNKS];
 static uint32_t g_pi_hits[PROF_THUNKS];
 static uint64_t g_pi_total;
+/* Diagnóstico de seções críticas disputadas amostradas pelo perfil */
+#define PROF_CS 128
+typedef struct {
+    uint32_t cs;
+    uint32_t owner;
+    uint32_t hits;
+} prof_cs_slot;
+static prof_cs_slot g_pcs[PROF_CS];
+static uint64_t g_pcs_total;
+
+static void cs_hit(uint32_t cs, uint32_t owner)
+{
+    g_pcs_total++;
+    uint32_t h = (cs >> 4) % PROF_CS;
+    for (uint32_t i = 0; i < PROF_CS; i++, h = (h + 1) % PROF_CS) {
+        if (g_pcs[h].cs == cs || !g_pcs[h].cs) {
+            g_pcs[h].cs = cs;
+            if (owner) g_pcs[h].owner = owner;
+            g_pcs[h].hits++;
+            return;
+        }
+    }
+}
 /* Fora do código gerado e fora de handler: RIP (em blocos de 16 bytes) para o nm. */
 #define PROF_OTHER 4096
 static uintptr_t g_po_rip[PROF_OTHER];
@@ -975,6 +999,51 @@ static void prof_report(uint64_t total, uint64_t gen, uint64_t host, uint64_t ot
         tab_report("parada em", g_pi_name, g_pi_hits, g_pi_total, 10);
         g_pi_total = 0;
     }
+    if (g_pcs_total) {
+        RE5_INFO("profile", "  seções críticas (CS) mais disputadas (%llu amostras em espera):",
+                 (unsigned long long)g_pcs_total);
+        for (int k = 0; k < 8; k++) {
+            uint32_t best = 0, bi = 0;
+            for (uint32_t i = 0; i < PROF_CS; i++) {
+                if (g_pcs[i].hits > best) {
+                    best = g_pcs[i].hits;
+                    bi = i;
+                }
+            }
+            if (!best) break;
+            uint32_t cs = g_pcs[bi].cs;
+            uint32_t owner = g_pcs[bi].owner;
+            const re5_thread *oth = NULL;
+            for (int i = 0; i < MAX_THREADS; i++) {
+                if (g_threads[i] && g_threads[i]->tid == owner) {
+                    oth = g_threads[i];
+                    break;
+                }
+            }
+            char oname[32];
+            if (!owner) snprintf(oname, sizeof oname, "livre/passando");
+            else if (oth && oth->is_main) snprintf(oname, sizeof oname, "re5-main");
+            else if (oth && oth->start_va) snprintf(oname, sizeof oname, "g%08X", oth->start_va);
+            else snprintf(oname, sizeof oname, "tid 0x%X", owner);
+
+            const char *cs_sym = re5_name_lookup(cs);
+            const re5_image *img = re5_image_main();
+            char loc[64] = "";
+            if (img && cs >= img->base && cs < img->base + img->size) {
+                snprintf(loc, sizeof loc, " (imagem+0x%X)", (unsigned)(cs - img->base));
+            } else if (cs >= RE5_MEM_DYN_LO) {
+                snprintf(loc, sizeof loc, " (heap)");
+            }
+
+            RE5_INFO("profile", "    %5.1f%%  CS 0x%08X%s (dona: %s)%s%s",
+                     100.0 * best / (double)g_pcs_total, cs, loc, oname,
+                     cs_sym ? "  " : "", cs_sym ? cs_sym : "");
+            g_pcs[bi].hits = 0;
+        }
+        g_pcs_total = 0;
+        memset(g_pcs, 0, sizeof g_pcs);
+    }
+    re5_k32_cs_contend_report();
     pr_dump();
     memset(g_po_rip, 0, sizeof g_po_rip);
     memset(g_po_hits, 0, sizeof g_po_hits);
@@ -1025,7 +1094,11 @@ static void profile_main(void *arg)
             /* Sem o lock dentro de um handler: bloqueada numa espera (ou um handler
              * NOLOCK curto), não conta. No modo global, sem o lock = parada. */
             if (t->lock_depth <= 0 && (th || g_mode != 1)) {
-                if (th) { g_pi_total++; tab_hit(g_pi_name, g_pi_hits, th); }
+                if (th) {
+                    g_pi_total++;
+                    tab_hit(g_pi_name, g_pi_hits, th);
+                    if (t->cs_waiting) cs_hit(t->cs_waiting, t->cs_owner);
+                }
                 continue;
             }
             any++;
@@ -1040,7 +1113,11 @@ static void profile_main(void *arg)
             th = t->thunk;
             int idle = t->lock_depth <= 0 && th && g_mode == 1;
             ResumeThread((HANDLE)t->host);
-            if (idle) { g_pi_total++; tab_hit(g_pi_name, g_pi_hits, th); }
+            if (idle) {
+                g_pi_total++;
+                tab_hit(g_pi_name, g_pi_hits, th);
+                if (t->cs_waiting) cs_hit(t->cs_waiting, t->cs_owner);
+            }
             if (!ok || idle) continue;
             total++;
             int f = pf_find((uintptr_t)ctx.Rip);

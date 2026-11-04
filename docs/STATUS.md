@@ -221,6 +221,25 @@ O que mudou:
   - **Medida do usuário, benchmark FIXO 1080p** (não comparar com os números do variável acima):
     re5vk **78 fps**, DXVK 68,9 (+13% para o re5vk). Tabela de handles, DXVK: build anterior
     (`re5_ic`) 73 contra 74 com ela - empate.
+- **Seções críticas, ponte D3D9 e binds do re5vk (2026-11-04):** o diagnóstico de contenção
+  por CS (`RE5_PROFILE`; `RE5_CS_STATS` só para os testes) mostrou a thread principal disputando
+  com os workers do job system (`g004278D0`) em seções seguradas por instantes: `0x337516B0`
+  ~81% das esperas dela, `0x2EDEF754` ~11-18%, mais de 3,2 milhões de bloqueios em 400 s.
+  - **CS no modo `hle` como a do Windows** (`kernel32_sync.c`): pegar a seção livre é um CAS
+    no OwningThread (sem mutex); ocupada, gira até o SpinCount (256 sem SpinCount, teto 4000)
+    antes de dormir; o Leave solta e acorda uma só das threads que dormem nela. Antes a seção
+    era entregue direto à próxima da fila, ainda dormindo (lock convoy). O modo `global`
+    (Android) fica com a entrega direta, que ele precisa. Teste `test_cs_stress` (4 threads x
+    50000 Enter/Leave com recursão e TryEnter, contador não atômico exato; com o CAS sabotado
+    o teste falha).
+  - **`obj_of` sem o mutex da memória do guest** (`d3d9.c`): cache de objetos-sombra já
+    validados pula só o `re5_mem_is_mapped`; a mágica e o handle continuam conferidos, e o
+    `d9_retire` tira o va antes de liberar a memória (`test_d3d9`).
+  - **re5vk:** vertex/index buffers só são religados se o `VkBuffer`, offset ou stride
+    mudaram (o `Lock` com DISCARD troca o buffer, e todo command buffer novo começa sem
+    binds); variantes, chave e busca de pipeline só quando `pipe_gen` muda (estado de
+    pipeline, shaders, declaração, alvos, textura que troca entre profundidade e cor).
+  - `ctest` 31/31. Fps: pendente (A/B do usuário: `re5_atual.exe` x `re5.exe`).
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.

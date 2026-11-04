@@ -63,14 +63,18 @@ static uint32_t cur_tid(void)
 #define CS_STRIPES 64
 #define CS_QUEUES  8      /* seções disputadas ao mesmo tempo por faixa */
 #define CS_QLEN    32
+/* Modo hle: quem dorme numa seção, na pilha dela, com variável de condição própria. */
+typedef struct { re5_cond cv; } cs_waiter;
 typedef struct {
     uint32_t cs, n;
     uint32_t tid[CS_QLEN];
+    cs_waiter *w[CS_QLEN];     /* modo hle */
 } cs_queue;
 typedef struct {
     re5_mutex mu;
-    re5_cond  cv;
+    re5_cond  cv;              /* modo global */
     cs_queue  q[CS_QUEUES];
+    volatile uint32_t nwait;   /* modo hle: threads dormindo nesta faixa (atômico) */
 } cs_stripe;
 static cs_stripe g_cs[CS_STRIPES];
 static volatile int g_cs_ready;
@@ -145,7 +149,102 @@ static void k_DeleteCriticalSection(CPU *c)
     memset(re5_g2h(cs), 0, 24);
 }
 
-static void k_EnterCriticalSection(CPU *c)
+/* Contenção de seções críticas: quantas vezes cada CS bloqueou uma thread */
+typedef struct {
+    uint32_t cs;
+    uint32_t count;
+    uint32_t last_waiter;
+    uint32_t last_owner;
+} k32_cs_contention;
+#define K32_CS_CONTEND_MAX 128
+static k32_cs_contention g_cs_contend[K32_CS_CONTEND_MAX];
+static uint64_t g_cs_contend_total;
+static re5_mutex g_cs_contend_mu;
+static int g_cs_contend_mu_ready;
+
+/* Só com RE5_PROFILE ou RE5_CS_STATS: o registro passa por um mutex global e a contenção
+ * chega a ~10 mil por segundo no jogo. */
+static int cs_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *p = getenv("RE5_PROFILE"), *s = getenv("RE5_CS_STATS");
+        on = (p && *p && *p != '0') || (s && *s && *s != '0');
+    }
+    return on;
+}
+
+static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner)
+{
+    if (!cs_stats_on()) return;
+    if (!g_cs_contend_mu_ready) {
+        static volatile int once;
+        if (!once) {
+            re5_mutex_init(&g_cs_contend_mu);
+            g_cs_contend_mu_ready = 1;
+            once = 1;
+        }
+    }
+    re5_mutex_lock(&g_cs_contend_mu);
+    g_cs_contend_total++;
+    uint32_t h = (cs >> 4) % K32_CS_CONTEND_MAX;
+    for (uint32_t i = 0; i < K32_CS_CONTEND_MAX; i++, h = (h + 1) % K32_CS_CONTEND_MAX) {
+        if (g_cs_contend[h].cs == cs || !g_cs_contend[h].cs) {
+            g_cs_contend[h].cs = cs;
+            g_cs_contend[h].count++;
+            g_cs_contend[h].last_waiter = waiter;
+            g_cs_contend[h].last_owner = owner;
+            break;
+        }
+    }
+    re5_mutex_unlock(&g_cs_contend_mu);
+}
+
+uint32_t re5_k32_cs_contend_count(uint32_t cs)
+{
+    if (!g_cs_contend_mu_ready) return 0;
+    re5_mutex_lock(&g_cs_contend_mu);
+    uint32_t h = (cs >> 4) % K32_CS_CONTEND_MAX;
+    uint32_t res = 0;
+    for (uint32_t i = 0; i < K32_CS_CONTEND_MAX; i++, h = (h + 1) % K32_CS_CONTEND_MAX) {
+        if (g_cs_contend[h].cs == cs) {
+            res = g_cs_contend[h].count;
+            break;
+        }
+        if (!g_cs_contend[h].cs) break;
+    }
+    re5_mutex_unlock(&g_cs_contend_mu);
+    return res;
+}
+
+void re5_k32_cs_contend_report(void)
+{
+    if (!g_cs_contend_mu_ready || !g_cs_contend_total) return;
+    re5_mutex_lock(&g_cs_contend_mu);
+    RE5_INFO("profile", "  seções críticas com mais bloqueios (%llu contenções):",
+             (unsigned long long)g_cs_contend_total);
+    for (int k = 0; k < 6; k++) {
+        uint32_t best = 0, bi = 0;
+        for (uint32_t i = 0; i < K32_CS_CONTEND_MAX; i++) {
+            if (g_cs_contend[i].count > best) {
+                best = g_cs_contend[i].count;
+                bi = i;
+            }
+        }
+        if (!best) break;
+        uint32_t cs = g_cs_contend[bi].cs;
+        const char *nm = re5_name_lookup(cs);
+        RE5_INFO("profile", "    %7u bloqueios: CS 0x%08X (último dono tid 0x%X, garçom tid 0x%X)%s%s",
+                 best, cs, g_cs_contend[bi].last_owner, g_cs_contend[bi].last_waiter,
+                 nm ? "  " : "", nm ? nm : "");
+        g_cs_contend[bi].count = 0;
+    }
+    g_cs_contend_total = 0;
+    memset(g_cs_contend, 0, sizeof g_cs_contend);
+    re5_mutex_unlock(&g_cs_contend_mu);
+}
+
+static void cs_enter_global(CPU *c)
 {
     uint32_t cs = re5_arg(c, 0), tid = cur_tid();
     cs_stripe *s = stripe_of(cs);
@@ -154,10 +253,17 @@ static void k_EnterCriticalSection(CPU *c)
         re5_mutex_unlock(&s->mu);
         return;
     }
+    uint32_t owner = k32_r32(cs + CS_OWNER);
+    cs_record_contention(cs, tid, owner);
     cs_queue *q = csq_find(s, cs, 1);
     if (q->n == CS_QLEN) re5_fatal("kernel32", "mais de %d threads esperando a seção 0x%08X", CS_QLEN, cs);
     q->tid[q->n++] = tid;
     re5_mutex_unlock(&s->mu);
+    re5_thread *t = re5_thread_current();
+    if (t) {
+        t->cs_waiting = cs;
+        t->cs_owner = owner;
+    }
     /* O Leave do dono põe esta thread como dona (recursão 1) quando chegar a vez
      * dela. Sem o lock do guest (modo global) e sem o mutex da faixa na ordem
      * guest -> faixa, nunca o contrário. */
@@ -165,6 +271,7 @@ static void k_EnterCriticalSection(CPU *c)
     int pump = re5_thread_has_pump();
     re5_mutex_lock(&s->mu);
     while (k32_r32(cs + CS_OWNER) != tid) {
+        if (t) t->cs_owner = k32_r32(cs + CS_OWNER);
         if (re5_cond_wait_ms(&s->cv, &s->mu, pump ? PUMP_SLICE_MS : K32_INFINITE_MS) && pump &&
             k32_r32(cs + CS_OWNER) != tid) {
             re5_mutex_unlock(&s->mu);   /* thread da janela: o Windows não a marca travada */
@@ -173,10 +280,14 @@ static void k_EnterCriticalSection(CPU *c)
         }
     }
     re5_mutex_unlock(&s->mu);
+    if (t) {
+        t->cs_waiting = 0;
+        t->cs_owner = 0;
+    }
     RE5_BLOCKING_END();
 }
 
-static void k_TryEnterCriticalSection(CPU *c)
+static void cs_tryenter_global(CPU *c)
 {
     uint32_t cs = re5_arg(c, 0);
     cs_stripe *s = stripe_of(cs);
@@ -185,7 +296,7 @@ static void k_TryEnterCriticalSection(CPU *c)
     re5_mutex_unlock(&s->mu);
 }
 
-static void k_LeaveCriticalSection(CPU *c)
+static void cs_leave_global(CPU *c)
 {
     uint32_t cs = re5_arg(c, 0), tid = cur_tid();
     cs_stripe *s = stripe_of(cs);
@@ -214,6 +325,143 @@ static void k_LeaveCriticalSection(CPU *c)
         }
     }
     re5_mutex_unlock(&s->mu);
+}
+
+/* ---- modo hle: seção crítica como a do Windows ----
+ *
+ * O caminho global acima entrega a seção direto à próxima thread da fila: com o lock do guest
+ * revezando as threads, sem isso uma thread em laço Enter/Leave nunca deixa a outra entrar.
+ * No modo hle, porém, a entrega direta é um "lock convoy": a seção fica com uma thread que
+ * ainda está dormindo, e até ela acordar (microssegundos) ninguém a usa, nem quem acabou de
+ * soltá-la e quer entrar de novo. RE5_PROFILE no re5vk (2026-11-03): 45% das esperas da thread
+ * principal eram EnterCriticalSection, contra os workers do job system, em seções seguradas por
+ * instantes (8 a 10 mil bloqueios por segundo).
+ *
+ * Aqui, como no Windows desde o Vista: a seção livre se pega com um CAS no OwningThread (sem
+ * mutex); ocupada, a thread gira até o SpinCount do jogo antes de dormir; o Leave solta a seção
+ * e acorda uma só das threads que dormem nela, que disputa com quem chegar. Sem sinal perdido:
+ * quem vai dormir conta-se em nwait (seq_cst) antes de tentar o CAS de novo; o Leave zera o
+ * dono (seq_cst) antes de ler nwait e sinaliza sob o mutex da faixa, que quem dorme só larga
+ * dentro do cond_wait. */
+
+#define CS_SPIN_DEFAULT 256u    /* seção sem SpinCount (InitializeCriticalSection) */
+#define CS_SPIN_MAX     4000u   /* o teto do heap do Windows */
+
+static inline void cs_pause(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+static int cs_hle_try(uint32_t cs, uint32_t tid)
+{
+    volatile uint32_t *own = (volatile uint32_t *)re5_g2h(cs + CS_OWNER);
+    uint32_t o = __atomic_load_n(own, __ATOMIC_SEQ_CST);
+    if (o == tid) {   /* recursão: só a dona escreve RecursionCount */
+        k32_w32(cs + CS_RECURSION, k32_r32(cs + CS_RECURSION) + 1);
+    } else {
+        uint32_t z = 0;
+        if (o || !__atomic_compare_exchange_n(own, &z, tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 0;
+        k32_w32(cs + CS_RECURSION, 1);
+    }
+    __atomic_add_fetch((volatile uint32_t *)re5_g2h(cs + CS_LOCKCOUNT), 1u, __ATOMIC_RELAXED);
+    return 1;
+}
+
+static void cs_enter_hle(CPU *c)
+{
+    uint32_t cs = re5_arg(c, 0), tid = cur_tid();
+    if (cs_hle_try(cs, tid)) return;
+    volatile uint32_t *own = (volatile uint32_t *)re5_g2h(cs + CS_OWNER);
+    cs_record_contention(cs, tid, *own);
+    uint32_t spin = k32_r32(cs + CS_SPIN) & 0x00FFFFFFu;   /* os bits altos são flags */
+    if (!spin) spin = CS_SPIN_DEFAULT;
+    if (spin > CS_SPIN_MAX) spin = CS_SPIN_MAX;
+    for (uint32_t i = 0; i < spin; i++) {
+        cs_pause();
+        if (!__atomic_load_n(own, __ATOMIC_RELAXED) && cs_hle_try(cs, tid)) return;
+    }
+    cs_stripe *s = stripe_of(cs);
+    cs_waiter me;
+    re5_cond_init(&me.cv);
+    re5_thread *t = re5_thread_current();
+    if (t) {
+        t->cs_waiting = cs;
+        t->cs_owner = *own;
+    }
+    RE5_BLOCKING_BEGIN();
+    int pump = re5_thread_has_pump();
+    re5_mutex_lock(&s->mu);
+    __atomic_add_fetch(&s->nwait, 1u, __ATOMIC_SEQ_CST);
+    cs_queue *q = csq_find(s, cs, 1);
+    if (q->n == CS_QLEN) re5_fatal("kernel32", "mais de %d threads esperando a seção 0x%08X", CS_QLEN, cs);
+    q->tid[q->n] = tid;
+    q->w[q->n++] = &me;
+    while (!cs_hle_try(cs, tid)) {
+        if (t) t->cs_owner = *own;
+        if (re5_cond_wait_ms(&me.cv, &s->mu, pump ? PUMP_SLICE_MS : K32_INFINITE_MS) && pump) {
+            re5_mutex_unlock(&s->mu);   /* thread da janela: o Windows não a marca travada */
+            re5_thread_pump();
+            re5_mutex_lock(&s->mu);
+        }
+    }
+    q = csq_find(s, cs, 0);   /* a fila pode ter andado: tira esta thread de onde estiver */
+    for (uint32_t i = 0; q && i < q->n; i++) {
+        if (q->w[i] != &me) continue;
+        memmove(q->tid + i, q->tid + i + 1, (q->n - 1 - i) * sizeof q->tid[0]);
+        memmove(q->w + i, q->w + i + 1, (q->n - 1 - i) * sizeof q->w[0]);
+        q->n--;
+        break;
+    }
+    __atomic_sub_fetch(&s->nwait, 1u, __ATOMIC_SEQ_CST);
+    re5_mutex_unlock(&s->mu);
+    re5_cond_destroy(&me.cv);
+    if (t) {
+        t->cs_waiting = 0;
+        t->cs_owner = 0;
+    }
+    RE5_BLOCKING_END();
+}
+
+static void cs_leave_hle(CPU *c)
+{
+    uint32_t cs = re5_arg(c, 0), tid = cur_tid();
+    volatile uint32_t *own = (volatile uint32_t *)re5_g2h(cs + CS_OWNER);
+    uint32_t owner = __atomic_load_n(own, __ATOMIC_RELAXED), rec = k32_r32(cs + CS_RECURSION);
+    if (owner != tid || !rec)
+        re5_fatal("kernel32", "LeaveCriticalSection(0x%08X) pela thread 0x%X, dona 0x%X (recursão %u)", cs, tid,
+                  owner, rec);
+    k32_w32(cs + CS_RECURSION, --rec);
+    __atomic_sub_fetch((volatile uint32_t *)re5_g2h(cs + CS_LOCKCOUNT), 1u, __ATOMIC_RELAXED);
+    if (rec) return;
+    __atomic_store_n(own, 0u, __ATOMIC_SEQ_CST);
+    cs_stripe *s = stripe_of(cs);
+    if (!__atomic_load_n(&s->nwait, __ATOMIC_SEQ_CST)) return;
+    re5_mutex_lock(&s->mu);
+    cs_queue *q = csq_find(s, cs, 0);
+    if (q && q->n) re5_cond_signal(&q->w[0]->cv);   /* uma só, a mais antiga */
+    re5_mutex_unlock(&s->mu);
+}
+
+static void k_EnterCriticalSection(CPU *c)
+{
+    if (re5_guest_lock_mode_hle()) cs_enter_hle(c);
+    else cs_enter_global(c);
+}
+
+static void k_TryEnterCriticalSection(CPU *c)
+{
+    if (re5_guest_lock_mode_hle()) c->eax = (uint32_t)cs_hle_try(re5_arg(c, 0), cur_tid());
+    else cs_tryenter_global(c);
+}
+
+static void k_LeaveCriticalSection(CPU *c)
+{
+    if (re5_guest_lock_mode_hle()) cs_leave_hle(c);
+    else cs_leave_global(c);
 }
 
 /* ---- TLS: slots no TEB (fs:[0xE10]) ---- */

@@ -107,6 +107,7 @@ void re5vk_state_reset(vk_device *d)
     d->scissor = (RECT){0, 0, (LONG)bb->w, (LONG)bb->h};
     d->vs_dirty = d->ps_dirty = d->dyn_dirty = d->desc_dirty = 1;
     d->pending_clear.on = 0;
+    d->pipe_gen++;
 }
 
 /* ---- passes de render ---- */
@@ -193,6 +194,7 @@ static HRESULT STDMETHODCALLTYPE v_SetRenderTarget(IDirect3DDevice9 *self, DWORD
     if (d->rt[i] != s) {
         re5vk_end_rendering(d);
         set_obj((vk_obj **)&d->rt[i], &s->o);
+        d->pipe_gen++;
     }
     if (i == 0) {   /* D3D9: o viewport e o scissor voltam ao alvo inteiro */
         d->vp = (D3DVIEWPORT9){0, 0, s->desc.Width, s->desc.Height, 0.0f, 1.0f};
@@ -221,6 +223,7 @@ static HRESULT STDMETHODCALLTYPE v_SetDepthStencilSurface(IDirect3DDevice9 *self
     if (d->ds != s) {
         re5vk_end_rendering(d);
         set_obj((vk_obj **)&d->ds, s ? &s->o : NULL);
+        d->pipe_gen++;
     }
     re5vk_unlock(d);
     return D3D_OK;
@@ -368,6 +371,7 @@ static HRESULT STDMETHODCALLTYPE v_SetRenderState(IDirect3DDevice9 *self, D3DREN
     if (d->rs[s] == v) return D3D_OK;
     d->rs[s] = v;
     d->dyn_dirty = 1;
+    d->pipe_gen++;
     if (s == D3DRS_ALPHAREF) d->ps_dirty = 1;
     return D3D_OK;
 }
@@ -395,12 +399,15 @@ static HRESULT STDMETHODCALLTYPE v_GetSamplerState(IDirect3DDevice9 *self, DWORD
     *v = ((vk_device *)self)->ss[s][t];
     return D3D_OK;
 }
+static int tex_is_depth(vk_obj *t);
+
 static HRESULT STDMETHODCALLTYPE v_SetTexture(IDirect3DDevice9 *self, DWORD stage, IDirect3DBaseTexture9 *t)
 {
     vk_device *d = (vk_device *)self;
     int s = sampler_slot(stage);
     if (s < 0) return D3DERR_INVALIDCALL;
     if (d->tex[s] != (vk_obj *)t) {
+        if (tex_is_depth(d->tex[s]) != tex_is_depth((vk_obj *)t)) d->pipe_gen++;   /* variante do PS */
         re5vk_lock(d);
         set_obj(&d->tex[s], (vk_obj *)t);
         re5vk_unlock(d);
@@ -452,6 +459,7 @@ static HRESULT STDMETHODCALLTYPE v_SetVertexDeclaration(IDirect3DDevice9 *self, 
 {
     vk_device *d = (vk_device *)self;
     re5vk_lock(d);
+    if (d->decl != (vk_decl *)dl) d->pipe_gen++;
     set_obj((vk_obj **)&d->decl, (vk_obj *)dl);
     re5vk_unlock(d);
     return D3D_OK;
@@ -472,6 +480,7 @@ static HRESULT STDMETHODCALLTYPE v_SetVertexShader(IDirect3DDevice9 *self, IDire
         set_obj((vk_obj **)&d->vs, (vk_obj *)s);
         re5vk_unlock(d);
         d->desc_dirty = 1;
+        d->pipe_gen++;
     }
     return D3D_OK;
 }
@@ -483,6 +492,7 @@ static HRESULT STDMETHODCALLTYPE v_SetPixelShader(IDirect3DDevice9 *self, IDirec
         set_obj((vk_obj **)&d->ps, (vk_obj *)s);
         re5vk_unlock(d);
         d->desc_dirty = 1;
+        d->pipe_gen++;
     }
     return D3D_OK;
 }
@@ -973,56 +983,76 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     }
     if (RS(d, D3DRS_SRGBWRITEENABLE)) re5_fatal("re5vk", "D3DRS_SRGBWRITEENABLE sem implementação");
     begin_rendering(d);
-    /* variantes */
-    re5vk_dxso_variant vsv = {0, 0}, psv = {0, 0};
-    VkShaderModule vsm, psm;
+    /* Mesmo estado de pipeline do draw anterior (pipe_gen e topologia): sem variantes, chave
+     * nem busca (eram ~90 mil por segundo na thread de render). */
+    re5vk_dxso_variant psv;
     const re5vk_shader *vsi, *psi;
-    re5vk_shader_variant(d, d->vs, &vsv, &vsm, &vsi);
-    /* primeiro sem as profundidades, para saber os samplers do PS */
-    psv.alpha_func = RS(d, D3DRS_ALPHATESTENABLE) ? (uint8_t)RS(d, D3DRS_ALPHAFUNC) : 0;
-    if (psv.alpha_func == D3DCMP_ALWAYS) psv.alpha_func = 0;
-    for (int s = 0; s < 16; s++)
-        if (tex_is_depth(d->tex[s])) psv.depth_samplers |= (uint16_t)(1u << s);
-    re5vk_shader_variant(d, d->ps, &psv, &psm, &psi);
+    VkPipeline pipe;
+    uint32_t tc = topo_class(pt);
+    if (d->last_pipe && d->last_gen == d->pipe_gen && d->last_topo == tc) {
+        pipe = d->last_pipe;
+        vsi = d->last_vsi;
+        psi = d->last_psi;
+        psv = d->last_psv;
+    } else {
+        re5vk_dxso_variant vsv = {0, 0};
+        VkShaderModule vsm, psm;
+        /* variantes */
+        psv = (re5vk_dxso_variant){0, 0};
+        re5vk_shader_variant(d, d->vs, &vsv, &vsm, &vsi);
+        /* primeiro sem as profundidades, para saber os samplers do PS */
+        psv.alpha_func = RS(d, D3DRS_ALPHATESTENABLE) ? (uint8_t)RS(d, D3DRS_ALPHAFUNC) : 0;
+        if (psv.alpha_func == D3DCMP_ALWAYS) psv.alpha_func = 0;
+        for (int s = 0; s < 16; s++)
+            if (tex_is_depth(d->tex[s])) psv.depth_samplers |= (uint16_t)(1u << s);
+        re5vk_shader_variant(d, d->ps, &psv, &psm, &psi);
 
-    pipe_key k;
-    memset(&k, 0, sizeof k);
-    k.vs_hash = d->vs->hash;
-    k.vs_len = d->vs->ndw;
-    k.ps_hash = d->ps->hash;
-    k.ps_len = d->ps->ndw;
-    k.vsv = vsv;
-    k.psv = psv;
-    k.decl_hash = d->decl ? fnv(d->decl->el, d->decl->n * sizeof d->decl->el[0], 2166136261u) : 0;
-    k.topo_class = topo_class(pt);
-    k.fill = RS(d, D3DRS_FILLMODE);
-    if (RS(d, D3DRS_ALPHABLENDENABLE)) {
-        k.blend[0] = 1;
-        k.blend[1] = RS(d, D3DRS_SRCBLEND);
-        k.blend[2] = RS(d, D3DRS_DESTBLEND);
-        k.blend[3] = RS(d, D3DRS_BLENDOP);
-        if (RS(d, D3DRS_SEPARATEALPHABLENDENABLE)) {
-            k.blend[4] = RS(d, D3DRS_SRCBLENDALPHA);
-            k.blend[5] = RS(d, D3DRS_DESTBLENDALPHA) | RS(d, D3DRS_BLENDOPALPHA) << 16;
-        } else {
-            k.blend[4] = k.blend[1];
-            k.blend[5] = k.blend[2] | k.blend[3] << 16;
+        pipe_key k;
+        memset(&k, 0, sizeof k);
+        k.vs_hash = d->vs->hash;
+        k.vs_len = d->vs->ndw;
+        k.ps_hash = d->ps->hash;
+        k.ps_len = d->ps->ndw;
+        k.vsv = vsv;
+        k.psv = psv;
+        k.decl_hash = d->decl ? fnv(d->decl->el, d->decl->n * sizeof d->decl->el[0], 2166136261u) : 0;
+        k.topo_class = tc;
+        k.fill = RS(d, D3DRS_FILLMODE);
+        if (RS(d, D3DRS_ALPHABLENDENABLE)) {
+            k.blend[0] = 1;
+            k.blend[1] = RS(d, D3DRS_SRCBLEND);
+            k.blend[2] = RS(d, D3DRS_DESTBLEND);
+            k.blend[3] = RS(d, D3DRS_BLENDOP);
+            if (RS(d, D3DRS_SEPARATEALPHABLENDENABLE)) {
+                k.blend[4] = RS(d, D3DRS_SRCBLENDALPHA);
+                k.blend[5] = RS(d, D3DRS_DESTBLENDALPHA) | RS(d, D3DRS_BLENDOPALPHA) << 16;
+            } else {
+                k.blend[4] = k.blend[1];
+                k.blend[5] = k.blend[2] | k.blend[3] << 16;
+            }
         }
+        static const D3DRENDERSTATETYPE wr[4] = {D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2,
+                                                 D3DRS_COLORWRITEENABLE3};
+        for (int i = 0; i < 4; i++) {
+            k.color[i] = d->rt[i] ? d->rt[i]->img->vkf : VK_FORMAT_UNDEFINED;
+            k.write[i] = RS(d, wr[i]) & 0xF;
+        }
+        k.depth = d->ds ? d->ds->img->vkf : VK_FORMAT_UNDEFINED;
+        k.stencil = d->ds ? d->ds->img->fmt->stencil : 0;
+        VkPipeline *pp = pipe_find(&k, key_hash(&k));
+        if (!*pp) *pp = pipeline_create(d, &k, vsm, vsi, psm);
+        pipe = *pp;
+        d->last_pipe = pipe;
+        d->last_gen = d->pipe_gen;
+        d->last_topo = tc;
+        d->last_vsi = vsi;
+        d->last_psi = psi;
+        d->last_psv = psv;
     }
-    static const D3DRENDERSTATETYPE wr[4] = {D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2,
-                                             D3DRS_COLORWRITEENABLE3};
-    for (int i = 0; i < 4; i++) {
-        k.color[i] = d->rt[i] ? d->rt[i]->img->vkf : VK_FORMAT_UNDEFINED;
-        k.write[i] = RS(d, wr[i]) & 0xF;
-    }
-    k.depth = d->ds ? d->ds->img->vkf : VK_FORMAT_UNDEFINED;
-    k.stencil = d->ds ? d->ds->img->fmt->stencil : 0;
-    VkPipeline *pp = pipe_find(&k, key_hash(&k));
-    if (!*pp) *pp = pipeline_create(d, &k, vsm, vsi, psm);
     VkCommandBuffer cb = re5vk_cmd(d);
-    if (*pp != d->bound_pipe) {
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, *pp);
-        d->bound_pipe = *pp;
+    if (pipe != d->bound_pipe) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        d->bound_pipe = pipe;
     }
     set_dynamic(d, pt);
 
@@ -1112,7 +1142,15 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     bufs[15] = d->zero_vb;
     vo[15] = 0;
     strides[15] = 0;
-    vkCmdBindVertexBuffers2(cb, 0, 16, bufs, vo, NULL, strides);
+    /* Só se algo mudou desde o último bind neste command buffer. */
+    if (!d->vb_valid || memcmp(bufs, d->bound_vb, sizeof bufs) || memcmp(vo, d->bound_vo, sizeof vo) ||
+        memcmp(strides, d->bound_vstride, sizeof strides)) {
+        vkCmdBindVertexBuffers2(cb, 0, 16, bufs, vo, NULL, strides);
+        memcpy(d->bound_vb, bufs, sizeof bufs);
+        memcpy(d->bound_vo, vo, sizeof vo);
+        memcpy(d->bound_vstride, strides, sizeof strides);
+        d->vb_valid = 1;
+    }
 }
 
 static UINT vertex_count(D3DPRIMITIVETYPE t, UINT n)
@@ -1147,7 +1185,12 @@ static HRESULT STDMETHODCALLTYPE v_DrawIndexedPrimitive(IDirect3DDevice9 *self, 
     re5vk_lock(d);
     prepare(d, t);
     VkCommandBuffer cb = re5vk_cmd(d);
-    vkCmdBindIndexBuffer(cb, d->ib->buf, 0, d->ib->format == D3DFMT_INDEX32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+    VkIndexType it = d->ib->format == D3DFMT_INDEX32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    if (d->ib->buf != d->bound_ib || it != d->bound_ibt) {   /* o VkBuffer muda num Lock com DISCARD */
+        vkCmdBindIndexBuffer(cb, d->ib->buf, 0, it);
+        d->bound_ib = d->ib->buf;
+        d->bound_ibt = it;
+    }
     d->ib->last_use = d->serial;
     vkCmdDrawIndexed(cb, vertex_count(t, n), 1, start, base, 0);
     re5vk_unlock(d);

@@ -61,7 +61,14 @@ typedef struct re5_thread {
     uint32_t             start_va;     /* função inicial no guest (CreateThread; entry point na principal) */
     int                  is_main;      /* thread principal do jogo (RE5_PROFILE_THREAD=main) */
     int                  host_tid;     /* Linux/Android: gettid() (RE5_FPS_LOG separa jogo de DXVK/driver) */
+    /* Diagnóstico de seções críticas: */
+    volatile uint32_t    cs_waiting;   /* CS do guest que a thread está esperando agora */
+    volatile uint32_t    cs_owner;     /* dono da CS no momento da espera */
 } re5_thread;
+
+/* Diagnóstico de seções críticas: relatório de bloqueios por CS */
+void     re5_k32_cs_contend_report(void);
+uint32_t re5_k32_cs_contend_count(uint32_t cs);
 
 /* Nome da thread do host que chama (SetThreadDescription / pthread_setname_np), visto pelo
  * scripts/thread_cpu.py, pelo Gerenciador de Tarefas e pelos depuradores. Até 15 caracteres

@@ -153,11 +153,27 @@ static int kind_accepts(int want, int have)
     return 0;
 }
 
+/* Objetos já validados (va de objeto-sombra vivo): o re5_mem_is_mapped pega o mutex global da
+ * memória do guest e percorre as regiões, e o obj_of roda em toda chamada D3D9 (this e
+ * argumentos, ~1 milhão por segundo na thread de render; RE5_PROFILE, 2026-11-03). Com o va
+ * aqui, só ele é pulado: a mágica e o handle continuam conferidos. O d9_retire tira o va antes
+ * de liberar a memória do objeto. Mapeamento direto, uma palavra por entrada (atômica). */
+#define D9_OK_CACHE 256u
+static uint32_t g_ok_va[D9_OK_CACHE];
+
+static uint32_t ok_slot(uint32_t va) { return (va >> 4) & (D9_OK_CACHE - 1u); }
+
 static d9_obj *obj_of(uint32_t va)
 {
-    if (!va || !re5_mem_is_mapped(va, D9_OBJ_SIZE) || rd32(va + 12) != D9_MAGIC) return NULL;
+    if (!va) return NULL;
+    uint32_t k = ok_slot(va);
+    int known = __atomic_load_n(&g_ok_va[k], __ATOMIC_ACQUIRE) == va;
+    if (!known && !re5_mem_is_mapped(va, D9_OBJ_SIZE)) return NULL;
+    if (rd32(va + 12) != D9_MAGIC) return NULL;
     d9_obj *o = re5_handle_get(rd32(va + 4), RE5_H_COM);
-    return o && o->guest == va ? o : NULL;
+    if (!o || o->guest != va) return NULL;
+    if (!known) __atomic_store_n(&g_ok_va[k], va, __ATOMIC_RELEASE);
+    return o;
 }
 
 void *re5_d3d9_host_object(uint32_t guest_obj)
@@ -231,6 +247,9 @@ static void d9_retire(d9_obj *o)
     }
     re5_handle_close(o->handle);
     wr32(o->guest + 12, 0);   /* um this velho passa a ser recusado por obj_of */
+    uint32_t k = ok_slot(o->guest);   /* antes de a memória poder ser devolvida */
+    uint32_t want = o->guest;
+    __atomic_compare_exchange_n(&g_ok_va[k], &want, 0u, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
     k32_heap_free(heap(), o->guest);
     free(o->locks);
     free(o);

@@ -297,6 +297,21 @@ struct vk_device {
     /* o que a região atual do UBO tem (prepare copia só o que o shader lê): c[0..n-1], i[], b */
     uint16_t vs_ubo_f, ps_ubo_f;
     uint8_t vs_ubo_ib, ps_ubo_ib;
+    /* O que está ligado no command buffer atual (zerado a cada slot_begin): o draw só religa o
+     * que mudou. Compara o VkBuffer, não o objeto: o Lock com DISCARD troca a memória. */
+    VkBuffer bound_vb[16];
+    VkDeviceSize bound_vo[16], bound_vstride[16];
+    int vb_valid;
+    VkBuffer bound_ib;
+    VkIndexType bound_ibt;
+    /* Pipeline do draw anterior: refeito só quando muda algo que entra nele (pipe_gen sobe em
+     * todo SetRenderState com valor novo, shaders, declaração, alvos e textura que troca entre
+     * profundidade e cor) ou a classe de topologia. */
+    uint32_t pipe_gen, last_gen;
+    uint32_t last_topo;
+    VkPipeline last_pipe;
+    const re5vk_shader *last_vsi, *last_psi;
+    re5vk_dxso_variant last_psv;
     VkDeviceSize vs_ubo_off, ps_ubo_off;
     VkBuffer vs_ubo_buf, ps_ubo_buf;
     int in_scene;
