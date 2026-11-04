@@ -72,6 +72,27 @@ static int format_ok(vk_device *d, VkFormat f, VkFormatFeatureFlags need)
     return (p.optimalTilingFeatures & need) == need;
 }
 
+/* D3DSAMP_SRGBTEXTURE: o D3D9 converte sRGB -> linear ao amostrar estes formatos. Sem isso as
+ * texturas entram claras demais na iluminação e no HDR (cena estourada na fase 3 do benchmark,
+ * 2026-11-04). RE5VK_SRGB=0 desliga (a imagem deixa de ser mutável; o Mali perde AFBC com ela). */
+static VkFormat srgb_pair(VkFormat f)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_SRGB");
+        on = !(e && *e == '0');
+    }
+    if (!on) return VK_FORMAT_UNDEFINED;
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return VK_FORMAT_BC2_SRGB_BLOCK;
+    case VK_FORMAT_BC3_UNORM_BLOCK: return VK_FORMAT_BC3_SRGB_BLOCK;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 static VkImageAspectFlags aspect_of(const vk_format *f, int for_view)
 {
     if (!f->depth) return VK_IMAGE_ASPECT_COLOR_BIT;
@@ -118,7 +139,19 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
         .usage = usage,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
+    /* Com par sRGB: imagem mutável, com a lista dos dois formatos (o driver mantém a compressão
+     * quando sabe quais vistas vão existir). */
+    VkFormat sv = (usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !ds ? srgb_pair(vf) : VK_FORMAT_UNDEFINED;
+    if (sv != VK_FORMAT_UNDEFINED && !format_ok(d, sv, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) sv = VK_FORMAT_UNDEFINED;
+    VkFormat views[2] = {vf, sv};
+    VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+                                      .viewFormatCount = 2, .pViewFormats = views};
+    if (sv != VK_FORMAT_UNDEFINED) {
+        ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        ci.pNext = &fl;
+    }
     VK_CHECK(vkCreateImage(d->dev, &ci, NULL, &im->image));
+    im->srgb = sv;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(d->dev, im->image, &req);
     im->mem = re5vk_mem_alloc(d, req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
@@ -196,9 +229,28 @@ VkImageView re5vk_image_rt_view(vk_device *d, vk_image *im, uint32_t layer, uint
     return *v;
 }
 
+VkImageView re5vk_image_sampled_view(vk_device *d, vk_image *im, int srgb)
+{
+    if (!srgb || im->srgb == VK_FORMAT_UNDEFINED) return im->view;
+    if (im->view_srgb) return im->view_srgb;
+    VkImageViewCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = im->image,
+        .viewType = im->layers == 6 && im->type == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_CUBE
+                  : im->type == VK_IMAGE_TYPE_3D                    ? VK_IMAGE_VIEW_TYPE_3D
+                                                                    : VK_IMAGE_VIEW_TYPE_2D,
+        .format = im->srgb,
+        .components = im->fmt->swz,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, im->levels, 0, im->layers},
+    };
+    VK_CHECK(vkCreateImageView(d->dev, &vi, NULL, &im->view_srgb));
+    return im->view_srgb;
+}
+
 void re5vk_image_destroy(vk_device *d, vk_image *im)
 {
     if (!im->image) return;
+    if (im->view_srgb) re5vk_destroy_later(d, 3, (uint64_t)(uintptr_t)im->view_srgb, (vk_alloc){0});
     for (uint32_t i = 0; i < im->levels * im->layers; i++)
         if (im->rt_views && im->rt_views[i]) re5vk_destroy_later(d, 3, (uint64_t)(uintptr_t)im->rt_views[i], (vk_alloc){0});
     if (im->view) re5vk_destroy_later(d, 3, (uint64_t)(uintptr_t)im->view, (vk_alloc){0});

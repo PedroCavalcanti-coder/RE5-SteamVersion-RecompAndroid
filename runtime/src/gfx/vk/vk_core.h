@@ -166,6 +166,8 @@ struct vk_image {             /* imagem de textura, alvo de render, profundidade
     uint32_t w, h, d, levels, layers;
     VkImageType type;
     uint64_t last_use;
+    VkFormat srgb;             /* par sRGB do formato (D3DSAMP_SRGBTEXTURE), ou UNDEFINED */
+    VkImageView view_srgb;     /* criada no primeiro uso */
 };
 
 typedef struct {
@@ -360,6 +362,8 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
                        uint32_t depth, uint32_t levels, uint32_t layers, int cube, int rt, int ds);
 void re5vk_image_destroy(vk_device *d, vk_image *im);
 VkImageView re5vk_image_rt_view(vk_device *d, vk_image *im, uint32_t layer, uint32_t level);
+/* Vista para amostrar: a sRGB (sRGB -> linear na leitura) se srgb e o formato tem par. */
+VkImageView re5vk_image_sampled_view(vk_device *d, vk_image *im, int srgb);
 vk_surface *re5vk_surface_new(vk_device *d, vk_obj *container, vk_image *img, int own, uint32_t layer, uint32_t level,
                               D3DFORMAT format, DWORD usage, D3DPOOL pool);
 void re5vk_res_vtables(vk_device *d);

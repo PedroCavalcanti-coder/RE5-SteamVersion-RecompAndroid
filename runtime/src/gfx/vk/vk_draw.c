@@ -1100,7 +1100,8 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
             if (!(psi->samplers >> s & 1)) continue;
             int dep;
             vk_image *im = bound_image(d, s, psi->sampler_type[s], &dep);
-            ii[ni] = (VkDescriptorImageInfo){sampler_get(d, s, dep && (psv.depth_samplers >> s & 1)), im->view,
+            ii[ni] = (VkDescriptorImageInfo){sampler_get(d, s, dep && (psv.depth_samplers >> s & 1)),
+                                             re5vk_image_sampled_view(d, im, d->ss[s][D3DSAMP_SRGBTEXTURE] != 0),
                                              VK_IMAGE_LAYOUT_GENERAL};
             w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
                                              .dstBinding = RE5VK_BIND_PS_SAMP + (uint32_t)s, .descriptorCount = 1,
@@ -1111,7 +1112,9 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
             if (!(vsi->samplers >> s & 1)) continue;
             int dep;
             vk_image *im = bound_image(d, 16 + s, vsi->sampler_type[s], &dep);
-            ii[ni] = (VkDescriptorImageInfo){sampler_get(d, 16 + s, 0), im->view, VK_IMAGE_LAYOUT_GENERAL};
+            ii[ni] = (VkDescriptorImageInfo){sampler_get(d, 16 + s, 0),
+                                             re5vk_image_sampled_view(d, im, d->ss[16 + s][D3DSAMP_SRGBTEXTURE] != 0),
+                                             VK_IMAGE_LAYOUT_GENERAL};
             w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
                                              .dstBinding = RE5VK_BIND_VS_SAMP + (uint32_t)s, .descriptorCount = 1,
                                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,

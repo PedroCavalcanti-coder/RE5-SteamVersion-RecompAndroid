@@ -239,7 +239,15 @@ O que mudou:
     mudaram (o `Lock` com DISCARD troca o buffer, e todo command buffer novo começa sem
     binds); variantes, chave e busca de pipeline só quando `pipe_gen` muda (estado de
     pipeline, shaders, declaração, alvos, textura que troca entre profundidade e cor).
-  - `ctest` 31/31. Fps: pendente (A/B do usuário: `re5_atual.exe` x `re5.exe`).
+  - `ctest` 31/31. **A/B do usuário (re5vk, benchmark variável, duas primeiras áreas):
+    89 fps antes, 95 a 102 depois** (+7% a +15%, conforme a ordem das rodadas). Benchmark
+    fixo, re5vk: **78 -> 87,1** (+12%); o original faz 136. CPU igual à do original (~4%
+    abaixo); a GPU fica 5 a 10 pontos mais ocupada no original.
+  - **re5vk passa a honrar o `D3DSAMP_SRGBTEXTURE`** (`vk_res.c`, `vk_draw.c`): o estado era
+    ignorado em silêncio, e as texturas que o jogo lê como sRGB entravam sem a conversão para
+    linear (ambiente estourado na fase 3 do variável). Imagens com par sRGB (BGRA8, RGBA8,
+    BC1-3) nascem mutáveis, com lista de formatos, e ganham a vista sRGB no primeiro uso.
+    `RE5VK_SRGB=0` desliga (Mali: imagem mutável perde AFBC). Visual: pendente.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
