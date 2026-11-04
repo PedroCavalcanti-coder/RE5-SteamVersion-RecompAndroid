@@ -217,7 +217,10 @@ O que mudou:
     thread cria/fecha alternando tipo e objeto, outra lê sem nunca ver tipo e objeto misturados).
   - **re5vk copia só as constantes que o shader lê** (`vk_dxso.c` registra `const_f`/`uses_i`/
     `uses_b`; `prepare()` copia isso): antes eram os bancos inteiros, ~8 KB por draw. Teste
-    `test_vk_dxso` (relativo = banco inteiro; `c7` = 8). `ctest` 31/31. Fps: pendente.
+    `test_vk_dxso` (relativo = banco inteiro; `c7` = 8). `ctest` 31/31.
+  - **Medida do usuário, benchmark FIXO 1080p** (não comparar com os números do variável acima):
+    re5vk **78 fps**, DXVK 68,9 (+13% para o re5vk). Tabela de handles, DXVK: build anterior
+    (`re5_ic`) 73 contra 74 com ela - empate.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
