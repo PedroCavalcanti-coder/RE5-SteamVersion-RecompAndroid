@@ -44,6 +44,21 @@
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
         </activity>
 
+        <!-- Configurações em tela cheia (abas). -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+
+        <!-- Editor do layout dos controles na tela (aberto pelo launcher). -->
+        <activity
+            android:name=".ControlsEditorActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+
         <!-- Mostra a pasta do jogo (Android/data/.../files/game) no app Arquivos. -->
         <provider
             android:name=".GameFilesProvider"

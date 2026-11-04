@@ -531,6 +531,12 @@ int main(void)
     CHECK_EQ_U32(vcall(dev, 57, 2, srs), D3D_OK);
     CHECK_EQ_U32(rec.rs, D3DRS_ZENABLE);
 
+    /* Limite de FPS: prazos a cada período; atrasado mais de um período, recomeça (sem rajada). */
+    CHECK(re5_frame_cap_next(1000, 0, 100) == 1100);
+    CHECK(re5_frame_cap_next(1050, 1100, 100) == 1200);   /* adiantado: o próximo prazo */
+    CHECK(re5_frame_cap_next(1150, 1100, 100) == 1200);   /* atrasado menos de um período */
+    CHECK(re5_frame_cap_next(5000, 1100, 100) == 5100);   /* muito atrasado: recomeça */
+
     /* Identidade: o mesmo objeto do host é o mesmo objeto do guest. */
     uint32_t live0 = re5_d3d9_live_objects(), pbb = gbuf(4);
     const uint32_t gbb[4] = {0, 0, D3DBACKBUFFER_TYPE_MONO, pbb};

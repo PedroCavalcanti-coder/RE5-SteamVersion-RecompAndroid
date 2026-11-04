@@ -85,6 +85,7 @@ public final class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        L.init(this);
         getWindow().setStatusBarColor(Color.TRANSPARENT);
         getWindow().setNavigationBarColor(BG);
         setContentView(buildScreen());
@@ -115,43 +116,43 @@ public final class LauncherActivity extends Activity {
         File rar = GameStorage.downloadedRar();
         boolean rarExists = perm && rar.isFile();
 
-        rowState.setText(installed ? "Instalados" : GameStorage.hasData(dir) ? "Falta o re5dx9.exe" : "Não instalados");
+        rowState.setText(installed ? L.t("Instalados") : GameStorage.hasData(dir) ? L.t("Falta o re5dx9.exe") : L.t("Não instalados"));
         rowState.setTextColor(installed ? GREEN : AMBER);
-        rowWhere.setText("Pasta do app — apagada junto ao desinstalar");
+        rowWhere.setText(L.t("Pasta do app — apagada junto ao desinstalar"));
         rowDevice.setText(Build.MANUFACTURER.substring(0, 1).toUpperCase(Locale.ROOT) + Build.MANUFACTURER.substring(1)
-                + " " + Build.MODEL + " · Android " + Build.VERSION.RELEASE + " · " + vulkanVersion());
+                + " " + Build.MODEL + L.t(" · Android ") + Build.VERSION.RELEASE + " · " + vulkanVersion());
         filesActions.setVisibility(GameStorage.hasData(dir) ? View.VISIBLE : View.GONE);
         updateSize(dir);
         refreshLan();
 
         migrateCard.setVisibility(legacyData && !busy ? View.VISIBLE : View.GONE);
         if (legacyData) {
-            migrateText.setText("Os arquivos estão em " + legacy.getAbsolutePath()
-                    + ", fora da pasta do app: o Android não os conta no tamanho do app nem os apaga ao "
-                    + "desinstalar. Mova-os para a pasta do app (não precisa de espaço extra).");
+            migrateText.setText(L.t("Os arquivos estão em ") + legacy.getAbsolutePath()
+                    + L.t(", fora da pasta do app: o Android não os conta no tamanho do app nem os apaga ao ")
+                    + L.t("desinstalar. Mova-os para a pasta do app (não precisa de espaço extra)."));
         }
 
         installCard.setVisibility(!installed && !legacyData && !busy ? View.VISIBLE : View.GONE);
         installRarButton.setVisibility(rarExists ? View.VISIBLE : View.GONE);
-        if (rarExists) installRarButton.setText("Extrair Download/game.rar (" + GameStorage.formatSize(rar.length()) + ")");
+        if (rarExists) installRarButton.setText(L.t("Extrair Download/game.rar (") + GameStorage.formatSize(rar.length()) + ")");
 
         permCard.setVisibility(!perm && !installed && !busy ? View.VISIBLE : View.GONE);
 
         rarCleanCard.setVisibility(installed && rarExists && !busy ? View.VISIBLE : View.GONE);
-        if (rarExists) rarCleanText.setText("Download/game.rar ainda ocupa " + GameStorage.formatSize(rar.length())
-                + ". O jogo já está instalado; pode apagar.");
+        if (rarExists) rarCleanText.setText(L.t("Download/game.rar ainda ocupa ") + GameStorage.formatSize(rar.length())
+                + L.t(". O jogo já está instalado; pode apagar."));
 
         boolean ready = installed && !busy;
         playButton.setEnabled(ready);
         playButton.setBackground(ready ? playBackground : flat(SURFACE_2, 14));
         playButton.setTextColor(ready ? Color.WHITE : 0xFF5C6168);
-        if (busy) setChip("TRABALHANDO…", AMBER);
-        else if (installed) setChip("PRONTO", GREEN);
-        else setChip("FALTAM ARQUIVOS", AMBER);
+        if (busy) setChip(L.t("TRABALHANDO…"), AMBER);
+        else if (installed) setChip(L.t("PRONTO"), GREEN);
+        else setChip(L.t("FALTAM ARQUIVOS"), AMBER);
     }
 
     private void updateSize(File dir) {
-        rowSize.setText(gameSize < 0 ? "calculando…" : GameStorage.formatSize(gameSize));
+        rowSize.setText(gameSize < 0 ? L.t("calculando…") : GameStorage.formatSize(gameSize));
         new Thread(() -> {
             long s = GameStorage.sizeOf(dir);
             main.post(() -> {
@@ -167,7 +168,7 @@ public final class LauncherActivity extends Activity {
                 return "Vulkan " + (fi.version >>> 22) + "." + ((fi.version >> 12) & 0x3FF);
             }
         }
-        return "sem Vulkan";
+        return L.t("sem Vulkan");
     }
 
     private void setChip(String text, int color) {
@@ -207,10 +208,10 @@ public final class LauncherActivity extends Activity {
             String error = GameSession.findError(log);
             if (error == null) return;
             main.post(() -> new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                    .setTitle("O jogo fechou com erro")
-                    .setMessage(error + "\n\nO registro completo pode ser copiado para enviar a quem desenvolve.")
-                    .setPositiveButton("Copiar registro", (d, w) -> copyToClipboard(log))
-                    .setNegativeButton("Fechar", null)
+                    .setTitle(L.t("O jogo fechou com erro"))
+                    .setMessage(error + L.t("\n\nO registro completo pode ser copiado para enviar a quem desenvolve."))
+                    .setPositiveButton(L.t("Copiar registro"), (d, w) -> copyToClipboard(log))
+                    .setNegativeButton(L.t("Fechar"), null)
                     .show());
         }, "re5-crashlog").start();
     }
@@ -219,7 +220,7 @@ public final class LauncherActivity extends Activity {
         ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (cm != null) {
             cm.setPrimaryClip(ClipData.newPlainText("RE5", text));
-            Toast.makeText(this, "Registro copiado.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, L.t("Registro copiado."), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -241,7 +242,7 @@ public final class LauncherActivity extends Activity {
     private void migrateLegacy() {
         File from = GameStorage.legacyDir();
         File to = GameStorage.gameDir(this);
-        setBusy(true, "Movendo arquivos para a pasta do app…");
+        setBusy(true, L.t("Movendo arquivos para a pasta do app…"));
         new Thread(() -> {
             String err = null;
             try {
@@ -253,10 +254,10 @@ public final class LauncherActivity extends Activity {
             main.post(() -> {
                 setBusy(false, null);
                 if (finalErr != null) {
-                    alert("Não foi possível mover tudo", finalErr
-                            + "\n\nO que já foi movido está na pasta do app; toque em mover de novo para continuar.");
+                    alert(L.t("Não foi possível mover tudo"), finalErr
+                            + L.t("\n\nO que já foi movido está na pasta do app; toque em mover de novo para continuar."));
                 } else {
-                    Toast.makeText(this, "Arquivos movidos para a pasta do app.", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, L.t("Arquivos movidos para a pasta do app."), Toast.LENGTH_LONG).show();
                 }
             });
         }, "re5-move").start();
@@ -266,7 +267,7 @@ public final class LauncherActivity extends Activity {
         progressBar.setIndeterminate(false);
         progressBar.setMax(1000);
         progressBar.setProgress(total > 0 ? (int) (done * 1000 / total) : 0);
-        progressDetail.setText(GameStorage.formatSize(done) + " de " + GameStorage.formatSize(total) + "\n" + file);
+        progressDetail.setText(GameStorage.formatSize(done) + L.t(" de ") + GameStorage.formatSize(total) + "\n" + file);
     }
 
     private void openArchivePicker() {
@@ -282,15 +283,19 @@ public final class LauncherActivity extends Activity {
         if (requestCode == REQUEST_ARCHIVE_PICK && resultCode == RESULT_OK && data != null && data.getData() != null) {
             startExtraction(data.getData(), null);
         }
+        if (requestCode == REQUEST_SETTINGS && resultCode == RESULT_OK && data != null
+                && data.getBooleanExtra(SettingsActivity.RESULT_OPEN_LAN, false)) {
+            showLanDialog();
+        }
     }
 
     private void startExtraction(Uri uri, String directPath) {
         File target = GameStorage.gameDir(this);
-        setBusy(true, "Extraindo arquivos do jogo…");
+        setBusy(true, L.t("Extraindo arquivos do jogo…"));
         new ArchiveExtractor().extractArchive(this, uri, directPath, target, new ArchiveExtractor.Callback() {
             @Override
             public void onProgress(String currentFile, long processedCount, int percent) {
-                main.post(() -> progressDetail.setText(processedCount + " arquivos\n" + currentFile));
+                main.post(() -> progressDetail.setText(processedCount + L.t(" arquivos\n") + currentFile));
             }
 
             @Override
@@ -299,12 +304,12 @@ public final class LauncherActivity extends Activity {
                     gameSize = -1;
                     setBusy(false, null);
                     if (GameStorage.isInstalled(target)) {
-                        Toast.makeText(LauncherActivity.this, "Jogo instalado.", Toast.LENGTH_LONG).show();
+                        Toast.makeText(LauncherActivity.this, L.t("Jogo instalado."), Toast.LENGTH_LONG).show();
                         if (uri != null) offerDeleteArchive(uri);
                     } else {
-                        alert("Arquivo incompleto", "A extração terminou, mas não encontrei "
+                        alert(L.t("Arquivo incompleto"), L.t("A extração terminou, mas não encontrei ")
                                 + GameStorage.DATA_DIR_NAME + "/ e " + GameStorage.EXE_NAME
-                                + " na pasta do jogo. O arquivo tem a pasta do jogo completa?");
+                                + L.t(" na pasta do jogo. O arquivo tem a pasta do jogo completa?"));
                     }
                 });
             }
@@ -313,7 +318,7 @@ public final class LauncherActivity extends Activity {
             public void onError(String error) {
                 main.post(() -> {
                     setBusy(false, null);
-                    alert("Erro na extração", error);
+                    alert(L.t("Erro na extração"), error);
                 });
             }
         });
@@ -321,9 +326,9 @@ public final class LauncherActivity extends Activity {
 
     private void offerDeleteArchive(Uri uri) {
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Apagar o arquivo compactado?")
-                .setMessage("O jogo já foi extraído para a pasta do app. O arquivo original não é mais necessário.")
-                .setPositiveButton("Apagar", (d, w) -> {
+                .setTitle(L.t("Apagar o arquivo compactado?"))
+                .setMessage(L.t("O jogo já foi extraído para a pasta do app. O arquivo original não é mais necessário."))
+                .setPositiveButton(L.t("Apagar"), (d, w) -> {
                     boolean ok = false;
                     try {
                         if (DocumentsContract.isDocumentUri(this, uri)) {
@@ -334,35 +339,35 @@ public final class LauncherActivity extends Activity {
                         }
                     } catch (Exception ignored) {
                     }
-                    Toast.makeText(this, ok ? "Arquivo apagado." : "Não foi possível apagar.", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, ok ? L.t("Arquivo apagado.") : L.t("Não foi possível apagar."), Toast.LENGTH_SHORT).show();
                     refresh();
                 })
-                .setNegativeButton("Manter", null)
+                .setNegativeButton(L.t("Manter"), null)
                 .show();
     }
 
     private void confirmDeleteRar() {
         File rar = GameStorage.downloadedRar();
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Apagar Download/game.rar?")
-                .setMessage("Libera " + GameStorage.formatSize(rar.length()) + ". O jogo instalado não é afetado.")
-                .setPositiveButton("Apagar", (d, w) -> {
-                    Toast.makeText(this, rar.delete() ? "game.rar apagado." : "Não foi possível apagar.",
+                .setTitle(L.t("Apagar Download/game.rar?"))
+                .setMessage(L.t("Libera ") + GameStorage.formatSize(rar.length()) + L.t(". O jogo instalado não é afetado."))
+                .setPositiveButton(L.t("Apagar"), (d, w) -> {
+                    Toast.makeText(this, rar.delete() ? L.t("game.rar apagado.") : L.t("Não foi possível apagar."),
                             Toast.LENGTH_SHORT).show();
                     refresh();
                 })
-                .setNegativeButton("Cancelar", null)
+                .setNegativeButton(L.t("Cancelar"), null)
                 .show();
     }
 
     private void confirmDeleteGame() {
         File dir = GameStorage.gameDir(this);
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Apagar os arquivos do jogo?")
-                .setMessage("Remove " + (gameSize > 0 ? GameStorage.formatSize(gameSize) + " " : "")
-                        + "da pasta do app, inclusive saves. Para jogar de novo será preciso importar o jogo outra vez.")
-                .setPositiveButton("Apagar tudo", (d, w) -> {
-                    setBusy(true, "Apagando arquivos do jogo…");
+                .setTitle(L.t("Apagar os arquivos do jogo?"))
+                .setMessage(L.t("Remove ") + (gameSize > 0 ? GameStorage.formatSize(gameSize) + " " : "")
+                        + L.t("da pasta do app, inclusive saves. Para jogar de novo será preciso importar o jogo outra vez."))
+                .setPositiveButton(L.t("Apagar tudo"), (d, w) -> {
+                    setBusy(true, L.t("Apagando arquivos do jogo…"));
                     new Thread(() -> {
                         GameStorage.deleteTree(dir);
                         main.post(() -> {
@@ -371,7 +376,7 @@ public final class LauncherActivity extends Activity {
                         });
                     }, "re5-delete").start();
                 })
-                .setNegativeButton("Cancelar", null)
+                .setNegativeButton(L.t("Cancelar"), null)
                 .show();
     }
 
@@ -392,7 +397,7 @@ public final class LauncherActivity extends Activity {
             } catch (ActivityNotFoundException | SecurityException ignored) {
             }
         }
-        Toast.makeText(this, "Nenhum app de arquivos disponível.", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, L.t("Nenhum app de arquivos disponível."), Toast.LENGTH_SHORT).show();
     }
 
     /** Navegador simples dentro do próprio app. */
@@ -420,14 +425,14 @@ public final class LauncherActivity extends Activity {
                     if (f.isDirectory()) browse(f);
                     else browse(dir);
                 })
-                .setNeutralButton("App Arquivos", (d, w) -> openInFilesApp())
-                .setNegativeButton("Fechar", null)
+                .setNeutralButton(L.t("App Arquivos"), (d, w) -> openInFilesApp())
+                .setNegativeButton(L.t("Fechar"), null)
                 .show();
     }
 
     private void alert(String title, String msg) {
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle(title).setMessage(msg).setPositiveButton("OK", null).show();
+                .setTitle(title).setMessage(msg).setPositiveButton(L.t("OK"), null).show();
     }
 
     // ------------------------------------------------------------------ layout
@@ -457,7 +462,7 @@ public final class LauncherActivity extends Activity {
         heroText.setOrientation(LinearLayout.VERTICAL);
         heroText.setGravity(Gravity.BOTTOM);
         heroText.setPadding(dp(20), 0, dp(20), dp(6));
-        TextView kicker = text("RECOMPILAÇÃO ESTÁTICA · ARM64", 11, RED, true);
+        TextView kicker = text(L.t("RECOMPILAÇÃO ESTÁTICA · ARM64"), 11, RED, true);
         kicker.setLetterSpacing(0.12f);
         heroText.addView(kicker);
         TextView title = text("RESIDENT EVIL 5", 34, TEXT, true);
@@ -481,8 +486,22 @@ public final class LauncherActivity extends Activity {
         btnSettings.setBackground(setBg);
         FrameLayout.LayoutParams setLp = new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP | Gravity.END);
         setLp.setMargins(0, dp(38), dp(18), 0);
-        btnSettings.setOnClickListener(v -> showSettingsDialog());
+        btnSettings.setOnClickListener(v -> openSettings(SettingsActivity.TAB_GRAPHICS));
         hero.addView(btnSettings, setLp);
+        // Idioma: ao lado do ⚙ (EN, ES, PT, ZH, RU, JA; padrão = o do sistema)
+        TextView btnLang = new TextView(this);
+        btnLang.setText("🌐");
+        btnLang.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        btnLang.setGravity(Gravity.CENTER);
+        GradientDrawable langBg = new GradientDrawable();
+        langBg.setShape(GradientDrawable.OVAL);
+        langBg.setColor(0xAA15171B);
+        langBg.setStroke(dp(1), 0x66FFFFFF);
+        btnLang.setBackground(langBg);
+        FrameLayout.LayoutParams langLp = new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP | Gravity.END);
+        langLp.setMargins(0, dp(38), dp(72), 0);
+        btnLang.setOnClickListener(v -> chooseLanguage());
+        hero.addView(btnLang, langLp);
         hero.addView(heroText, match());
         col.addView(hero, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(340)));
 
@@ -509,54 +528,73 @@ public final class LauncherActivity extends Activity {
         // Mover de /sdcard/re5
         LinearLayout mig = card(body);
         migrateCard = mig;
-        mig.addView(cardTitle("Mover arquivos para a pasta do app", AMBER));
+        mig.addView(cardTitle(L.t("Mover arquivos para a pasta do app"), AMBER));
         migrateText = text("", 13, TEXT_DIM, false);
         mig.addView(migrateText);
-        mig.addView(button("Mover agora", RED, TEXT, v -> migrateLegacy()), buttonLp());
+        mig.addView(button(L.t("Mover agora"), RED, TEXT, v -> migrateLegacy()), buttonLp());
 
         // Permissão
         LinearLayout perm = card(body);
         permCard = perm;
-        perm.addView(cardTitle("Acesso aos arquivos", AMBER));
-        perm.addView(text("Permita o acesso para o app achar o game.rar em Download ou uma instalação antiga em /sdcard/re5. "
-                + "Não é preciso para importar escolhendo o arquivo.", 13, TEXT_DIM, false));
-        perm.addView(button("Permitir acesso", SURFACE_2, TEXT, v -> requestStorageAccess()), buttonLp());
+        perm.addView(cardTitle(L.t("Acesso aos arquivos"), AMBER));
+        perm.addView(text(L.t("Permita o acesso para o app achar o game.rar em Download ou uma instalação antiga em /sdcard/re5. ")
+                + L.t("Não é preciso para importar escolhendo o arquivo."), 13, TEXT_DIM, false));
+        perm.addView(button(L.t("Permitir acesso"), SURFACE_2, TEXT, v -> requestStorageAccess()), buttonLp());
 
         // Instalar
         LinearLayout inst = card(body);
         installCard = inst;
-        inst.addView(cardTitle("Instalar o jogo", TEXT));
-        inst.addView(text("Escolha o game.rar (ou .zip) com a pasta do jogo: re5dx9.exe e nativePC_MT/.", 13, TEXT_DIM, false));
+        inst.addView(cardTitle(L.t("Instalar o jogo"), TEXT));
+        inst.addView(text(L.t("Escolha o game.rar (ou .zip) com a pasta do jogo: re5dx9.exe e nativePC_MT/."), 13, TEXT_DIM, false));
         installRarButton = button("", RED, TEXT, v -> startExtraction(null, GameStorage.downloadedRar().getAbsolutePath()));
         inst.addView(installRarButton, buttonLp());
-        inst.addView(button("Escolher arquivo…", SURFACE_2, TEXT, v -> openArchivePicker()), buttonLp());
+        inst.addView(button(L.t("Escolher arquivo…"), SURFACE_2, TEXT, v -> openArchivePicker()), buttonLp());
 
         // Multiplayer: toda a configuração da LAN fica aqui (o jogo não tem tela para isso)
         LinearLayout mp = card(body);
-        mp.addView(cardTitle("Multiplayer cooperativo (LAN)", TEXT));
-        rowLanProfile = infoRow(mp, "Jogador");
-        rowLanHosts = infoRow(mp, "Procurar em");
-        rowLanIp = infoRow(mp, "IP deste aparelho");
-        mp.addView(text("Os dois aparelhos na mesma rede Wi-Fi (ou um no hotspot do outro). No jogo: Multiplayer > "
-                + "criar ou entrar na sessão.", 12, TEXT_DIM, false));
-        mp.addView(button("Editar multiplayer", SURFACE_2, TEXT, v -> showLanDialog()), buttonLp());
+        mp.addView(cardTitle(L.t("Multiplayer cooperativo (LAN)"), TEXT));
+        rowLanProfile = infoRow(mp, L.t("Jogador"));
+        rowLanHosts = infoRow(mp, L.t("Procurar em"));
+        rowLanIp = infoRow(mp, L.t("IP deste aparelho"));
+        mp.addView(text(L.t("Os dois aparelhos na mesma rede Wi-Fi (ou um no hotspot do outro). No jogo: Multiplayer > ")
+                + L.t("criar ou entrar na sessão."), 12, TEXT_DIM, false));
+        mp.addView(button(L.t("Editar multiplayer"), SURFACE_2, TEXT, v -> showLanDialog()), buttonLp());
 
-        // Configurações (Controles, HUD)
-        LinearLayout cfg = card(body);
-        cfg.addView(cardTitle("Configurações do jogo", TEXT));
-        cfg.addView(text("Controles na tela, monitor de desempenho e opções avançadas.", 13, TEXT_DIM, false));
-        cfg.addView(button("⚙ Abrir configurações", SURFACE_2, TEXT, v -> showSettingsDialog()), buttonLp());
+        // Atalhos, como nos emuladores: cada um abre a aba certa das configurações.
+        LinearLayout tiles = card(body);
+        tiles.addView(cardTitle(L.t("Ajustes"), TEXT));
+        String[][] t = {
+                {"🎨", L.t("Gráficos")}, {"🕹", L.t("Controles")}, {"✋", L.t("Editar layout")},
+                {"📊", "HUD"}, {"⚡", L.t("Desempenho")}, {"🌐", L.t("Multiplayer")}};
+        Runnable[] act = {
+                () -> openSettings(SettingsActivity.TAB_GRAPHICS),
+                () -> openSettings(SettingsActivity.TAB_CONTROLS),
+                () -> startActivity(new Intent(this, ControlsEditorActivity.class)),
+                () -> openSettings(SettingsActivity.TAB_HUD),
+                () -> openSettings(SettingsActivity.TAB_PERF),
+                this::showLanDialog};
+        for (int r = 0; r < 2; r++) {
+            LinearLayout line = new LinearLayout(this);
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            for (int c = 0; c < 3; c++) {
+                int i = r * 3 + c;
+                line.addView(tile(t[i][0], t[i][1], act[i]), weightLp());
+            }
+            LinearLayout.LayoutParams lLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(84));
+            lLp.topMargin = dp(8);
+            tiles.addView(line, lLp);
+        }
 
         // Arquivos do jogo
         LinearLayout info = card(body);
-        info.addView(cardTitle("Arquivos do jogo", TEXT));
-        rowState = infoRow(info, "Situação");
-        rowSize = infoRow(info, "Tamanho");
-        rowWhere = infoRow(info, "Local");
+        info.addView(cardTitle(L.t("Arquivos do jogo"), TEXT));
+        rowState = infoRow(info, L.t("Situação"));
+        rowSize = infoRow(info, L.t("Tamanho"));
+        rowWhere = infoRow(info, L.t("Local"));
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.addView(button("Ver arquivos", SURFACE_2, TEXT, v -> browse(GameStorage.gameDir(this))), weightLp());
-        actions.addView(button("Apagar", SURFACE_2, 0xFFFF8A8A, v -> confirmDeleteGame()), weightLp());
+        actions.addView(button(L.t("Ver arquivos"), SURFACE_2, TEXT, v -> browse(GameStorage.gameDir(this))), weightLp());
+        actions.addView(button(L.t("Apagar"), SURFACE_2, 0xFFFF8A8A, v -> confirmDeleteGame()), weightLp());
         filesActions = actions;
         LinearLayout.LayoutParams aLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
         aLp.topMargin = dp(12);
@@ -565,14 +603,14 @@ public final class LauncherActivity extends Activity {
         // game.rar sobrando
         LinearLayout clean = card(body);
         rarCleanCard = clean;
-        clean.addView(cardTitle("Liberar espaço", TEXT));
+        clean.addView(cardTitle(L.t("Liberar espaço"), TEXT));
         rarCleanText = text("", 13, TEXT_DIM, false);
         clean.addView(rarCleanText);
-        clean.addView(button("Apagar game.rar", SURFACE_2, 0xFFFF8A8A, v -> confirmDeleteRar()), buttonLp());
+        clean.addView(button(L.t("Apagar game.rar"), SURFACE_2, 0xFFFF8A8A, v -> confirmDeleteRar()), buttonLp());
 
         // Aparelho
         LinearLayout dev = card(body);
-        dev.addView(cardTitle("Aparelho", TEXT));
+        dev.addView(cardTitle(L.t("Aparelho"), TEXT));
         rowDevice = text("", 13, TEXT_DIM, false);
         dev.addView(rowDevice);
 
@@ -583,7 +621,7 @@ public final class LauncherActivity extends Activity {
         bottom.setOrientation(LinearLayout.VERTICAL);
         bottom.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0x000A0B0D, BG, BG}));
         bottom.setPadding(dp(16), dp(22), dp(16), dp(16));
-        playButton = button("JOGAR", RED, Color.WHITE, v -> launchGame());
+        playButton = button(L.t("JOGAR"), RED, Color.WHITE, v -> launchGame());
         playButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         playButton.setLetterSpacing(0.2f);
         playBackground = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{RED, RED_DARK});
@@ -704,7 +742,7 @@ public final class LauncherActivity extends Activity {
     }
 
     private static class LanConfig {
-        String name = "Jogador";
+        String name = L.t("Jogador");
         String country = "BR";
         String hosts = "";
         long id = 0;
@@ -746,7 +784,7 @@ public final class LauncherActivity extends Activity {
 
         long id = existingId >= 100000 && existingId < 1000000 ? existingId : (100000 + (long) (Math.random() * 900000));
         name = name != null ? name.replace("#", "").trim() : "";
-        if (name.isEmpty()) name = "Jogador";
+        if (name.isEmpty()) name = L.t("Jogador");
         if (name.length() > LAN_NAME_MAX) name = name.substring(0, LAN_NAME_MAX);
         country = country != null && country.trim().length() >= 2 ? country.trim().substring(0, 2).toUpperCase(Locale.US) : "BR";
         hosts = hosts != null ? hosts.replace(" ", "").replace(";", ",").trim() : "";
@@ -764,7 +802,7 @@ public final class LauncherActivity extends Activity {
             w.write("hosts=" + hosts + "\n");
             w.write("id=" + id + "\n");
         } catch (Exception e) {
-            Toast.makeText(this, "Erro ao salvar re5_lan.ini: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, L.t("Erro ao salvar re5_lan.ini: ") + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -773,9 +811,9 @@ public final class LauncherActivity extends Activity {
     private void refreshLan() {
         LanConfig lan = loadLanConfig();
         rowLanProfile.setText(lan.name + (lan.id > 0 ? " #" + lan.id : "") + " · " + lan.country);
-        rowLanHosts.setText(lan.hosts.isEmpty() ? "rede local (automático)" : lan.hosts);
+        rowLanHosts.setText(lan.hosts.isEmpty() ? L.t("rede local (automático)") : lan.hosts);
         String ips = localIpv4();
-        rowLanIp.setText(ips.isEmpty() ? "sem rede" : ips);
+        rowLanIp.setText(ips.isEmpty() ? L.t("sem rede") : ips);
     }
 
     /** IPv4 das interfaces ativas (Wi-Fi, hotspot): o parceiro digita um destes em "Procurar em". */
@@ -814,207 +852,84 @@ public final class LauncherActivity extends Activity {
         col.setPadding(dp(20), dp(16), dp(20), dp(16));
         scroll.addView(col);
 
-        col.addView(text("Sua identidade no cooperativo em rede local. Vale na próxima vez que o jogo abrir.", 12, TEXT_DIM, false));
+        col.addView(text(L.t("Sua identidade no cooperativo em rede local. Vale na próxima vez que o jogo abrir."), 12, TEXT_DIM, false));
 
-        col.addView(dialogFieldLabel("Nome do jogador (até " + LAN_NAME_MAX + " letras)"));
+        col.addView(dialogFieldLabel(L.t("Nome do jogador (até ") + LAN_NAME_MAX + L.t(" letras)")));
         EditText editName = dialogEditText(lan.name);
         editName.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(LAN_NAME_MAX)});
         col.addView(editName);
 
-        col.addView(dialogFieldLabel("País da bandeira (duas letras: BR, PT, US...)"));
+        col.addView(dialogFieldLabel(L.t("País da bandeira (duas letras: BR, PT, US...)")));
         EditText editCountry = dialogEditText(lan.country);
         editCountry.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(2),
                 new android.text.InputFilter.AllCaps()});
         col.addView(editCountry);
 
-        col.addView(dialogFieldLabel("Procurar sessão nestes IPs (opcional)"));
+        col.addView(dialogFieldLabel(L.t("Procurar sessão nestes IPs (opcional)")));
         EditText editHosts = dialogEditText(lan.hosts);
-        editHosts.setHint("Ex.: 192.168.1.100, 192.168.43.1");
+        editHosts.setHint(L.t("Ex.: 192.168.1.100, 192.168.43.1"));
         col.addView(editHosts);
         String ips = localIpv4();
-        col.addView(text("Deixe vazio para achar a sessão sozinho na rede. Use só se a rede bloqueia a busca: "
-                + "o IP do aparelho que cria a sessão. O deste aparelho: " + (ips.isEmpty() ? "sem rede" : ips) + ".",
+        col.addView(text(L.t("Deixe vazio para achar a sessão sozinho na rede. Use só se a rede bloqueia a busca: ")
+                + L.t("o IP do aparelho que cria a sessão. O deste aparelho: ") + (ips.isEmpty() ? L.t("sem rede") : ips) + ".",
                 12, TEXT_DIM, false));
 
         AlertDialog dlg = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Multiplayer (LAN)")
+                .setTitle(L.t("Multiplayer (LAN)"))
                 .setView(scroll)
-                .setPositiveButton("Salvar", null)
-                .setNegativeButton("Cancelar", null)
+                .setPositiveButton(L.t("Salvar"), null)
+                .setNegativeButton(L.t("Cancelar"), null)
                 .create();
         dlg.setOnShowListener(d -> dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             String hosts = editHosts.getText().toString().replace(" ", "").replace(";", ",");
             if (!validHosts(hosts)) {
-                editHosts.setError("IPs no formato 192.168.0.10, separados por vírgula");
+                editHosts.setError(L.t("IPs no formato 192.168.0.10, separados por vírgula"));
                 return;
             }
             saveLanConfig(editName.getText().toString(), editCountry.getText().toString(), hosts, lan.id);
             refreshLan();
-            Toast.makeText(this, "Multiplayer salvo", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, L.t("Multiplayer salvo"), Toast.LENGTH_SHORT).show();
             dlg.dismiss();
         }));
         dlg.show();
     }
 
-    private void showSettingsDialog() {
-        SharedPreferences prefs = getSharedPreferences("re5_settings", MODE_PRIVATE);
-        boolean touchEnabled = prefs.getBoolean("touch_enabled", true);
-        float touchOpacity = prefs.getFloat("touch_opacity", 0.85f);
-        float touchScale = prefs.getFloat("touch_scale", 1.0f);
-        float lookSens = prefs.getFloat("touch_look_sens", 1.0f);
-        boolean hidePad = prefs.getBoolean("touch_hide_with_pad", true);
-        boolean hudEnabled = prefs.getBoolean("hud_enabled", true);
+    private static final int REQUEST_SETTINGS = 1003;
 
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(dp(20), dp(16), dp(20), dp(16));
-        scroll.addView(col);
-
-        // --- 1. CONTROLES NA TELA ---
-        col.addView(cardTitle("🕹 Controles na tela", RED));
-        col.addView(text("Os botões levam as letras do controle (A, B, X, Y, LB, RT...), as mesmas que o jogo mostra "
-                + "nos avisos e nos QTEs.", 12, TEXT_DIM, false));
-        CheckBox checkTouch = new CheckBox(this);
-        checkTouch.setText("Mostrar os controles na tela");
-        checkTouch.setTextColor(TEXT);
-        checkTouch.setChecked(touchEnabled);
-        col.addView(checkTouch);
-
-        CheckBox checkHidePad = new CheckBox(this);
-        checkHidePad.setText("Esconder quando usar um controle físico (voltam ao tocar na tela)");
-        checkHidePad.setTextColor(TEXT);
-        checkHidePad.setChecked(hidePad);
-        col.addView(checkHidePad);
-
-        col.addView(dialogFieldLabel("Sensibilidade da câmera (arrastar à direita)"));
-        Spinner spinLook = new Spinner(this);
-        String[] looks = {"Baixa (60%)", "Média (80%)", "Normal (100%)", "Alta (130%)", "Muito alta (170%)"};
-        float[] lookVals = {0.6f, 0.8f, 1.0f, 1.3f, 1.7f};
-        spinLook.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, looks));
-        int lookIdx = 2;
-        for (int i = 0; i < lookVals.length; i++) if (Math.abs(lookSens - lookVals[i]) < 0.05f) lookIdx = i;
-        spinLook.setSelection(lookIdx);
-        col.addView(spinLook);
-
-        col.addView(dialogFieldLabel("Opacidade dos Botões"));
-        Spinner spinOpacity = new Spinner(this);
-        String[] opacities = {"50% (Sutil)", "75% (Médio)", "85% (Padrão)", "100% (Sólido)"};
-        float[] opVals = {0.50f, 0.75f, 0.85f, 1.0f};
-        ArrayAdapter<String> opAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, opacities);
-        spinOpacity.setAdapter(opAdapter);
-        int opIdx = 2;
-        if (Math.abs(touchOpacity - 0.5f) < 0.1f) opIdx = 0;
-        else if (Math.abs(touchOpacity - 0.75f) < 0.05f) opIdx = 1;
-        else if (Math.abs(touchOpacity - 1.0f) < 0.05f) opIdx = 3;
-        spinOpacity.setSelection(opIdx);
-        col.addView(spinOpacity);
-
-        col.addView(dialogFieldLabel("Tamanho dos Botões"));
-        Spinner spinScale = new Spinner(this);
-        String[] scales = {"Pequeno (85%)", "Normal (100%)", "Grande (115%)"};
-        float[] scVals = {0.85f, 1.0f, 1.15f};
-        ArrayAdapter<String> scAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, scales);
-        spinScale.setAdapter(scAdapter);
-        int scIdx = 1;
-        if (touchScale < 0.95f) scIdx = 0;
-        else if (touchScale > 1.05f) scIdx = 2;
-        spinScale.setSelection(scIdx);
-        col.addView(spinScale);
-
-        // Divisor
-        col.addView(dialogDivider());
-
-        // --- 3. TELEMETRIA / HUD ---
-        col.addView(cardTitle("📊 Monitor de Desempenho (HUD)", RED));
-        CheckBox checkHud = new CheckBox(this);
-        checkHud.setText("Exibir FPS, RAM, CPU e GPU na tela");
-        checkHud.setTextColor(TEXT);
-        checkHud.setChecked(hudEnabled);
-        col.addView(checkHud);
-        col.addView(text("Mostra contador de FPS em tempo real e consumo de recursos durante a partida.", 12, TEXT_DIM, false));
-
-        // Divisor
-        col.addView(dialogDivider());
-
-        // --- DESEMPENHO ---
-        col.addView(cardTitle("⚡ Desempenho", RED));
-        CheckBox checkParallel = new CheckBox(this);
-        checkParallel.setText("Modo paralelo (experimental)");
-        checkParallel.setTextColor(TEXT);
-        checkParallel.setChecked(prefs.getBoolean("parallel_mode", false));
-        col.addView(checkParallel);
-        col.addView(text("As threads do jogo rodam ao mesmo tempo, como no PC: som sem atraso, menos telas de "
-                + "carregamento e cerca do dobro de fps nas cenas pesadas. Experimental: a ordem de memória do "
-                + "processador do celular ainda não é igualada à do PC, então pode haver travamento ou erro raro. "
-                + "Se acontecer, desligue.", 12, TEXT_DIM, false));
-
-        // Divisor
-        col.addView(dialogDivider());
-
-        // --- 4. AVANÇADO: variáveis RE5_* (re5_env.txt, lido pelo runtime) ---
-        col.addView(cardTitle("🔧 Avançado (testes de desempenho)", RED));
-        col.addView(text("Uma variável por linha, ex.: RE5_FPS_LOG=1 ou RE5_CPUS=4. Vai para re5_env.txt na pasta do jogo "
-                + "(PLANO_MESTRE_OTIMIZACAO.md). Deixe vazio no uso normal.", 12, TEXT_DIM, false));
-        File envFile = new File(GameStorage.gameDir(this), "re5_env.txt");
-        EditText editEnv = dialogEditText(readTextFile(envFile));
-        editEnv.setHint("RE5_FPS_LOG=1");
-        editEnv.setSingleLine(false);
-        editEnv.setMinLines(3);
-        col.addView(editEnv);
-
+    /** Escolha de idioma; a tela é refeita no idioma novo. */
+    private void chooseLanguage() {
+        String[] names = new String[L.NAMES.length];
+        for (int i = 0; i < names.length; i++) names[i] = i < 2 ? L.t(L.NAMES[i]) : L.NAMES[i];
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Configurações")
-                .setView(scroll)
-                .setPositiveButton("Salvar", (d, w) -> {
-                    boolean newTouch = checkTouch.isChecked();
-                    float newOp = opVals[spinOpacity.getSelectedItemPosition()];
-                    float newSc = scVals[spinScale.getSelectedItemPosition()];
-                    boolean newHud = checkHud.isChecked();
-
-                    writeEnvFile(envFile, editEnv.getText().toString());
-
-                    prefs.edit()
-                            .putBoolean("touch_enabled", newTouch)
-                            .putFloat("touch_opacity", newOp)
-                            .putFloat("touch_scale", newSc)
-                            .putFloat("touch_look_sens", lookVals[spinLook.getSelectedItemPosition()])
-                            .putBoolean("touch_hide_with_pad", checkHidePad.isChecked())
-                            .putBoolean("parallel_mode", checkParallel.isChecked())
-                            .putBoolean("hud_enabled", newHud)
-                            .apply();
-
-                    Toast.makeText(this, "Configurações salvas com sucesso!", Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("Cancelar", null)
-                .show();
+                .setTitle(L.t("Idioma"))
+                .setSingleChoiceItems(names, L.savedIndex(this), (d, w) -> {
+                    L.save(this, w);
+                    d.dismiss();
+                    recreate();
+                }).show();
     }
 
-    private static String readTextFile(File f) {
-        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line).append('\n');
-            return sb.toString().trim();
-        } catch (java.io.IOException e) {
-            return "";
-        }
+    private void openSettings(int tab) {
+        startActivityForResult(SettingsActivity.open(this, tab), REQUEST_SETTINGS);
     }
 
-    private void writeEnvFile(File f, String text) {
-        String t = text.trim();
-        try {
-            if (t.isEmpty()) {
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
-                return;
-            }
-            try (java.io.FileWriter w = new java.io.FileWriter(f)) {
-                w.write(t + "\n");
-            }
-        } catch (java.io.IOException e) {
-            Toast.makeText(this, "Não consegui gravar re5_env.txt: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
+    /** Atalho da grade: ícone grande e nome. */
+    private View tile(String icon, String label, Runnable r) {
+        LinearLayout t = new LinearLayout(this);
+        t.setOrientation(LinearLayout.VERTICAL);
+        t.setGravity(Gravity.CENTER);
+        t.setBackground(flat(SURFACE_2, 14));
+        t.setClickable(true);
+        t.setForeground(getDrawable(android.R.drawable.list_selector_background));
+        TextView i = text(icon, 24, TEXT, false);
+        i.setGravity(Gravity.CENTER);
+        t.addView(i);
+        TextView l = text(label, 12, TEXT, true);
+        l.setGravity(Gravity.CENTER);
+        l.setPadding(0, dp(4), 0, 0);
+        t.addView(l);
+        t.setOnClickListener(v -> r.run());
+        return t;
     }
 
     private TextView dialogFieldLabel(String label) {

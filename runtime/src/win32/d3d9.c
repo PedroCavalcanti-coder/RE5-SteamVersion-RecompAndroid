@@ -970,6 +970,35 @@ static void d_SetVertexShaderConstantF(CPU *c)
     c->eax = (uint32_t)dev->lpVtbl->SetVertexShaderConstantF(dev, start, data, n);
 }
 
+uint64_t re5_frame_cap_next(uint64_t now, uint64_t prev, uint64_t period)
+{
+    if (!prev || now > prev + period) return now + period;
+    return prev + period;
+}
+
+/* Espera o prazo do quadro (RE5_FPS_CAP), com o lock do guest solto: dorme até ~1 ms antes e
+ * cede a CPU no resto. Bateria e calor no celular; o jogo segue em tempo variável. */
+static void frame_cap(void)
+{
+    static int64_t period = -1;
+    static uint64_t deadline;
+    if (period < 0) {
+        const char *e = getenv("RE5_FPS_CAP");
+        long fps = e ? strtol(e, NULL, 10) : 0;
+        period = fps > 0 && fps <= 1000 ? (int64_t)(1000000000LL / fps) : 0;
+        if (period) RE5_INFO("d3d9", "limite de FPS: %ld (RE5_FPS_CAP)", fps);
+    }
+    if (!period) return;
+    deadline = re5_frame_cap_next(re5_stat_now_ns(), deadline, (uint64_t)period);
+    for (;;) {
+        uint64_t now = re5_stat_now_ns();
+        if (now >= deadline) break;
+        uint64_t left = deadline - now;
+        if (left > 2000000u) SDL_Delay((Uint32)((left - 1000000u) / 1000000u));
+        else SDL_Delay(0);
+    }
+}
+
 static void d_Present(CPU *c)
 {
     IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
@@ -994,6 +1023,7 @@ static void d_Present(CPU *c)
             RE5_STAT_ADD(RE5_ST_PRESENT_NS, dt);
             if (re5_thunk_current()) ((re5_thunk *)re5_thunk_current())->ns += dt;
         }
+        frame_cap();
         RE5_BLOCKING_END();
     }
     if (++g_presents == 1) RE5_INFO("d3d9", "primeiro Present -> 0x%08X", (uint32_t)hr);

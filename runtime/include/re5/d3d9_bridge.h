@@ -49,6 +49,10 @@ void *re5_d3d9_host_object(uint32_t guest_obj);
 
 /* Diagnóstico: Present já feitos e objetos do guest vivos. */
 uint32_t re5_d3d9_present_count(void);
+/* Limite de FPS (RE5_FPS_CAP=<fps>; o launcher do Android o oferece): o próximo prazo de quadro a
+ * partir de `now`, do prazo anterior e do período. Atrasado mais de um período = recomeça de now
+ * (sem rajada de quadros para "recuperar"). */
+uint64_t re5_frame_cap_next(uint64_t now_ns, uint64_t prev_deadline_ns, uint64_t period_ns);
 uint32_t re5_d3d9_live_objects(void);
 
 #endif /* RE5_D3D9_BRIDGE_H */

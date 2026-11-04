@@ -3,6 +3,7 @@ package com.re5.recompiled;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
+import android.net.wifi.WifiManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -68,7 +69,13 @@ public class GameActivity extends SDLActivity {
     private final Handler hudHandler = new Handler(Looper.getMainLooper());
     private int lastPresents = 0;
     private long lastHudTime = 0;
-    private long lastTotalCpu = 0, lastProcCpu = 0;
+    private long lastProcCpuTicks = -1, lastCpuWallMs = 0;
+    private TextView hudMs;
+    private int hudItems;
+    // Multiplayer LAN: sem o MulticastLock o Wi-Fi do Android descarta broadcast UDP (a busca de
+    // sessão); sem o WifiLock de baixa latência a economia do rádio dá picos de ping.
+    private WifiManager.MulticastLock multicastLock;
+    private WifiManager.WifiLock wifiLock;
 
     private final Runnable hudRunnable = new Runnable() {
         @Override
@@ -98,6 +105,7 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        L.init(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (Build.VERSION.SDK_INT >= 27) {
             setShowWhenLocked(true);
@@ -130,18 +138,17 @@ public class GameActivity extends SDLActivity {
                 nativeSetenv("RE5_GUEST_LOCK", "hle");
             } catch (Throwable ignored) {}
         }
-        boolean touchEnabled = prefs.getBoolean("touch_enabled", true);
-        float touchOpacity = prefs.getFloat("touch_opacity", 0.85f);
-        float touchScale = prefs.getFloat("touch_scale", 1.0f);
+        // Vídeo (launcher, aba Gráficos): renderizador, limite de FPS, apresentação e quadros em voo.
+        setenvPref(prefs, "gfx_renderer", "RE5_GFX");
+        setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");
+        setenvPref(prefs, "gfx_present", "RE5VK_PRESENT");
+        setenvPref(prefs, "gfx_latency", "RE5VK_LATENCY");
         boolean hudEnabled = prefs.getBoolean("hud_enabled", true);
+        hudItems = prefs.getInt("hud_items", HudPrefs.DEFAULT_ITEMS);
 
         TouchControlsView touch = new TouchControlsView(this);
         touchView = touch;
-        touch.setControlsEnabled(touchEnabled);
-        touch.setControlsOpacity(touchOpacity);
-        touch.setControlsScale(touchScale);
-        touch.setLookSensitivity(prefs.getFloat("touch_look_sens", 1.0f));
-        touch.setHideWithPad(prefs.getBoolean("touch_hide_with_pad", true));
+        ControlsOptions.apply(this, touch);
         touch.setOnMenuToggleListener(this::toggleOverlay);
 
         overlay = buildOverlay();
@@ -154,7 +161,7 @@ public class GameActivity extends SDLActivity {
                 hudLayout = buildTelemetryHUD();
                 RelativeLayout.LayoutParams hudLp = new RelativeLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                hudLp.setMargins(dp(16), dp(10), 0, 0);
+                HudPrefs.place(hudLp, prefs.getInt("hud_pos", HudPrefs.POS_TOP_LEFT), dp(16), dp(10));
                 mLayout.addView(hudLayout, hudLp);
                 hudHandler.post(hudRunnable);
             }
@@ -165,6 +172,39 @@ public class GameActivity extends SDLActivity {
 
         startLogReader();
         watchInputDevices();
+        acquireNetworkLocks();
+    }
+
+    private void setenvPref(SharedPreferences prefs, String key, String env) {
+        String v = prefs.getString(key, "");
+        if (v == null || v.isEmpty()) return;
+        try {
+            nativeSetenv(env, v);
+        } catch (Throwable ignored) {}
+    }
+
+    private void acquireNetworkLocks() {
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            if (wm == null) return;
+            multicastLock = wm.createMulticastLock("re5-lan");
+            multicastLock.setReferenceCounted(false);
+            multicastLock.acquire();
+            int mode = Build.VERSION.SDK_INT >= 29 ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                                                   : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+            wifiLock = wm.createWifiLock(mode, "re5-lan");
+            wifiLock.setReferenceCounted(false);
+            wifiLock.acquire();
+        } catch (Throwable t) {
+            Log.w(TAG, "locks de Wi-Fi: " + t);
+        }
+    }
+
+    private void releaseNetworkLocks() {
+        try {
+            if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        } catch (Throwable ignored) {}
     }
 
     // ------------------------------------------------------------------ ciclo de vida
@@ -177,8 +217,8 @@ public class GameActivity extends SDLActivity {
     protected boolean shouldStartGame(Bundle savedInstanceState) {
         if (GameSession.claimLaunch(this, getIntent().getStringExtra("LAUNCH_ID"))) return true;
         Log.i(TAG, "activity recriada pelo sistema depois que o processo do jogo morreu: volta ao launcher");
-        android.widget.Toast.makeText(this, "O jogo foi fechado pelo Android em segundo plano. Toque em JOGAR "
-                + "para abrir de novo.", android.widget.Toast.LENGTH_LONG).show();
+        android.widget.Toast.makeText(this, L.t("O jogo foi fechado pelo Android em segundo plano. Toque em JOGAR ")
+                + L.t("para abrir de novo."), android.widget.Toast.LENGTH_LONG).show();
         Intent i = new Intent(this, LauncherActivity.class);
         i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         startActivity(i);
@@ -203,6 +243,7 @@ public class GameActivity extends SDLActivity {
     protected void onDestroy() {
         readingLog = false;
         hudHandler.removeCallbacks(hudRunnable);
+        releaseNetworkLocks();
         InputManager im = (InputManager) getSystemService(INPUT_SERVICE);
         if (im != null) im.unregisterInputDeviceListener(deviceListener);
         super.onDestroy();
@@ -263,7 +304,7 @@ public class GameActivity extends SDLActivity {
             already.append(kind).append(' ').append(d.getName());
         }
         // Mostrado quando a tela de carregamento sai (embaixo dela ninguém veria).
-        if (already.length() > 0) startupNotice = "Conectado: " + already;
+        if (already.length() > 0) startupNotice = L.t("Conectado: ") + already;
     }
 
     private void notice(String text) {
@@ -271,7 +312,8 @@ public class GameActivity extends SDLActivity {
         if (touchView != null) touchView.showNotice(text);
     }
 
-    /** Constrói a visualização do HUD de telemetria */
+    /** HUD de desempenho: FPS, ms por quadro, CPU do processo, GPU (uso e MHz) e RAM, conforme
+     *  os itens e a posição escolhidos no launcher (aba HUD). */
     private LinearLayout buildTelemetryHUD() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.HORIZONTAL);
@@ -279,24 +321,25 @@ public class GameActivity extends SDLActivity {
         card.setPadding(dp(10), dp(4), dp(10), dp(4));
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0x880B0F19);
+        bg.setColor(0x990B0F19);
         bg.setCornerRadius(dp(12));
         bg.setStroke(dp(1), 0x44FFFFFF);
         card.setBackground(bg);
 
-        hudFps = text("... FPS", 11, 0xFF4ADE80, true);
-        hudRam = text("... RAM", 11, 0xFF38BDF8, true);
-        hudCpu = text("... CPU", 11, 0xFFFBBF24, true);
-        hudGpu = text("Vulkan 1.3", 11, 0xFFE2E8F0, true);
-
-        card.addView(hudFps);
-        card.addView(hudDivider());
-        card.addView(hudRam);
-        card.addView(hudDivider());
-        card.addView(hudCpu);
-        card.addView(hudDivider());
-        card.addView(hudGpu);
-
+        hudFps = text(L.t("… FPS"), 11, 0xFF4ADE80, true);
+        hudMs = text(L.t("… ms"), 11, 0xFFE2E8F0, true);
+        hudCpu = text(L.t("… CPU"), 11, 0xFFFBBF24, true);
+        hudGpu = text(L.t("… GPU"), 11, 0xFFC084FC, true);
+        hudRam = text(L.t("… RAM"), 11, 0xFF38BDF8, true);
+        TextView[] all = {hudFps, hudMs, hudCpu, hudGpu, hudRam};
+        int[] bits = {HudPrefs.ITEM_FPS, HudPrefs.ITEM_MS, HudPrefs.ITEM_CPU, HudPrefs.ITEM_GPU, HudPrefs.ITEM_RAM};
+        boolean first = true;
+        for (int i = 0; i < all.length; i++) {
+            if ((hudItems & bits[i]) == 0) continue;
+            if (!first) card.addView(hudDivider());
+            card.addView(all[i]);
+            first = false;
+        }
         return card;
     }
 
@@ -310,36 +353,45 @@ public class GameActivity extends SDLActivity {
     }
 
     private void updateTelemetry() {
-        // 1. FPS via contador de Presents D3D9 da libre5.so
+        // FPS e ms pelo contador de Presents D3D9 da libre5.so (média da janela de 500 ms)
         int curPresents = 0;
         try { curPresents = SDLActivity.nativeGetPresents(); } catch (Throwable ignored) {}
         long now = SystemClock.uptimeMillis();
         if (lastHudTime > 0 && now > lastHudTime) {
             float dt = (now - lastHudTime) / 1000.0f;
-            int dp = curPresents - lastPresents;
-            float fps = dt > 0 ? (dp / dt) : 0f;
-            if (hudFps != null) {
-                hudFps.setText(String.format(Locale.US, "%.1f FPS", fps));
-                hudFps.setTextColor(fps >= 45f ? 0xFF4ADE80 : fps >= 25f ? 0xFFFBBF24 : 0xFFF87171);
-            }
+            int n = curPresents - lastPresents;
+            float fps = dt > 0 ? (n / dt) : 0f;
+            hudFps.setText(String.format(Locale.US, L.t("%.1f FPS"), fps));
+            hudFps.setTextColor(fps >= 45f ? 0xFF4ADE80 : fps >= 25f ? 0xFFFBBF24 : 0xFFF87171);
+            hudMs.setText(n > 0 ? String.format(Locale.US, L.t("%.1f ms"), 1000f * dt / n) : L.t("— ms"));
         }
         lastPresents = curPresents;
         lastHudTime = now;
 
-        // 2. RAM real em uso (VmRSS no /proc/self/status)
         long rssKb = readVmRssKb();
-        if (hudRam != null) {
-            if (rssKb >= 1024 * 1024) {
-                hudRam.setText(String.format(Locale.US, "%.2f GB", rssKb / (1024.0f * 1024.0f)));
-            } else {
-                hudRam.setText(String.format(Locale.US, "%d MB", rssKb / 1024));
-            }
-        }
+        hudRam.setText(rssKb >= 1024 * 1024 ? String.format(Locale.US, L.t("%.2f GB"), rssKb / (1024.0f * 1024.0f))
+                                            : String.format(Locale.US, L.t("%d MB"), rssKb / 1024));
 
-        // 3. CPU % do processo
-        float cpu = calculateCpuUsage();
-        if (hudCpu != null) {
-            hudCpu.setText(String.format(Locale.US, "%.0f%% CPU", cpu));
+        // CPU: tempo de CPU do processo / tempo real, em % de todos os núcleos (100% = todos cheios)
+        long ticks = HudPrefs.processCpuTicks();
+        long wall = SystemClock.elapsedRealtime();
+        if (ticks >= 0 && lastProcCpuTicks >= 0 && wall > lastCpuWallMs) {
+            float cpuMs = (ticks - lastProcCpuTicks) * 10f;   // 1 tick = 10 ms (USER_HZ 100)
+            int cores = Runtime.getRuntime().availableProcessors();
+            float pct = 100f * cpuMs / ((wall - lastCpuWallMs) * (float) cores);
+            hudCpu.setText(String.format(Locale.US, L.t("%.0f%% CPU"), Math.max(0f, Math.min(100f, pct))));
+        } else if (ticks < 0) {
+            hudCpu.setText(L.t("— CPU"));
+        }
+        lastProcCpuTicks = ticks;
+        lastCpuWallMs = wall;
+
+        int busy = HudPrefs.gpuBusy(), mhz = HudPrefs.gpuMhz();
+        if (busy >= 0) {
+            hudGpu.setText(mhz > 0 ? String.format(Locale.US, L.t("GPU %d%% · %d MHz"), busy, mhz)
+                                   : String.format(Locale.US, L.t("GPU %d%%"), busy));
+        } else {
+            hudGpu.setText(L.t("GPU —"));
         }
     }
 
@@ -354,33 +406,6 @@ public class GameActivity extends SDLActivity {
             }
         } catch (Exception ignored) {}
         return Runtime.getRuntime().totalMemory() / 1024;
-    }
-
-    private float calculateCpuUsage() {
-        try (BufferedReader rStat = new BufferedReader(new FileReader("/proc/stat"));
-             BufferedReader rProc = new BufferedReader(new FileReader("/proc/self/stat"))) {
-            String lStat = rStat.readLine();
-            String lProc = rProc.readLine();
-            if (lStat != null && lProc != null) {
-                String[] sTok = lStat.trim().split("\\s+");
-                long total = 0;
-                for (int i = 1; i < sTok.length && i < 8; i++) total += Long.parseLong(sTok[i]);
-
-                String[] pTok = lProc.trim().split("\\s+");
-                long proc = Long.parseLong(pTok[13]) + Long.parseLong(pTok[14]);
-
-                if (lastTotalCpu > 0 && total > lastTotalCpu) {
-                    float usage = (float) (proc - lastProcCpu) / (float) (total - lastTotalCpu) * 100.0f
-                            * Runtime.getRuntime().availableProcessors();
-                    lastTotalCpu = total;
-                    lastProcCpu = proc;
-                    return Math.max(0f, Math.min(100f, usage));
-                }
-                lastTotalCpu = total;
-                lastProcCpu = proc;
-            }
-        } catch (Exception ignored) {}
-        return 0f;
     }
 
     /** O re5dx9.clean.exe (despejo já desempacotado) vai no APK; copia para a pasta do jogo. */
@@ -464,6 +489,25 @@ public class GameActivity extends SDLActivity {
         overlay.animate().alpha(1f).setDuration(250);
     }
 
+    /** Editor do layout dos controles por cima do jogo (o jogo não recebe toque enquanto isso). */
+    private void editControls() {
+        hideOverlay();
+        if (touchView == null) return;
+        touchView.setEditorListener(new TouchControlsView.EditorListener() {
+            @Override
+            public void onEditorOptions() {
+                ControlsOptions.show(GameActivity.this, () -> ControlsOptions.apply(GameActivity.this, touchView));
+            }
+
+            @Override
+            public void onEditorClose(boolean saved) {
+                touchView.setEditMode(false);
+                if (saved) notice(L.t("Layout dos controles salvo"));
+            }
+        });
+        touchView.setEditMode(true);
+    }
+
     private void toggleOverlay() {
         if (overlay.getVisibility() == View.VISIBLE) hideOverlay();
         else showOverlay();
@@ -499,7 +543,7 @@ public class GameActivity extends SDLActivity {
         LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(dp(36), dp(36));
         sLp.setMargins(0, dp(18), 0, dp(12));
         left.addView(spin, sLp);
-        statusText = text("Carregando…", 13, TEXT_DIM, false);
+        statusText = text(L.t("Carregando…"), 13, TEXT_DIM, false);
         statusText.setMaxLines(3);
         left.addView(statusText);
 
@@ -507,8 +551,9 @@ public class GameActivity extends SDLActivity {
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42));
         bLp.setMargins(0, dp(20), dp(10), 0);
-        buttons.addView(button("Ocultar", 0xFF22252B, v -> hideOverlay()), bLp);
-        buttons.addView(button("Sair", RED, v -> quitGame()), bLp);
+        buttons.addView(button(L.t("Ocultar"), 0xFF22252B, v -> hideOverlay()), bLp);
+        buttons.addView(button(L.t("Controles"), 0xFF22252B, v -> editControls()), bLp);
+        buttons.addView(button(L.t("Sair"), RED, v -> quitGame()), bLp);
         left.addView(buttons);
         row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
 

@@ -84,9 +84,9 @@ public final class GameStorage {
     }
 
     public static String formatSize(long bytes) {
-        if (bytes >= 1L << 30) return String.format(Locale.getDefault(), "%.1f GB", bytes / (double) (1L << 30));
-        if (bytes >= 1L << 20) return String.format(Locale.getDefault(), "%.0f MB", bytes / (double) (1L << 20));
-        return String.format(Locale.getDefault(), "%d KB", Math.max(1, bytes >> 10));
+        if (bytes >= 1L << 30) return String.format(Locale.getDefault(), L.t("%.1f GB"), bytes / (double) (1L << 30));
+        if (bytes >= 1L << 20) return String.format(Locale.getDefault(), L.t("%.0f MB"), bytes / (double) (1L << 20));
+        return String.format(Locale.getDefault(), L.t("%d KB"), Math.max(1, bytes >> 10));
     }
 
     /**
@@ -109,14 +109,14 @@ public final class GameStorage {
             File out = new File(dst, rel);
             File parent = out.getParentFile();
             if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-                throw new IOException("não foi possível criar " + parent);
+                throw new IOException(L.t("não foi possível criar ") + parent);
             }
             long len = f.length();
             // renameTo só funciona no mesmo sistema de arquivos; /sdcard e a pasta do
             // app normalmente não são, e aí copia.
             if (!f.renameTo(out)) {
                 copyFile(f, out, buf);
-                if (!f.delete()) throw new IOException("não foi possível apagar " + f);
+                if (!f.delete()) throw new IOException(L.t("não foi possível apagar ") + f);
             }
             done += len;
             if (progress != null) progress.onProgress(rel, done, total);
@@ -149,8 +149,8 @@ public final class GameStorage {
             int r;
             while ((r = in.read(buf)) != -1) out.write(buf, 0, r);
         }
-        if (to.exists() && !to.delete()) throw new IOException("não foi possível substituir " + to);
-        if (!tmp.renameTo(to)) throw new IOException("não foi possível gravar " + to);
+        if (to.exists() && !to.delete()) throw new IOException(L.t("não foi possível substituir ") + to);
+        if (!tmp.renameTo(to)) throw new IOException(L.t("não foi possível gravar ") + to);
         to.setLastModified(from.lastModified());
     }
 }

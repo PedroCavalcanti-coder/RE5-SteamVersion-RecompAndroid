@@ -79,7 +79,7 @@ public class ArchiveExtractor {
         new Thread(() -> {
             try {
                 if (!targetDir.exists() && !targetDir.mkdirs()) {
-                    callback.onError("Não foi possível criar a pasta: " + targetDir.getAbsolutePath());
+                    callback.onError(L.t("Não foi possível criar a pasta: ") + targetDir.getAbsolutePath());
                     return;
                 }
 
@@ -101,7 +101,7 @@ public class ArchiveExtractor {
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Falha na extração", e);
-                callback.onError("Erro na descompactação: " + e.getMessage());
+                callback.onError(L.t("Erro na descompactação: ") + e.getMessage());
             }
         }).start();
     }
@@ -122,7 +122,7 @@ public class ArchiveExtractor {
                 try (InputStream in = context.getContentResolver().openInputStream(archiveUri);
                      FileOutputStream out = new FileOutputStream(tempRar)) {
                     if (in == null) {
-                        callback.onError("Não foi possível abrir o arquivo.");
+                        callback.onError(L.t("Não foi possível abrir o arquivo."));
                         return;
                     }
                     byte[] buf = new byte[BUFFER_SIZE];
@@ -131,12 +131,12 @@ public class ArchiveExtractor {
                     while ((r = in.read(buf)) != -1) {
                         if (isCancelled) {
                             if (tempRar.exists()) tempRar.delete();
-                            callback.onError("Cancelado.");
+                            callback.onError(L.t("Cancelado."));
                             return;
                         }
                         out.write(buf, 0, r);
                         copied += r;
-                        callback.onProgress("Copiando arquivo para extração...", copied / (1024 * 1024), -1);
+                        callback.onProgress(L.t("Copiando arquivo para extração..."), copied / (1024 * 1024), -1);
                     }
                 }
                 rarPath = tempRar.getAbsolutePath();
@@ -144,7 +144,7 @@ public class ArchiveExtractor {
         }
 
         if (rarPath == null) {
-            callback.onError("Arquivo .rar não encontrado.");
+            callback.onError(L.t("Arquivo .rar não encontrado."));
             return;
         }
 
@@ -169,7 +169,7 @@ public class ArchiveExtractor {
             while ((line = reader.readLine()) != null) {
                 if (isCancelled) {
                     unrarProcess.destroy();
-                    callback.onError("Extração cancelada pelo usuário.");
+                    callback.onError(L.t("Extração cancelada pelo usuário."));
                     return;
                 }
                 line = line.trim();
@@ -191,7 +191,7 @@ public class ArchiveExtractor {
             organizeExtractedFolder(targetDir);
             callback.onSuccess(fileCount, archiveSize);
         } else {
-            callback.onError("UnRAR falhou com código de saída: " + exitCode);
+            callback.onError(L.t("UnRAR falhou com código de saída: ") + exitCode);
         }
     }
 
@@ -212,7 +212,7 @@ public class ArchiveExtractor {
     private void extractZip(Context context, Uri archiveUri, File targetDir, Callback callback) throws Exception {
         InputStream rawInput = context.getContentResolver().openInputStream(archiveUri);
         if (rawInput == null) {
-            callback.onError("Não foi possível abrir o arquivo ZIP selecionado.");
+            callback.onError(L.t("Não foi possível abrir o arquivo ZIP selecionado."));
             return;
         }
 
@@ -224,7 +224,7 @@ public class ArchiveExtractor {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 if (isCancelled) {
-                    callback.onError("Extração cancelada pelo usuário.");
+                    callback.onError(L.t("Extração cancelada pelo usuário."));
                     return;
                 }
 
@@ -248,7 +248,7 @@ public class ArchiveExtractor {
                         int len;
                         while ((len = zis.read(buffer)) > 0) {
                             if (isCancelled) {
-                                callback.onError("Extração cancelada.");
+                                callback.onError(L.t("Extração cancelada."));
                                 return;
                             }
                             bos.write(buffer, 0, len);

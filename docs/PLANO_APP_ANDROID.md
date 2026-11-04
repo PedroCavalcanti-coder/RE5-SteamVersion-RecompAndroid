@@ -116,6 +116,31 @@ avisar, como no PC.
 Desenho: ImGui com o backend D3D9, desenhado no `Present` da ponte D3D9 (passa pela
 DXVK como o resto do quadro); o editor de layout é o mesmo overlay em modo edição.
 
+## 4b. Estado em 2026-11-04 (o que está no app)
+
+- **Toque** (`TouchControlsView`): ícones do usuário (`res/drawable-nodpi/ic_ctl_*`, recarregar
+  desenhado no mesmo estilo); posição e tamanho por controle (`re5_layout`); a arma do lado do
+  analógico e das setas. Correr, Mirar e Faca alternam (ligar um desliga os outros); a arma atira
+  mirando ou dá a facada com a faca pronta, e sem nenhum dos dois mira e atira enquanto segura;
+  recarregar mira, aperta A e volta. Câmera: deflexão total a ~0,45 dp/ms (antes 1), sensibilidade
+  de 50% a 400%, inverter Y. Inventário: o ícone liga o toque direto até ser tocado de novo. Menus:
+  toque direto ou botões (OK/Voltar), escolha do usuário. Vibração opcional.
+- **Editor de layout** desenhado na própria view (arrastar move, pinça redimensiona; Opções,
+  Restaurar, Salvar): `ControlsEditorActivity` no launcher e botão "Controles" no painel do jogo.
+- **Launcher**: grade de atalhos e `SettingsActivity` com abas (Gráficos, Controles, HUD,
+  Desempenho, Rede, Avançado). Gráficos grava o `config.ini` do jogo (`GameConfigIni`: resolução,
+  sombras, texturas, efeitos, iluminação, desfoque, `JobThread`) e variáveis do runtime
+  (`RE5_GFX`, `RE5_FPS_CAP`, `RE5VK_PRESENT`, `RE5VK_LATENCY`). FSR 1.0 e Turnip aparecem
+  desativados com o motivo (FSR: próxima versão, no re5vk; Turnip: só Adreno).
+- **HUD**: CPU do processo por `/proc/self/stat` (o `/proc/stat` é bloqueado desde o Android 8:
+  era o 0%), GPU por `/sys/kernel/gpu/gpu_busy` e `gpu_clock` (Exynos/Mali; Adreno por kgsl),
+  ms por quadro; itens e canto escolhidos no launcher.
+- **Multiplayer**: `MulticastLock` (sem ele o Wi-Fi descarta o broadcast da busca de sessão) e
+  `WifiLock` de baixa latência enquanto o jogo roda.
+- **Idiomas**: português, inglês, espanhol, chinês simplificado, russo e japonês (`L.t`, chave =
+  texto em português; traduções em `assets/i18n/*.json`, geradas por `scripts/android_i18n.py`);
+  🌐 na capa e em Configurações › Avançado; padrão = idioma do sistema (inglês se não houver).
+
 ## 5. Etapas
 
 | # | Etapa | Pronto quando |
