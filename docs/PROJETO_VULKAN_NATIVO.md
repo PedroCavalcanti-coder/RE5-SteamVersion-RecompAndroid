@@ -12,6 +12,18 @@ crítico") e precisa da medida da fase A0.
 
 ## 1. Decisão
 
+**Atualização (03/11, noite): a branch `re5vk-nativo` está sobre o master atual, com duas
+correções.**
+- **Imagens nascem zeradas** (`vk_res.c`), como na DXVK e no D3D9. Candidata do preto na cena
+  3D: sem o clear, um NaN de lixo num alvo FP16 da luminância do HDR não sai mais da adaptação
+  de exposição.
+- **Swapchain acompanha a janela** (`re5vk.c`): o Present refaz a swapchain quando o
+  `currentExtent` muda. Antes a imagem ficava 1280x720 no canto da tela cheia ou cortada na
+  janela (o driver AMD no Windows não devolve `OUT_OF_DATE`).
+- **Medida do usuário no PC** (benchmark variável, 1080p, 10 minutos entre as rodadas):
+  re5vk **93,0 fps** contra DXVK 89,4, os dois com a mesma oscilação de quadro; o re5vk com
+  menos uso de CPU.
+
 **Atualização (03/11): o backend está guardado na branch `re5vk-nativo`; o `master` volta à DXVK.**
 Na branch: tradutor SM3 -> SPIR-V (os 164 shaders do benchmark passam no `spirv-val`) e o device
 inteiro (`runtime/src/gfx/vk/`, `RE5_GFX=re5vk`). Resultado no A54 em 720p: ~16 fps, contra 15,4
