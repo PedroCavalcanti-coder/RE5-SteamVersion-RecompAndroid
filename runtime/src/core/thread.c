@@ -423,10 +423,13 @@ static void give_turn(void)
     re5_mutex_unlock(&g_lk);
 }
 
-void re5_guest_lock(void)
+void re5_guest_lock(void) { re5_guest_lock_as(t_self_get()); }
+
+/* t = re5_thread_current() (ou NULL numa thread do host sem re5_thread): o thunk já a tem e
+ * evita mais duas leituras de TLS em cada uma das ~1 milhão de chamadas D3D9 por segundo. */
+void re5_guest_lock_as(re5_thread *t)
 {
     ensure_init();
-    re5_thread *t = t_self_get();
     int *depth = depth_of(t);
     if (*depth > 0) {   /* reentrante: guest -> host -> guest */
         (*depth)++;
@@ -726,9 +729,11 @@ uint32_t re5_thread_resume(re5_thread *t)
     return prev;
 }
 
-void re5_guest_unlock(void)
+void re5_guest_unlock(void) { re5_guest_unlock_as(t_self_get()); }
+
+void re5_guest_unlock_as(re5_thread *t)
 {
-    int *depth = depth_of(t_self_get());
+    int *depth = depth_of(t);
     if (*depth <= 0) re5_fatal("thread", "re5_guest_unlock sem o lock do guest");
     if (--*depth == 0) {
         g_holder = NULL;

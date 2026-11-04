@@ -126,15 +126,28 @@ const re5_thunk *re5_thunk_get(uint32_t va)
 }
 
 uint32_t re5_thunk_count(void) { return g_next; }
-const re5_thunk *re5_thunk_current(void) { return t_current_get(); }
+const re5_thunk *re5_thunk_current(void)
+{
+    re5_thread *th = re5_thread_current();
+    return th ? (const re5_thunk *)th->cur_thunk : t_current_get();
+}
 
 void re5_thunk_invoke(CPU *c, uint32_t va)
 {
     const re5_thunk *t = re5_thunk_get(va);
     if (!t) re5_fatal("thunk", "dispatch para 0x%08X na faixa de thunks, mas nenhum thunk mora aí", va);
-    const re5_thunk *prev = t_current_get();
-    t_current_set(t);
+    /* O thunk corrente mora na re5_thread (o TLS só nas threads do host sem ela): uma leitura
+     * de TLS por chamada em vez de cinco (RE5_PROFILE, 2026-11-04: re5_thread_current 1,4% da
+     * thread de render). */
     re5_thread *th = re5_thread_current();
+    const re5_thunk *prev;
+    if (th) {
+        prev = th->cur_thunk;
+        th->cur_thunk = t;
+    } else {
+        prev = t_current_get();
+        t_current_set(t);
+    }
     const char *prev_name = th ? th->thunk : NULL;
     if (th) th->thunk = t->name;
     RE5_TRACE("thunk", "-> %s", t->name);
@@ -160,7 +173,7 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
         }
     }
     int lk = re5_guest_lock_mode_hle() && !(t->flags & (RE5_THUNK_NOLOCK | g_nolock_mask));
-    if (lk) re5_guest_lock();
+    if (lk) re5_guest_lock_as(th);
     uint64_t t0 = d3d9_timed ? re5_stat_now_ns() : 0;
     t->fn(c);
     if (d3d9_timed) {
@@ -168,8 +181,12 @@ void re5_thunk_invoke(CPU *c, uint32_t va)
         RE5_STAT_ADD(RE5_ST_D3D9_NS, dt);
         ((re5_thunk *)t)->ns += dt;   /* sem trava: ordem de grandeza, como calls */
     }
-    if (lk) re5_guest_unlock();
-    if (th) th->thunk = prev_name;
-    t_current_set(prev);
+    if (lk) re5_guest_unlock_as(th);
+    if (th) {
+        th->thunk = prev_name;
+        th->cur_thunk = prev;
+    } else {
+        t_current_set(prev);
+    }
     c->esp += 4u + t->arg_bytes;   /* ret N: endereço de retorno + argumentos stdcall */
 }

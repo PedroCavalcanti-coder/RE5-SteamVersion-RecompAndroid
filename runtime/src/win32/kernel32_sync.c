@@ -155,6 +155,7 @@ typedef struct {
     uint32_t count;
     uint32_t last_waiter;
     uint32_t last_owner;
+    uint32_t spin;           /* SpinCount que o jogo deu à seção */
 } k32_cs_contention;
 #define K32_CS_CONTEND_MAX 128
 static k32_cs_contention g_cs_contend[K32_CS_CONTEND_MAX];
@@ -194,6 +195,7 @@ static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner)
             g_cs_contend[h].count++;
             g_cs_contend[h].last_waiter = waiter;
             g_cs_contend[h].last_owner = owner;
+            g_cs_contend[h].spin = k32_r32(cs + CS_SPIN);
             break;
         }
     }
@@ -234,8 +236,8 @@ void re5_k32_cs_contend_report(void)
         if (!best) break;
         uint32_t cs = g_cs_contend[bi].cs;
         const char *nm = re5_name_lookup(cs);
-        RE5_INFO("profile", "    %7u bloqueios: CS 0x%08X (último dono tid 0x%X, garçom tid 0x%X)%s%s",
-                 best, cs, g_cs_contend[bi].last_owner, g_cs_contend[bi].last_waiter,
+        RE5_INFO("profile", "    %7u bloqueios: CS 0x%08X SpinCount %u (último dono tid 0x%X, garçom tid 0x%X)%s%s",
+                 best, cs, g_cs_contend[bi].spin & 0x00FFFFFFu, g_cs_contend[bi].last_owner, g_cs_contend[bi].last_waiter,
                  nm ? "  " : "", nm ? nm : "");
         g_cs_contend[bi].count = 0;
     }
@@ -347,6 +349,18 @@ static void cs_leave_global(CPU *c)
 #define CS_SPIN_DEFAULT 256u    /* seção sem SpinCount (InitializeCriticalSection) */
 #define CS_SPIN_MAX     4000u   /* o teto do heap do Windows */
 
+/* RE5_CS_SPIN=<n>: força o giro de toda seção (para o A/B; 0 = dorme direto). */
+static uint32_t cs_spin_override(uint32_t spin)
+{
+    static int64_t forced = -2;
+    if (forced == -2) {
+        const char *e = getenv("RE5_CS_SPIN");
+        forced = e && *e ? (int64_t)strtoul(e, NULL, 10) : -1;
+        if (forced >= 0) RE5_INFO("kernel32", "RE5_CS_SPIN=%lld: giro fixo nas seções críticas", (long long)forced);
+    }
+    return forced >= 0 ? (uint32_t)forced : spin;
+}
+
 static inline void cs_pause(void)
 {
 #if defined(__x86_64__) || defined(__i386__)
@@ -380,6 +394,7 @@ static void cs_enter_hle(CPU *c)
     uint32_t spin = k32_r32(cs + CS_SPIN) & 0x00FFFFFFu;   /* os bits altos são flags */
     if (!spin) spin = CS_SPIN_DEFAULT;
     if (spin > CS_SPIN_MAX) spin = CS_SPIN_MAX;
+    spin = cs_spin_override(spin);
     for (uint32_t i = 0; i < spin; i++) {
         cs_pause();
         if (!__atomic_load_n(own, __ATOMIC_RELAXED) && cs_hle_try(cs, tid)) return;

@@ -62,6 +62,7 @@ typedef struct re5_thread {
     int                  is_main;      /* thread principal do jogo (RE5_PROFILE_THREAD=main) */
     int                  host_tid;     /* Linux/Android: gettid() (RE5_FPS_LOG separa jogo de DXVK/driver) */
     /* Diagnóstico de seções críticas: */
+    const void          *cur_thunk;    /* re5_thunk em execução nesta thread (thunks.c) */
     volatile uint32_t    cs_waiting;   /* CS do guest que a thread está esperando agora */
     volatile uint32_t    cs_owner;     /* dono da CS no momento da espera */
 } re5_thread;
@@ -102,6 +103,9 @@ int re5_host_thread_start(void (*fn)(void *), void *arg, size_t stack_bytes);
 
 void re5_guest_lock(void);
 void re5_guest_unlock(void);
+/* O mesmo, com a thread que chama já em mãos (re5_thread_current(), ou NULL). */
+void re5_guest_lock_as(re5_thread *self);
+void re5_guest_unlock_as(re5_thread *self);
 /* Para handlers que bloqueiam: solta o lock (inteiro, mesmo reentrante) e o retoma. */
 int  re5_guest_lock_release_all(void);
 /* 1 se RE5_GUEST_LOCK=hle (o lock protege só o HLE; ver thread.c). */

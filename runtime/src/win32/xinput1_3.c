@@ -143,7 +143,18 @@ static void scan(void)
 static pad *pad_of(uint32_t i)
 {
     if (!sdl_ready()) return NULL;
-    SDL_GameControllerUpdate();
+    /* O jogo sonda os quatro usuários a cada quadro, com o lock do HLE na mão (a thread de render
+     * espera por ele), e cada SDL_GameControllerUpdate varre os dispositivos de entrada. Uma vez
+     * a cada 4 ms basta: no mesmo quadro as quatro sondas leem o mesmo estado, e 4 ms de atraso
+     * é menos que um quadro (RE5_PROFILE, 2026-11-04: XInputGetState 1,8% da thread principal). */
+    static uint32_t last_update;
+    static int updated;
+    uint32_t now = SDL_GetTicks();
+    if (!updated || now - last_update >= 4u) {
+        SDL_GameControllerUpdate();
+        last_update = now;
+        updated = 1;
+    }
     if ((!g_pads[i].gc && !g_pads[i].js) ||
         (g_pads[i].gc && !SDL_GameControllerGetAttached(g_pads[i].gc)) ||
         (g_pads[i].js && !SDL_JoystickGetAttached(g_pads[i].js))) {

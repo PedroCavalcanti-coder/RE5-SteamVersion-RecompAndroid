@@ -65,6 +65,8 @@ static int rd16le(const uint8_t *p) { return (int16_t)(p[0] | p[1] << 8); }
 
 int re5_touch_pad(uint8_t out[12])
 {
+    /* Sem controle de toque ligado (todo PC): nem o spinlock. */
+    if (!__atomic_load_n(&g_pad_on, __ATOMIC_ACQUIRE)) return 0;
     SDL_AtomicLock(&g_lock);
     int on = g_pad_on;
     uint32_t b = g_buttons;
