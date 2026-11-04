@@ -71,14 +71,20 @@ static slot_t *build(void)
     return t;
 }
 
-re5_lifted_fn re5_lookup(uint32_t va)
+static const slot_t *lookup_slot(uint32_t va)
 {
     slot_t *t = g_slots;
     if (!t) t = g_slots = build();   /* re5_runtime_init já montou, com uma thread só */
     for (uint32_t h = slot_of(va);; h = (h + 1) & g_mask) {
-        if (t[h].va == va && t[h].fn) return t[h].fn;
+        if (t[h].va == va && t[h].fn) return &t[h];
         if (!t[h].fn) return NULL;
     }
+}
+
+re5_lifted_fn re5_lookup(uint32_t va)
+{
+    const slot_t *s = lookup_slot(va);
+    return s ? s->fn : NULL;
 }
 
 void re5_dispatch_trail_print(void)
@@ -132,4 +138,26 @@ static inline void go(CPU *c, uint32_t va, const char *how)
 }
 
 void dispatch(CPU *c, uint32_t va) { go(c, va, "call/jmp"); }
+
+/* O cache guarda um ponteiro para o slot (uma palavra, lida e escrita atômica): a tabela não
+ * muda depois de montada, então o slot é sempre um par (va, fn) coerente. Dois statics
+ * separados (va, fn) deixariam outra thread ver o va novo com o fn velho. */
+void dispatch_ic(CPU *c, uint32_t va, const void **site)
+{
+    trail_t *tr = trail();
+    uint32_t n = ++tr->pos;
+    tr->va[(n - 1) % TRAIL] = va;
+    if ((n & 1023u) == 0) re5_guest_preempt();
+    if (re5_is_thunk(va)) {
+        re5_thunk_invoke(c, va);
+        return;
+    }
+    const slot_t *s = __atomic_load_n((const slot_t **)site, __ATOMIC_RELAXED);
+    if (__builtin_expect(!s || s->va != va, 0)) {
+        s = lookup_slot(va);
+        if (!s) unresolved(c, va, "call/jmp");
+        __atomic_store_n((const slot_t **)site, s, __ATOMIC_RELAXED);
+    }
+    s->fn(c);
+}
 void dispatch_jmp(CPU *c, uint32_t va) { go(c, va, "jmp indireto"); }

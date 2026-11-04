@@ -57,6 +57,11 @@ extern const uint32_t       re5_lifted_count;
 
 void dispatch(CPU *c, uint32_t va);
 void dispatch_jmp(CPU *c, uint32_t va);
+/* call indireto com cache no ponto de chamada (lift.call_site_cache): `site` é um static
+ * do próprio call, que guarda o slot da última função gerada chamada dali. Mesmo alvo da
+ * vez anterior = sem a busca na tabela. Trilha e preempção iguais às do dispatch. */
+void dispatch_ic(CPU *c, uint32_t va, const void **site);
+#define RE5_DISPATCH_IC(c, va) do { static const void *re5_ic_; dispatch_ic(c, va, &re5_ic_); } while (0)
 void re5_override(CPU *c, uint32_t va);
 void recomp_cpuid(CPU *c);
 void recomp_rdtsc(CPU *c);

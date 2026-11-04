@@ -196,6 +196,13 @@ O que mudou:
   de média (áreas 104,9 / 83,8 / 87,5 / 89,1), CPU ~25%. Não há medida do usuário no mesmo
   benchmark antes desta mudança; o `bench_re5.py` deu 93,1 de média (antes, a base sem perfil
   oscilou demais para comparar).
+- **Cache no ponto de chamada (2026-11-03, `lift.call_site_cache`, fase P2):** `RE5_PROFILE` pôs
+  ~1,3% das amostras em `re5_lookup` (tabela hash de 2 MB a cada call indireto). Os 60.300
+  `dispatch(c, _ct)` viram `RE5_DISPATCH_IC`: um static no próprio call guarda o slot da última
+  função gerada chamada dali (uma palavra; a tabela não muda depois de montada, então nunca há
+  par va/fn rasgado entre threads). Trilha e preempção iguais às do `dispatch` (o modo `global`
+  do Android reveza as threads por elas). Testes: `test_dispatch` (o mesmo call alternando entre
+  duas funções geradas e um thunk) e `test_run_lift_post`. `ctest` 30/30. Fps: pendente (A/B).
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
