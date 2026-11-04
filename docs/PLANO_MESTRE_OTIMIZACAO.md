@@ -576,15 +576,15 @@ Diferença abaixo de 2% é empate: a mudança só fica se simplificar o código.
 |:---:|---|---|---|---|:---:|:---:|:---:|
 | **0.1** Linha de base e tetos | PC + Android | — | — | — | — | baixo | [pendente] |
 | **0.2** Itens 1/2 (A/B, fechamento) | PC | 0.1 | — | ctest, unittest, relift | baixo | baixo | [pendente] |
-| **0.3** Perfil e contadores | PC + Android | 0.1 | — | ctest | — | médio | [pendente] |
+| **0.3** Perfil e contadores | PC + Android | 0.1 | — | ctest | — | médio | **[PC feito 03/11]** `RE5_PROFILE_THREAD` + "parada em" por handler; `perfil_vulkan.bat` |
 | **0.4** `-ffp-contract=off` | PC + Android | — | difftest no ARM64 | difftest_cpu (x86 e ARM64) | baixo | baixo | [pendente] |
-| **P1** D3D9 e heap fora do lock | PC (e Android, se A1) | 0.3 | espera no lock do HLE | test_d3d9, kernel32 com estresse | médio | médio | [pendente] |
-| **P2** Cache por ponto de chamada, `musttail` | PC + Android | 0.3 | dispatch no perfil | difftest_cpu, test_crash, laço entre funções | médio | médio | [pendente] |
+| **P1** D3D9 e heap fora do lock | PC (e Android, se A1) | 0.3 | espera no lock do HLE | test_d3d9, kernel32 com estresse | médio | médio | **[feito 03/11, outro caminho]** o D3D9 não disputa o lock: o custo era a aquisição; lock com CAS (espera 3,3-4,8% -> 0,8-1,5%), handles sem mutex na leitura |
+| **P2** Cache por ponto de chamada, `musttail` | PC + Android | 0.3 | dispatch no perfil | difftest_cpu, test_crash, laço entre funções | médio | médio | **[medido 03/11: empate]** `lift.call_site_cache` 89,4 x 90,1; desligado, código fica |
 | **P3** Flags restantes | PC + Android | 0.2 | contagem de escritas de flag | difftest_cpu, test_lifter_gaps | baixo | baixo | [pendente] |
 | **P4** PGO, ordenação, `-O2` quente | PC | 0.3 | iTLB/i-cache ou "espalhado" no perfil | ctest | baixo | médio | [pendente] |
 | **P5** *Overrides* verificados | PC + Android | 0.3 | função folha no topo do perfil | difftest_func ≥ 1000 entradas, snap_diff | médio | por função | [pendente] |
 | **P6** DXVK no PC | PC | 0.3 | fatia da DXVK, DXVK_HUD | — | baixo | baixo | [pendente] |
-| **P7** Threads e esperas | PC + Android | 0.3 | workers ociosos ou espera no perfil | test_lifter_gaps (laço de espera) | baixo | baixo | [pendente] |
+| **P7** Threads e esperas | PC + Android | 0.3 | workers ociosos ou espera no perfil | test_lifter_gaps (laço de espera) | baixo | baixo | **[parcial 03/11]** esperas sem thundering herd (+4,1%); `spin_pause` empatou (desligado). Falta: seção crítica disputada pela thread principal |
 | **A0** Variáveis, logcat, experimentos | Android | 0.1 | — | — | baixo | baixo | [pendente] |
 | **A1** Paralelismo (`hle-tso`) | Android | A0, 0.4 | ganho de `hle` no experimento da A0 | litmus no aparelho, laço de 1 h, trace_diff | **alto** | alto | [pendente] |
 | **A2** Núcleos, ADPF, térmica | Android | A0 | threads em núcleos pequenos | — | baixo | médio | [pendente] |

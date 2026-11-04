@@ -120,6 +120,11 @@ DXVK native 1.9.2b (`third_party/dxvk-native`) com o porte do NFSU2
 (`tools/nfsu2-reference/ports/dxvk_android`: recursos opcionais, DXT decodificado
 na CPU sem BC), já testado em Mali.
 
+Alternativa no mesmo ponto (03/11): `RE5_GFX=re5vk` troca só o **device** por um backend
+Vulkan próprio (`runtime/src/gfx/vk/`, tradutor SM3 -> SPIR-V incluído); o `IDirect3D9` da
+DXVK continua respondendo as consultas do adaptador, e a ponte COM acima não muda. Padrão:
+`dxvk`. Estado e medidas em `docs/PROJETO_VULKAN_NATIVO.md`.
+
 ### D5 — Threads 1:1 e lock global do guest (por enquanto)
 
 Cada thread do guest é uma thread do host com CPU, pilha e TEB próprios no espaço

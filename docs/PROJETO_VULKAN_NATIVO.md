@@ -12,17 +12,26 @@ crítico") e precisa da medida da fase A0.
 
 ## 1. Decisão
 
-**Atualização (03/11, noite): a branch `re5vk-nativo` está sobre o master atual, com duas
-correções.**
-- **Imagens nascem zeradas** (`vk_res.c`), como na DXVK e no D3D9. Candidata do preto na cena
-  3D: sem o clear, um NaN de lixo num alvo FP16 da luminância do HDR não sai mais da adaptação
-  de exposição.
+**Atualização (03/11, noite): o backend voltou ao `master` (merge `71bf1573`), atrás de
+`RE5_GFX=re5vk`; o padrão continua `dxvk`.** A branch `re5vk-nativo` foi mesclada e apagada.
+- **Preto na cena 3D: resolvido** (`vk_res.c`, usuário conferiu a cena normal). As imagens
+  nasciam com lixo de memória; um NaN num alvo FP16 da luminância do HDR não saía mais da
+  adaptação de exposição. Agora toda imagem não comprimida nasce zerada, como na DXVK e no D3D9.
 - **Swapchain acompanha a janela** (`re5vk.c`): o Present refaz a swapchain quando o
   `currentExtent` muda. Antes a imagem ficava 1280x720 no canto da tela cheia ou cortada na
   janela (o driver AMD no Windows não devolve `OUT_OF_DATE`).
-- **Medida do usuário no PC** (benchmark variável, 1080p, 10 minutos entre as rodadas):
-  re5vk **93,0 fps** contra DXVK 89,4, os dois com a mesma oscilação de quadro; o re5vk com
-  menos uso de CPU.
+- **Constantes por draw:** o tradutor registra até qual `c<n>` o shader lê (e se usa `i`/`b`);
+  o `prepare()` copia só isso, em vez dos bancos inteiros (~8 KB por draw).
+- **Medidas do usuário no PC (1080p):** benchmark variável, re5vk **93,0** contra DXVK 89,4;
+  benchmark fixo, re5vk **78** contra DXVK 68,9 a 74. O re5vk usa menos CPU. O jogo original
+  (D3D9 nativo) faz ~170 fps na área 1 do variável, contra 104,7 nosso.
+- **Onde o quadro vai (`RE5_PROFILE` por thread, `work/perf/re5vk_main.log` e
+  `re5vk_render.log`):** a thread principal e a de render (`g00457C60`, a que chama o D3D9) se
+  revezam, cada uma esperando a outra ~metade do tempo. Na render, 82% do que roda é handler
+  D3D9 (`DrawIndexedPrimitive` 34%), e 7% é código do jogo.
+- **Falta no re5vk:** `SetGammaRamp` (o brilho do jogo não tem efeito) e planos de recorte
+  (`D3DRS_CLIPPLANEENABLE`, como a DXVK no Mali). Por draw, ainda: 16 vertex buffers religados,
+  descritor novo a cada troca de textura e a chave de pipeline montada e procurada.
 
 **Atualização (03/11): o backend está guardado na branch `re5vk-nativo`; o `master` volta à DXVK.**
 Na branch: tradutor SM3 -> SPIR-V (os 164 shaders do benchmark passam no `spirv-val`) e o device
