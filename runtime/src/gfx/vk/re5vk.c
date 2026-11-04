@@ -1160,7 +1160,9 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
     if (!exts || !has_ext(exts, next, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
         re5_fatal("re5vk", "GPU '%s' sem VK_KHR_swapchain", d->props.deviceName);
     const char *zc_env = getenv("RE5VK_ZEROCOPY");
-    int want_zc = !(zc_env && *zc_env == '0') && has_ext(exts, next, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    /* Desligado por padrão: empate no A/B do usuário (93,5 x 93,9 fixo; 60,8 x 60,3 variável) e gasta
+     * espaço de endereço do guest. RE5VK_ZEROCOPY=1 liga. */
+    int want_zc = zc_env && *zc_env == '1' && has_ext(exts, next, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     free(exts);
 
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -1195,7 +1197,7 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
         d->zerocopy = d->get_host_ptr_props != NULL;
     }
     RE5_INFO("re5vk", "buffers dinâmicos na memória do guest (Unlock sem cópia): %s",
-             d->zerocopy ? "sim" : zc_env && *zc_env == '0' ? "não (RE5VK_ZEROCOPY=0)" : "não (sem VK_EXT_external_memory_host)");
+             d->zerocopy ? "sim" : !(zc_env && *zc_env == '1') ? "não (RE5VK_ZEROCOPY=1 liga)" : "não (sem VK_EXT_external_memory_host)");
 #define VK_LOAD_DEVICE(name)                                                                                       \
     if (!(name = (PFN_##name)vkGetDeviceProcAddr(d->dev, #name))) re5_fatal("re5vk", "sem %s", #name);
     VK_DEVICE_FNS(VK_LOAD_DEVICE)

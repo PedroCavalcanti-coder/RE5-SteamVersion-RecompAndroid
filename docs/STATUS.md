@@ -271,7 +271,9 @@ O que mudou:
     ponte vê que o ponteiro do host já está no guest e o entrega ao jogo, sem sombra e sem
     `memcpy`. Sem a extensão, com a importação recusada ou com `RE5VK_ZEROCOPY=0`, volta ao
     caminho anterior (o log diz qual). Teste em `test_d3d9` (o guest recebe o endereço do host;
-    sombra e memória antiga intocadas). Não vale para a DXVK. `ctest` 31/31. Fps: pendente.
+    sombra e memória antiga intocadas). Não vale para a DXVK. `ctest` 31/31. **A/B do usuário:
+    empate** (fixo 800x600: 93,5 com x 93,9 sem; variável Full HD: 60,8 x 60,3). Desligado por
+    padrão; `RE5VK_ZEROCOPY=1` liga.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
