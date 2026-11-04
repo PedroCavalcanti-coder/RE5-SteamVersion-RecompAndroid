@@ -256,6 +256,22 @@ O que mudou:
     (`DrawIndexedPrimitive` 32%). O perfil liga o `RE5_FPS_LOG`, que lê o relógio ~4 vezes por
     chamada D3D9; parte das amostras "paradas dentro de um método D3D9" é esse custo, que as
     rodadas normais não pagam.
+- **Depois do perfil de 04/11** (usuário: `RE5VK_PRESENT`/`RE5VK_LATENCY` não mudaram nada, então o
+  `Present` é espera legítima):
+  - **XInput** (`xinput1_3.c`, `touch.c`): `SDL_GameControllerUpdate` no máximo a cada 4 ms (o jogo
+    sonda os quatro usuários por quadro, com o lock do HLE na mão); toque desligado não pega o
+    spinlock.
+  - **Menos TLS por thunk** (`thunks.c`, `thread.c`): thunk corrente na `re5_thread` e
+    `re5_guest_lock_as(th)`; `re5_thread_current` era 1,4% da thread de render.
+  - **`RE5_CS_STATS`/`RE5_PROFILE` mostram o SpinCount** de cada seção disputada; `RE5_CS_SPIN=<n>`
+    força o giro para o A/B (as duas seções que sobraram são do heap; o endereço muda a cada
+    execução, então não dá para tratar por endereço).
+  - **`Unlock` sem cópia no re5vk** (`re5vk.c`, `vk_res.c`, `d3d9.c`): buffers `DYNAMIC` em
+    blocos de 16 MB da memória do guest importados pelo Vulkan (`VK_EXT_external_memory_host`); a
+    ponte vê que o ponteiro do host já está no guest e o entrega ao jogo, sem sombra e sem
+    `memcpy`. Sem a extensão, com a importação recusada ou com `RE5VK_ZEROCOPY=0`, volta ao
+    caminho anterior (o log diz qual). Teste em `test_d3d9` (o guest recebe o endereço do host;
+    sombra e memória antiga intocadas). Não vale para a DXVK. `ctest` 31/31. Fps: pendente.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.

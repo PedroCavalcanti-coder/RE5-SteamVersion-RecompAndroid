@@ -779,8 +779,24 @@ static void buffer_alloc(vk_device *d, vk_buffer *b)
         .size = b->size ? b->size : 4,
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
-    VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &b->buf));
     VkMemoryRequirements req;
+    /* DYNAMIC (travado a cada quadro): na memória do guest, e o Unlock da ponte não copia. Os
+     * estáticos ficam fora, para não gastar o espaço de 32 bits do guest com malhas. */
+    if (d->zerocopy && (b->usage & D3DUSAGE_DYNAMIC)) {
+        VkExternalMemoryBufferCreateInfo ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                                .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+        ci.pNext = &ext;
+        VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &b->buf));
+        vkGetBufferMemoryRequirements(d->dev, b->buf, &req);
+        b->mem = re5vk_mem_alloc_guest(d, req);
+        if (b->mem.mem) {
+            VK_CHECK(vkBindBufferMemory(d->dev, b->buf, b->mem.mem, b->mem.off));
+            return;
+        }
+        vkDestroyBuffer(d->dev, b->buf, NULL);   /* desligou: refaz pelo caminho comum */
+        ci.pNext = NULL;
+    }
+    VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &b->buf));
     vkGetBufferMemoryRequirements(d->dev, b->buf, &req);
     b->mem = re5vk_mem_alloc(d, req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
     VK_CHECK(vkBindBufferMemory(d->dev, b->buf, b->mem.mem, b->mem.off));

@@ -92,7 +92,7 @@ typedef struct {
     VkDeviceMemory mem;
     VkDeviceSize off, size;
     uint8_t *map;            /* NULL se não for host-visible */
-    int chunk;               /* -1: alocação dedicada */
+    int chunk;               /* -1: alocação dedicada; -2: dedicada na memória do guest */
     uint32_t type;
 } vk_alloc;
 
@@ -103,6 +103,7 @@ typedef struct {
     uint8_t *map;
     uint32_t type;
     VkDeviceSize (*free)[2];   /* faixas livres [off, size], ordenadas */
+    uint32_t guest_va;         /* bloco importado da memória do guest (0 = não) */
     int nfree, capfree;
 } vk_chunk;
 
@@ -304,6 +305,10 @@ struct vk_device {
     VkBuffer bound_vb[16];
     VkDeviceSize bound_vo[16], bound_vstride[16];
     int vb_valid;
+    /* Buffers DYNAMIC na memória do guest (VK_EXT_external_memory_host): o Lock devolve um
+     * endereço do guest e a ponte entrega ao jogo sem sombra nem cópia no Unlock. */
+    int zerocopy;
+    PFN_vkGetMemoryHostPointerPropertiesEXT get_host_ptr_props;
     VkBuffer bound_ib;
     VkIndexType bound_ibt;
     /* Pipeline do draw anterior: refeito só quando muda algo que entra nele (pipe_gen sobe em
@@ -343,6 +348,10 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
 HRESULT STDMETHODCALLTYPE re5vk_nyi(void *self);
 void re5vk_lock(vk_device *d);
 void re5vk_unlock(vk_device *d);
+/* Memória do guest importada como memória do device (VK_EXT_external_memory_host): `map` é um
+ * endereço do guest no espaço do host. mem = VK_NULL_HANDLE se não deu (o chamador volta ao
+ * caminho comum). */
+vk_alloc re5vk_mem_alloc_guest(vk_device *d, VkMemoryRequirements req);
 vk_alloc re5vk_mem_alloc(vk_device *d, VkMemoryRequirements req, VkMemoryPropertyFlags want, int host);
 void re5vk_mem_free(vk_device *d, vk_alloc *a);
 void re5vk_destroy_later(vk_device *d, int kind, uint64_t handle, vk_alloc mem);

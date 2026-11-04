@@ -23,6 +23,8 @@
 #include "vk_core.h"
 #include "re5/re5vk.h"
 #include "re5/thunks.h"
+#include "re5/guest_base.h"
+#include "re5/guest_memory.h"
 
 /* ---- carregador ---- */
 
@@ -326,9 +328,104 @@ vk_alloc re5vk_mem_alloc(vk_device *d, VkMemoryRequirements req, VkMemoryPropert
     return a;
 }
 
+#define GUEST_CHUNK ((VkDeviceSize)16 << 20)
+
+/* Importa [va, va+size) do guest; mem = VK_NULL_HANDLE se o driver recusar. */
+static VkDeviceMemory import_guest(vk_device *d, uint32_t va, VkDeviceSize size, uint32_t bits, uint32_t *type)
+{
+    void *p = re5_g2h(va);
+    VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (d->get_host_ptr_props(d->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p, &hp) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    int t = mem_type(d, bits & hp.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (t < 0) return VK_NULL_HANDLE;
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                            .pHostPointer = p};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = size,
+                               .memoryTypeIndex = (uint32_t)t};
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    if (vkAllocateMemory(d->dev, &ai, NULL, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+    *type = (uint32_t)t;
+    return m;
+}
+
+static void zerocopy_off(vk_device *d, const char *why)
+{
+    RE5_WARN("re5vk", "buffers dinâmicos sem a memória do guest (%s): o Unlock volta a copiar", why);
+    d->zerocopy = 0;
+}
+
+vk_alloc re5vk_mem_alloc_guest(vk_device *d, VkMemoryRequirements req)
+{
+    vk_alloc a = {0};
+    if (!d->zerocopy) return a;
+    VkDeviceSize align = req.alignment > 65536 ? req.alignment : 65536;
+    if (req.size > GUEST_CHUNK / 2) {   /* grande: bloco próprio */
+        VkDeviceSize size = (req.size + align - 1) / align * align;
+        uint32_t va = re5_mem_alloc((uint32_t)size, RE5_PAGE_READWRITE, "re5vk-buffer");
+        if (!va) { zerocopy_off(d, "sem espaço no guest"); return a; }
+        uint32_t t;
+        a.mem = import_guest(d, va, size, req.memoryTypeBits, &t);
+        if (!a.mem) { re5_mem_free(va); zerocopy_off(d, "importação recusada"); return a; }
+        a.size = size;
+        a.map = re5_g2h(va);
+        a.chunk = -2;
+        a.type = t;
+        return a;
+    }
+    for (int i = 0; i < d->nchunks; i++) {
+        vk_chunk *c = &d->chunks[i];
+        if (!c->guest_va || !(req.memoryTypeBits >> (c->type & 0xFFu) & 1u)) continue;
+        VkDeviceSize off;
+        if (chunk_take(c, req.size, req.alignment ? req.alignment : 1, &off) == 0) {
+            a.mem = c->mem;
+            a.off = off;
+            a.size = req.size;
+            a.map = c->map + off;
+            a.chunk = i;
+            a.type = c->type & 0xFFu;
+            return a;
+        }
+    }
+    if (d->nchunks >= VK_MAX_CHUNKS) { zerocopy_off(d, "blocos esgotados"); return a; }
+    uint32_t va = re5_mem_alloc((uint32_t)GUEST_CHUNK, RE5_PAGE_READWRITE, "re5vk-buffers");
+    if (!va) { zerocopy_off(d, "sem espaço no guest"); return a; }
+    uint32_t t;
+    VkDeviceMemory m = import_guest(d, va, GUEST_CHUNK, req.memoryTypeBits, &t);
+    if (!m) { re5_mem_free(va); zerocopy_off(d, "importação recusada"); return a; }
+    vk_chunk *c = &d->chunks[d->nchunks];
+    memset(c, 0, sizeof *c);
+    c->size = GUEST_CHUNK;
+    c->type = t | 0x200u;
+    c->mem = m;
+    c->map = re5_g2h(va);
+    c->guest_va = va;
+    chunk_free_insert(c, 0, c->size);
+    int idx = d->nchunks++;
+    VkDeviceSize off;
+    if (chunk_take(c, req.size, req.alignment ? req.alignment : 1, &off) != 0) {
+        zerocopy_off(d, "não coube no bloco");
+        return (vk_alloc){0};
+    }
+    a.mem = m;
+    a.off = off;
+    a.size = req.size;
+    a.map = c->map + off;
+    a.chunk = idx;
+    a.type = t;
+    return a;
+}
+
 void re5vk_mem_free(vk_device *d, vk_alloc *a)
 {
     if (!a->mem) return;
+    if (a->chunk == -2) {
+        vkFreeMemory(d->dev, a->mem, NULL);
+        re5_mem_free(re5_h2g(a->map));
+        memset(a, 0, sizeof *a);
+        return;
+    }
     if (a->chunk < 0) vkFreeMemory(d->dev, a->mem, NULL);
     else chunk_free_insert(&d->chunks[a->chunk], a->off, a->size);
     memset(a, 0, sizeof *a);
@@ -1062,6 +1159,8 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
     if (exts) vkEnumerateDeviceExtensionProperties(d->phys, NULL, &next, exts);
     if (!exts || !has_ext(exts, next, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
         re5_fatal("re5vk", "GPU '%s' sem VK_KHR_swapchain", d->props.deviceName);
+    const char *zc_env = getenv("RE5VK_ZEROCOPY");
+    int want_zc = !(zc_env && *zc_env == '0') && has_ext(exts, next, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     free(exts);
 
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -1085,10 +1184,18 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = d->qfam,
                                    .queueCount = 1, .pQueuePriorities = &prio};
-    const char *dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char *dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &e2, .queueCreateInfoCount = 1,
-                              .pQueueCreateInfos = &qci, .enabledExtensionCount = 1, .ppEnabledExtensionNames = dexts};
+                              .pQueueCreateInfos = &qci, .enabledExtensionCount = want_zc ? 2u : 1u,
+                              .ppEnabledExtensionNames = dexts};
     VK_CHECK(vkCreateDevice(d->phys, &dci, NULL, &d->dev));
+    if (want_zc) {
+        d->get_host_ptr_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(d->dev,
+                                                                                     "vkGetMemoryHostPointerPropertiesEXT");
+        d->zerocopy = d->get_host_ptr_props != NULL;
+    }
+    RE5_INFO("re5vk", "buffers dinâmicos na memória do guest (Unlock sem cópia): %s",
+             d->zerocopy ? "sim" : zc_env && *zc_env == '0' ? "não (RE5VK_ZEROCOPY=0)" : "não (sem VK_EXT_external_memory_host)");
 #define VK_LOAD_DEVICE(name)                                                                                       \
     if (!(name = (PFN_##name)vkGetDeviceProcAddr(d->dev, #name))) re5_fatal("re5vk", "sem %s", #name);
     VK_DEVICE_FNS(VK_LOAD_DEVICE)

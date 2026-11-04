@@ -274,10 +274,12 @@ static HRESULT STDMETHODCALLTYPE vb_GetDesc(IDirect3DVertexBuffer9 *This, D3DVER
     return D3D_OK;
 }
 
+static uint8_t *g_vb_direct;   /* host que guarda o buffer na memória do guest (re5vk) */
+
 static HRESULT STDMETHODCALLTYPE vb_Lock(IDirect3DVertexBuffer9 *This, UINT off, UINT size, void **p, DWORD f)
 {
     g_vb.locks++;
-    *p = g_vb.mem + off;
+    *p = (g_vb_direct ? g_vb_direct : g_vb.mem) + off;
     return D3D_OK;
 }
 
@@ -581,6 +583,21 @@ int main(void)
     CHECK_EQ_U32(g_vb.mem[80], 0xAB);
     CHECK_EQ_U32(g_vb.locks, 2);
     CHECK_EQ_U32(g_vb.unlocks, 2);
+
+    /* Host com o buffer na memória do guest (re5vk, VK_EXT_external_memory_host): o guest recebe
+     * esse endereço, sem sombra e sem cópia no Unlock. */
+    uint32_t direct = gbuf(256);
+    g_vb_direct = re5_g2h(direct);
+    const uint32_t lk3[4] = {32, 64, pdata, 0};
+    CHECK_EQ_U32(vcall(vb, 11, 4, lk3), D3D_OK);
+    CHECK_EQ_U32(rd32(pdata), direct + 32);
+    memset(re5_g2h(direct + 32), 0x11, 64);
+    CHECK_EQ_U32(vcall(vb, 12, 0, NULL), D3D_OK);
+    CHECK_EQ_U32(rd8(data + 32), 0xAB);          /* a sombra não foi usada */
+    CHECK_EQ_U32(g_vb.mem[32], 0xAB);           /* nem copiada para a memória antiga */
+    CHECK_EQ_U32(rd8(direct + 95), 0x11);
+    CHECK_EQ_U32(g_vb.unlocks, 3);
+    g_vb_direct = NULL;
 
     /* Textura: bloco por trava, com o pitch do host, cheio do conteúdo do host. */
     for (uint32_t i = 0; i < sizeof g_tex.mem; i++) g_tex.mem[i] = (uint8_t)i;

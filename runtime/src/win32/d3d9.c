@@ -29,6 +29,7 @@
 #include <SDL2/SDL.h>
 
 #include "re5/coldebug.h"
+#include "re5/guest_base.h"
 #include "re5/lan_menu.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/stats.h"
@@ -79,6 +80,7 @@ typedef struct {
     uint32_t pitch, row_bytes, rows, flags;
     uint32_t slices, slice_pitch;   /* volumes: fatias de `rows` linhas; o resto: 1 */
     int      owned;      /* 1: bloco só desta trava (texturas); 0: dentro da sombra do buffer */
+    int      direct;     /* o host deu memória do próprio guest: nada a copiar no Unlock */
     /* Fallback DXT -> RGBA8 */
     uint32_t dxt_orig_format, dxt_fallback_fmt;
     uint32_t dxt_region_w, dxt_region_h;
@@ -1043,7 +1045,7 @@ static void lock_finish(d9_obj *o, int idx)
 {
     d9_lock l = o->locks[idx];   /* a trava sai da lista antes da cópia, que roda sem o lock */
     o->locks[idx] = o->locks[--o->nlocks];
-    if (!(l.flags & D3DLOCK_READONLY)) {
+    if (!(l.flags & D3DLOCK_READONLY) && !l.direct) {
         /* Sem o lock do HLE: a cópia de um buffer dinâmico de MBs com ele na mão
          * era 22% das esperas das outras threads no carregamento (RE5_PROFILE).
          * O recurso continua travado no host até o Unlock de quem chamou. */
@@ -1122,6 +1124,22 @@ static void b_Lock(CPU *c)
     if (off > total || size > total - off)
         re5_fatal("d3d9", "%s::Lock(%u, %u) fora do buffer de %u bytes, e o host aceitou", kind_name(o->kind), off,
                   re5_arg(c, 2), total);
+    /* O backend re5vk guarda os buffers dinâmicos na memória do guest (importada pelo Vulkan): o
+     * ponteiro do host já é um endereço do guest, que o jogo recebe direto - sem sombra e sem a
+     * cópia no Unlock (19% das esperas da thread principal no perfil de 04/11). */
+    uintptr_t hpv = (uintptr_t)hp;
+    if (hp && hpv >= re5_guest_base && hpv - re5_guest_base + (uint64_t)size <= 0x100000000ull) {
+        d9_lock *l = lock_push(o);
+        l->guest = re5_h2g(hp);
+        l->host = hp;
+        l->pitch = l->row_bytes = size;
+        l->rows = 1;
+        l->flags = flags;
+        l->direct = 1;
+        wr32(pp, l->guest);
+        c->eax = (uint32_t)hr;
+        return;
+    }
     if (!o->shadow) {
         o->shadow = k32_heap_alloc(heap(), HEAP_ZERO_MEMORY, total ? total : 1);
         if (!o->shadow) re5_fatal("d3d9", "sem memória do guest para a sombra de um buffer de %u bytes", total);
