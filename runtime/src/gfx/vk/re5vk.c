@@ -811,6 +811,23 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
     vk_device *d = (vk_device *)self;
     re5vk_lock(d);
     re5vk_end_rendering(d);
+    /* A janela mudou de tamanho (tela cheia, Reset, arrastar): a swapchain acompanha, como na DXVK.
+     * Antes ela só era refeita com OUT_OF_DATE, que o driver AMD no Windows não devolve: a imagem
+     * ficava com o tamanho da janela da criação (1280x720), no canto da tela cheia ou cortada na
+     * janela menor. O blit abaixo escala o back buffer para o tamanho novo. */
+    VkSurfaceCapabilitiesKHR caps;
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(d->phys, d->surface, &caps) == VK_SUCCESS &&
+        caps.currentExtent.width != 0xFFFFFFFFu) {
+        if (!caps.currentExtent.width || !caps.currentExtent.height) {   /* minimizada: nada a apresentar */
+            re5vk_unlock(d);
+            return D3D_OK;
+        }
+        if (caps.currentExtent.width != d->swap_extent.width || caps.currentExtent.height != d->swap_extent.height) {
+            re5vk_flush(d, 1);
+            vkDeviceWaitIdle(d->dev);
+            swapchain_create(d);
+        }
+    }
     VkCommandBuffer cb = re5vk_cmd(d);
     VkSemaphore acq = d->acquired[d->cur];
     uint32_t idx = 0;
