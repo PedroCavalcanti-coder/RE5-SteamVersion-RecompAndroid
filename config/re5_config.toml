@@ -57,8 +57,9 @@ tail_calls = false
 # (2026-11-03, benchmark variável 1080p, 47 laços com a pausa): 90,1 sem / 89,2 com - empate, desligado.
 spin_pause = false
 # call indireto (vtable/ponteiro) com cache no ponto de chamada (fase P2, dispatch_ic): mesmo
-# alvo da vez anterior = sem a busca na tabela hash. Trilha e preempção iguais. A/B pendente.
-call_site_cache = true
+# alvo da vez anterior = sem a busca na tabela hash. Trilha e preempção iguais. A/B do usuário
+# (2026-11-03, benchmark variável 1080p): 89,4 com contra 90,1 sem - empate, desligado.
+call_site_cache = false
 # call/jmp/ret de função do jogo (abaixo de flags_dead_at_ret_below) deixam de gravar cf..of na CPU:
 # quem retorna e quem é chamado nunca as lê (mesma premissa da análise de flags no ret).
 elide_flag_stores = true

@@ -202,7 +202,8 @@ O que mudou:
   função gerada chamada dali (uma palavra; a tabela não muda depois de montada, então nunca há
   par va/fn rasgado entre threads). Trilha e preempção iguais às do `dispatch` (o modo `global`
   do Android reveza as threads por elas). Testes: `test_dispatch` (o mesmo call alternando entre
-  duas funções geradas e um thunk) e `test_run_lift_post`. `ctest` 30/30. Fps: pendente (A/B).
+  duas funções geradas e um thunk) e `test_run_lift_post`. `ctest` 30/30. A/B do usuário (mesmo
+  benchmark): 89,4 com contra 90,1 sem - empate; fica desligado (o código fica, atrás da chave).
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
