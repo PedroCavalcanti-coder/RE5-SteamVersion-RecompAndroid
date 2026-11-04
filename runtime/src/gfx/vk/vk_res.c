@@ -156,8 +156,28 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
         .subresourceRange = {aspect_of(fmt, 0), 0, levels, 0, layers},
     };
     re5vk_end_rendering(d);
-    vkCmdPipelineBarrier(re5vk_cmd(d), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
+    VkCommandBuffer cb = re5vk_cmd(d);
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
                          0, NULL, 1, &b);
+    /* Conteúdo inicial zerado, como a DXVK e os drivers D3D9 entregam. Sem isto a imagem nasce
+     * com o que havia na memória: num alvo FP16 da cadeia de luminância do HDR, um NaN de lixo
+     * entra na adaptação de exposição (que mistura o quadro anterior) e nunca mais sai - a cena
+     * 3D fica preta enquanto menus e vídeo, que desenham direto no back buffer, saem certos.
+     * Formato comprimido (BC) não aceita clear; ele sempre chega pelo upload. */
+    if (fmt->bw == 1 && fmt->bh == 1) {
+        VkImageSubresourceRange all = {aspect_of(fmt, 0), 0, levels, 0, layers};
+        if (fmt->depth) {
+            VkClearDepthStencilValue z = {0.0f, 0};
+            vkCmdClearDepthStencilImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+        } else {
+            VkClearColorValue z = {{0.0f, 0.0f, 0.0f, 0.0f}};
+            vkCmdClearColorImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+        }
+        VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL,
+                             0, NULL);
+    }
     return 0;
 }
 
