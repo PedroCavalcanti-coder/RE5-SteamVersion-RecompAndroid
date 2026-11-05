@@ -215,8 +215,10 @@ public final class SettingsActivity extends Activity {
         switchPref(L.t("Modo paralelo (experimental)"), L.t("As threads do jogo rodam ao mesmo tempo, como no PC: som sem atraso e ")
                 + L.t("mais FPS nas cenas pesadas. Se travar ou der erro, desligue."), "parallel_mode", false);
         String jt = ini.get("CPU", "JobThread", "2");
+        String[] jobVals = {"1", "2", "3", "4", "5", "6", "7", "8"};
+        String[] jobNames = {"1", "2", "3", "4", "5", "6", "7", "8 (" + L.t("todos") + ")"};
         choiceIni(L.t("Threads de trabalho do jogo"), L.t("Workers do motor do jogo (física, animação, efeitos)."),
-                new String[]{"1", "2", "3", "4", "6"}, new String[]{"1", "2", "3", "4", "6"}, "CPU", "JobThread", jt);
+                jobNames, jobVals, "CPU", "JobThread", jt);
     }
 
     private void buildNet() {

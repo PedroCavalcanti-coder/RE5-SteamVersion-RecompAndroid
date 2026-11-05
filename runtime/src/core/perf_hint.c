@@ -32,9 +32,11 @@ uint64_t re5_perf_big_mask(const char *sysroot)
         if (freq[i] < lo) lo = freq[i];
     }
     if (!hi || hi == lo) return 0;   /* todos iguais: nada a separar */
+    /* Todos acima do cluster mais lento: num Snapdragon 1+3+4 o Prime sozinho poria a thread
+     * principal e a de render no mesmo núcleo; Prime + médios dão espaço às duas. */
     uint64_t m = 0;
     for (int i = 0; i < n; i++)
-        if (freq[i] == hi) m |= 1ull << i;
+        if (freq[i] > lo) m |= 1ull << i;
     return m;
 }
 

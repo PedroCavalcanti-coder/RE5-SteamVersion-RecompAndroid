@@ -43,10 +43,10 @@ int main(void)
     fake_cpus("perf_sys_a54", a54, 8);
     CHECK(re5_perf_big_mask("perf_sys_a54") == 0xF0u);
 
-    /* 1 + 3 + 4 (Snapdragon com Prime): só o de maior frequência máxima. */
+    /* 1 + 3 + 4 (Snapdragon com Prime): Prime e médios (fora do cluster lento). */
     const unsigned long sd[8] = {1800000, 1800000, 1800000, 1800000, 2500000, 2500000, 2500000, 3200000};
     fake_cpus("perf_sys_sd", sd, 8);
-    CHECK(re5_perf_big_mask("perf_sys_sd") == 0x80u);
+    CHECK(re5_perf_big_mask("perf_sys_sd") == 0xF0u);
 
     /* Todos iguais (PC, emulador): nada a separar. */
     const unsigned long eq[4] = {3000000, 3000000, 3000000, 3000000};

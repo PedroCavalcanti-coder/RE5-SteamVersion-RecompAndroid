@@ -138,6 +138,10 @@ public class GameActivity extends SDLActivity {
                 nativeSetenv("RE5_GUEST_LOCK", "hle");
             } catch (Throwable ignored) {}
         }
+        // Workers (JobThread do config.ini, aba Desempenho): o próprio jogo lê. No modo paralelo o
+        // GetSystemInfo já anuncia todos os núcleos do aparelho (kernel32_env.c), então JobThread=8
+        // vale direto; repassá-lo como RE5_CPUS só reduziria os núcleos vistos (o padrão é 2). Sem o
+        // modo paralelo o jogo vê 2 de propósito: as threads se revezam num lock só.
         // Vídeo (launcher, aba Gráficos): renderizador, limite de FPS, apresentação e quadros em voo.
         setenvPref(prefs, "gfx_renderer", "RE5_GFX");
         setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");

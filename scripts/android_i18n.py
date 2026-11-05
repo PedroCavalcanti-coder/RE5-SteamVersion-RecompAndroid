@@ -424,6 +424,7 @@ T = {
     "Ваше имя в кооперативе по локальной сети. Действует при следующем запуске игры.",
     "LAN 協力プレイでの名前。次にゲームを開いたときに反映されます。"),
 "PRONTO": ("READY", "LISTO", "就绪", "ГОТОВО", "準備完了"),
+"todos": ("all", "todos", "全部", "все", "すべて"),
 "TRABALHANDO…": ("WORKING…", "TRABAJANDO…", "处理中…", "ВЫПОЛНЯЕТСЯ…", "処理中…"),
 "Tamanho": ("Size", "Tamaño", "大小", "Размер", "サイズ"),
 "Tamanho de todos os botões": ("Size of all buttons", "Tamaño de todos los botones", "所有按钮大小", "Размер всех кнопок",
