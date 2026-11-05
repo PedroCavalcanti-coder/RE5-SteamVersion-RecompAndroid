@@ -199,7 +199,12 @@ public final class LauncherActivity extends Activity {
         Intent intent = new Intent(this, GameActivity.class);
         intent.putExtra("GAME_DIR", dir.getAbsolutePath());
         intent.putExtra("LAUNCH_ID", Long.toString(System.currentTimeMillis()) + "-" + System.nanoTime());
-        startActivity(intent);
+        // O jogo abre na mesma tela do launcher (ex.: a tela externa do Z Flip, aberta por um
+        // mod/MultiStar): sem isso o Android manda a activity nova para a tela principal.
+        android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
+        if (getDisplay() != null) opts.setLaunchDisplayId(getDisplay().getDisplayId());
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent, opts.toBundle());
     }
 
     private void reportLastRun(String since) {
