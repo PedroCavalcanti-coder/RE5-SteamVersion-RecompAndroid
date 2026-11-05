@@ -18,6 +18,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:requestLegacyExternalStorage="true"
         android:allowBackup="false"
+        android:appCategory="game"
+        android:isGame="true"
         android:supportsRtl="true">
 
         <activity

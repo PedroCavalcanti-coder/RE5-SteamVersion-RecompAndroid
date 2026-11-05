@@ -88,6 +88,7 @@ add_library(re5_runtime STATIC
     src/core/dispatch.c
     src/core/guest_memory.c
     src/core/handle_table.c
+    src/core/perf_hint.c
     src/core/image.c
     src/core/imports.c
     src/core/log.c

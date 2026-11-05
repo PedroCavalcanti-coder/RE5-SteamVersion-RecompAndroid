@@ -31,6 +31,7 @@
 #include "re5/coldebug.h"
 #include "re5/guest_base.h"
 #include "re5/lan_menu.h"
+#include "re5/perf_hint.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/stats.h"
 #include "re5/user32.h"
@@ -963,6 +964,7 @@ static void shot(IDirect3DDevice9 *dev, uint32_t n)
  * matriz de câmera. Fora isso, é o repasse automático de sempre. */
 static void d_SetVertexShaderConstantF(CPU *c)
 {
+    re5_perf_note_render();   /* a thread de render, para a afinidade/ADPF */
     IDirect3DDevice9 *dev = d9_self(c, D9K_DEVICE);
     uint32_t start = re5_arg(c, 1), n = re5_arg(c, 3);
     const float *data = d9_ptr(re5_arg(c, 2));
@@ -1026,6 +1028,7 @@ static void d_Present(CPU *c)
         frame_cap();
         RE5_BLOCKING_END();
     }
+    re5_perf_note_present();   /* Android: núcleos grandes + ADPF (fase A2) */
     if (++g_presents == 1) RE5_INFO("d3d9", "primeiro Present -> 0x%08X", (uint32_t)hr);
     else if (g_presents == 100u || g_presents == 1000u || g_presents == 10000u || g_presents % 100000u == 0)
         RE5_INFO("d3d9", "%u Present (último -> 0x%08X)", g_presents, (uint32_t)hr);
