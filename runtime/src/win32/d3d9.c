@@ -980,7 +980,8 @@ uint64_t re5_frame_cap_next(uint64_t now, uint64_t prev, uint64_t period)
 
 /* Espera o prazo do quadro (RE5_FPS_CAP), com o lock do guest solto: dorme até ~1 ms antes e
  * cede a CPU no resto. Bateria e calor no celular; o jogo segue em tempo variável. */
-static void frame_cap(void)
+/* Devolve quanto dormiu (ns), para o ADPF não contar a espera como trabalho. */
+static uint64_t frame_cap(void)
 {
     static int64_t period = -1;
     static uint64_t deadline;
@@ -990,8 +991,9 @@ static void frame_cap(void)
         period = fps > 0 && fps <= 1000 ? (int64_t)(1000000000LL / fps) : 0;
         if (period) RE5_INFO("d3d9", "limite de FPS: %ld (RE5_FPS_CAP)", fps);
     }
-    if (!period) return;
-    deadline = re5_frame_cap_next(re5_stat_now_ns(), deadline, (uint64_t)period);
+    if (!period) return 0;
+    uint64_t start = re5_stat_now_ns();
+    deadline = re5_frame_cap_next(start, deadline, (uint64_t)period);
     for (;;) {
         uint64_t now = re5_stat_now_ns();
         if (now >= deadline) break;
@@ -999,6 +1001,7 @@ static void frame_cap(void)
         if (left > 2000000u) SDL_Delay((Uint32)((left - 1000000u) / 1000000u));
         else SDL_Delay(0);
     }
+    return re5_stat_now_ns() - start;
 }
 
 static void d_Present(CPU *c)
@@ -1008,6 +1011,7 @@ static void d_Present(CPU *c)
     HWND over = host_hwnd(re5_arg(c, 3), "IDirect3DDevice9::Present");
     const RGNDATA *dirty = d9_ptr(re5_arg(c, 4));
     HRESULT hr;
+    uint64_t cap_idle = 0;
     re5_coldebug_draw(dev);
 #if !defined(__ANDROID__)
     re5_lan_menu_draw(dev);
@@ -1025,10 +1029,10 @@ static void d_Present(CPU *c)
             RE5_STAT_ADD(RE5_ST_PRESENT_NS, dt);
             if (re5_thunk_current()) ((re5_thunk *)re5_thunk_current())->ns += dt;
         }
-        frame_cap();
+        cap_idle = frame_cap();
         RE5_BLOCKING_END();
     }
-    re5_perf_note_present();   /* Android: núcleos grandes + ADPF (fase A2) */
+    re5_perf_note_present(cap_idle);   /* Android: núcleos grandes + ADPF (fase A2) */
     if (++g_presents == 1) RE5_INFO("d3d9", "primeiro Present -> 0x%08X", (uint32_t)hr);
     else if (g_presents == 100u || g_presents == 1000u || g_presents == 10000u || g_presents % 100000u == 0)
         RE5_INFO("d3d9", "%u Present (último -> 0x%08X)", g_presents, (uint32_t)hr);

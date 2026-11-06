@@ -40,6 +40,19 @@ uint64_t re5_perf_big_mask(const char *sysroot)
     return m;
 }
 
+int64_t re5_perf_target_ns(const char *fps_cap)
+{
+    long fps = fps_cap ? strtol(fps_cap, NULL, 10) : 0;
+    if (fps < 30 || fps > 240) fps = 60;   /* sem limite: pede ao sistema o máximo útil */
+    return 1000000000LL / fps;
+}
+
+int64_t re5_perf_work_ns(int64_t interval_ns, uint64_t idle_ns)
+{
+    int64_t w = interval_ns - (int64_t)idle_ns;
+    return w > 0 ? w : 1;
+}
+
 #if defined(__ANDROID__)
 #include <dlfcn.h>
 #include <pthread.h>
@@ -109,10 +122,7 @@ static void setup(void)
         RE5_INFO("perf", "ADPF indisponível (Android 13+): só a afinidade");
         return;
     }
-    const char *cap = getenv("RE5_FPS_CAP");
-    long fps = cap ? strtol(cap, NULL, 10) : 0;
-    if (fps < 30 || fps > 240) fps = 30;   /* alvo padrão: 30 fps */
-    g_target_ns = 1000000000LL / fps;
+    g_target_ns = re5_perf_target_ns(getenv("RE5_FPS_CAP"));
     int32_t tids[2] = {g_present_tid, g_render_tid};
     size_t nt = g_render_tid && g_render_tid != g_present_tid ? 2 : 1;
     APerformanceHintManager *m = get();
@@ -130,7 +140,7 @@ void re5_perf_note_render(void)
     pthread_mutex_unlock(&g_mu);
 }
 
-void re5_perf_note_present(void)
+void re5_perf_note_present(uint64_t idle_ns)
 {
     if (!enabled()) return;
     static int64_t last;
@@ -151,14 +161,14 @@ void re5_perf_note_present(void)
     int64_t now = now_ns();
     if (g_session && last) {
         int64_t d = now - last;
-        if (d > 0 && d < 1000000000LL) g_report(g_session, d);   /* fora disso: carregamento/pausa */
+        if (d > 0 && d < 1000000000LL) g_report(g_session, re5_perf_work_ns(d, idle_ns));   /* fora: carregamento/pausa */
     }
     last = now;
 }
 
 #else
 
-void re5_perf_note_present(void) {}
+void re5_perf_note_present(uint64_t idle_ns) { (void)idle_ns; }
 void re5_perf_note_render(void) {}
 
 #endif

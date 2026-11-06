@@ -56,8 +56,20 @@ int main(void)
     /* Sem sysfs. */
     CHECK(re5_perf_big_mask("perf_sys_nao_existe") == 0);
 
+    /* Alvo do ADPF: sem limite pede 60 fps (antes 30, que fazia o sistema baixar o clock). */
+    CHECK(re5_perf_target_ns(NULL) == 1000000000LL / 60);
+    CHECK(re5_perf_target_ns("") == 1000000000LL / 60);
+    CHECK(re5_perf_target_ns("30") == 1000000000LL / 30);
+    CHECK(re5_perf_target_ns("45") == 1000000000LL / 45);
+    CHECK(re5_perf_target_ns("10") == 1000000000LL / 60);    /* fora de 30..240: como sem limite */
+    CHECK(re5_perf_target_ns("1000") == 1000000000LL / 60);
+    /* A espera do limitador não é trabalho. */
+    CHECK(re5_perf_work_ns(33333333, 13333333) == 20000000);
+    CHECK(re5_perf_work_ns(20000000, 0) == 20000000);
+    CHECK(re5_perf_work_ns(10, 50) == 1);
+
     /* Fora do Android os ganchos não fazem nada (nem falham). */
     re5_perf_note_render();
-    re5_perf_note_present();
+    re5_perf_note_present(0);
     CHECK_DONE();
 }

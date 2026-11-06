@@ -287,6 +287,23 @@ O que mudou:
   pipeline novo e no `Release`, via arquivo temporário + rename. Arquivo `re5vk.pcache` na pasta
   interna do app (Android) ou na atual; `RE5VK_PCACHE=<arquivo>` muda, `=0` desliga. `ctest`
   32/32. Ganho a medir (engasgo na primeira aparição de efeito, segunda sessão em diante).
+- **CPU e GPU ociosas no celular (investigação 2026-11-06):**
+  - **Bug do ADPF (fase A2, `perf_hint.c`), corrigido:** sem `RE5_FPS_CAP` (o padrão do
+    launcher, "Sem limite") o alvo da sessão era 30 fps. Quadros dentro do alvo fazem o sistema
+    baixar o clock, segurando o jogo perto de 30 fps com a CPU ociosa. Agora, sem limite, o alvo é
+    60 fps; com limite, o período dele. A duração informada desconta o sono do limitador (antes
+    contava como trabalho). Teste em `test_perf_hint`; `ctest` 32/32. **Não medido no aparelho.**
+  - **Lock global (padrão no Android):** nos logcats de 05/11 (`work/android/*_logcat.txt`,
+    modo global) `lock_ms` fica em 1600-2400 ms/s em jogo, ou seja, ~2 threads esperando o lock
+    do guest o tempo todo; o código do guest roda em um núcleo por vez (~12-20% de 8 núcleos). É
+    o modo seguro até a fase A1 (ordem de memória do x86 no ARM64). No modo paralelo (logs de
+    31/10) `lock_ms` cai para ~50 e a thread que apresenta passa ~47% do tempo dentro do Present
+    da DXVK (GPU/apresentação).
+  - **PC, benchmark com `RE5_PROFILE` e `Sleep` por endereço de retorno:** nenhuma espera
+    errada. O limitador do jogo (`0x00426F80`, `Sleep(resto-1)` + QPC) dormiu 3 vezes em 10 s; os
+    `Sleep(1)` a 500/s são threads de fundo (`0x0048C5D0`, `0x00447141`); os 8 workers ficam ~80%
+    em `WaitForSingleObject` esperando job; o caminho crítico é a principal + a de render. As
+    esperas do jogo são todas `INFINITE`.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
