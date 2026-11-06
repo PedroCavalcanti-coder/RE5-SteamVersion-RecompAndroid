@@ -188,6 +188,23 @@ static void run_builtin(void)
         CHECK_EQ_U32(c7.uses_i, 0);
         CHECK_EQ_U32(c7.uses_b, 0);
         free(c7.spv);
+        /* rcp r0, c0 ; mov oC0, r0: com a emulação de float (padrão) o resultado passa por FClamp
+         * (GLSL.std.450 43) para não sair infinito, como na D3D9. */
+        static const uint32_t ps_rcp[] = {
+            PS3,
+            INS(6, 2), DST(TEMP, 0, 0xF), SRCSW(CONST, 0, XXXX),
+            INS(1, 2), DST(COLOROUT, 0, 0xF), SRC(TEMP, 0),
+            END,
+        };
+        CHECK(re5vk_dxso_compile(ps_rcp, sizeof ps_rcp / 4, &plain, &c7, err, sizeof err) == 0);
+        int clamp = 0;
+        for (size_t w = 5; w < c7.nwords;) {   /* OpExtInst = 12: [res type, res, set, inst, ...] */
+            uint32_t op = c7.spv[w] & 0xFFFFu, len = c7.spv[w] >> 16;
+            if (op == 12 && len >= 5 && c7.spv[w + 4] == 43) clamp = 1;
+            w += len ? len : 1;
+        }
+        CHECK(clamp);
+        free(c7.spv);
     }
     free(s.spv);
     CHECK(re5vk_dxso_compile(ps_basic, sizeof ps_basic / 4, &plain, &s, err, sizeof err) == 0);

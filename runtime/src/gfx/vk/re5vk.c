@@ -19,12 +19,17 @@
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
+#if defined(__ANDROID__)
+#include <SDL2/SDL.h> /* SDL_AndroidGetInternalStoragePath, para o cache de pipelines */
+#endif
 
 #include "vk_core.h"
 #include "re5/re5vk.h"
 #include "re5/thunks.h"
 #include "re5/guest_base.h"
 #include "re5/guest_memory.h"
+
+static void pcache_save(vk_device *d);
 
 /* ---- carregador ---- */
 
@@ -800,6 +805,7 @@ static ULONG STDMETHODCALLTYPE v_Release(IDirect3DDevice9 *self)
     if (n == 0) {
         /* O processo sai logo depois (o RE5 solta o device no fim): espera a GPU e larga o resto. */
         vkDeviceWaitIdle(d->dev);
+        pcache_save(d);
         RE5_INFO("re5vk", "device liberado depois de %llu Present", (unsigned long long)d->presents);
     }
     return (ULONG)n;
@@ -985,6 +991,7 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
         re5vk_unlock(d);
     }
     if (++d->presents == 1) RE5_INFO("re5vk", "primeiro Present");
+    if (d->presents % 600 == 0) pcache_save(d); /* ~10-20 s: o Android mata o processo sem Release */
     return D3D_OK;
 }
 
@@ -1023,6 +1030,92 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     return 0;
 }
 
+/* ---- VkPipelineCache persistente ----
+ * Sem ele cada sessão recompila no driver todos os pipelines (shader DXSO→SPIR-V→ISA da GPU),
+ * o que no celular é o engasgo de "primeira vez que aparece um efeito". O blob vai para
+ * RE5VK_PCACHE ou, por padrão, re5vk.pcache na pasta interna do app (Android) / na pasta atual.
+ * O cabeçalho (VkPipelineCacheHeaderVersionOne: vendor, device, UUID) é conferido aqui antes de
+ * entregar ao driver: alguns drivers de celular tropeçam em blob de outro driver em vez de
+ * ignorá-lo como manda a especificação. RE5VK_PCACHE=0 desliga. */
+static const char *pcache_path(void)
+{
+    static char path[1024];
+    static int done;
+    if (done) return path[0] ? path : NULL;
+    done = 1;
+    const char *e = getenv("RE5VK_PCACHE");
+    if (e && !strcmp(e, "0")) return NULL;
+    if (e && *e) {
+        snprintf(path, sizeof path, "%s", e);
+        return path;
+    }
+#if defined(__ANDROID__)
+    const char *base = SDL_AndroidGetInternalStoragePath();
+    if (!base) return NULL;
+    snprintf(path, sizeof path, "%s/re5vk.pcache", base);
+#else
+    snprintf(path, sizeof path, "re5vk.pcache");
+#endif
+    return path;
+}
+
+static void *pcache_load(vk_device *d, size_t *out_n)
+{
+    *out_n = 0;
+    const char *path = pcache_path();
+    if (!path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *b = n >= 32 && n < (256L << 20) ? malloc((size_t)n) : NULL;
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
+    fclose(f);
+    if (!b) return NULL;
+    uint32_t hlen, hver, vendor, device;
+    memcpy(&hlen, b, 4); memcpy(&hver, b + 4, 4); memcpy(&vendor, b + 8, 4); memcpy(&device, b + 12, 4);
+    if (hlen < 32 || hver != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || vendor != d->props.vendorID ||
+        device != d->props.deviceID || memcmp(b + 16, d->props.pipelineCacheUUID, VK_UUID_SIZE) != 0) {
+        RE5_INFO("re5vk", "cache de pipelines em %s é de outro driver: começando do zero", path);
+        free(b);
+        return NULL;
+    }
+    RE5_INFO("re5vk", "cache de pipelines: %ld bytes de %s", n, path);
+    *out_n = (size_t)n;
+    return b;
+}
+
+/* Grava se houve pipeline novo desde a última vez (arquivo temporário + rename: um processo morto
+ * no meio — o Android mata sem aviso — não deixa blob truncado). */
+static void pcache_save(vk_device *d)
+{
+    const char *path = pcache_path();
+    if (!path || d->npipes == d->pcache_saved) return;
+    size_t n = 0;
+    if (vkGetPipelineCacheData(d->dev, d->pcache, &n, NULL) != VK_SUCCESS || !n) return;
+    void *b = malloc(n);
+    if (!b) return;
+    if (vkGetPipelineCacheData(d->dev, d->pcache, &n, b) == VK_SUCCESS) {
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "wb");
+        int ok = f && fwrite(b, 1, n, f) == n;
+        if (f) ok = fclose(f) == 0 && ok;
+        if (ok) {
+            remove(path); /* rename do Windows não sobrescreve */
+            ok = rename(tmp, path) == 0;
+        }
+        if (ok) {
+            d->pcache_saved = d->npipes;
+            RE5_INFO("re5vk", "cache de pipelines gravado: %zu bytes, %u pipelines", n, d->npipes);
+        } else {
+            RE5_WARN("re5vk", "não consegui gravar o cache de pipelines em %s", path);
+        }
+    }
+    free(b);
+}
+
 static void layout_create(vk_device *d)
 {
     VkDescriptorSetLayoutBinding b[RE5VK_NBINDINGS];
@@ -1042,7 +1135,12 @@ static void layout_create(vk_device *d)
                                       .pSetLayouts = &d->dsl};
     VK_CHECK(vkCreatePipelineLayout(d->dev, &pci, NULL, &d->layout));
     VkPipelineCacheCreateInfo cci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    size_t n = 0;
+    void *blob = pcache_load(d, &n);
+    cci.initialDataSize = n;
+    cci.pInitialData = blob;
     VK_CHECK(vkCreatePipelineCache(d->dev, &cci, NULL, &d->pcache));
+    free(blob);
 }
 
 HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags,

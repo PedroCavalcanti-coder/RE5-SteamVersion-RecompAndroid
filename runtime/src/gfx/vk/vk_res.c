@@ -108,6 +108,16 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
     if (rt) need |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
     if (ds) need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
     VkFormat vf = fmt->vk;
+    /* RE5VK_D32=1: profundidade D24 vira D32F+S8 mesmo onde o D24 existe (como na AMD do PC).
+     * Diagnóstico das manchas de sombra no Mali (D24 real), que no PC não aparecem. */
+    if (vf == VK_FORMAT_D24_UNORM_S8_UINT) {
+        static int force32 = -1;
+        if (force32 < 0) {
+            const char *e = getenv("RE5VK_D32");
+            force32 = e && *e == '1';
+        }
+        if (force32 && format_ok(d, VK_FORMAT_D32_SFLOAT_S8_UINT, need)) vf = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
     if (!format_ok(d, vf, need)) {
         /* D24S8 não existe na AMD: D32F+S8, como a DXVK */
         if (vf == VK_FORMAT_D24_UNORM_S8_UINT && format_ok(d, VK_FORMAT_D32_SFLOAT_S8_UINT, need))

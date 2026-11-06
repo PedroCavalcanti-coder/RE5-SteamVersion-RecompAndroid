@@ -274,6 +274,19 @@ O que mudou:
     sombra e memória antiga intocadas). Não vale para a DXVK. `ctest` 31/31. **A/B do usuário:
     empate** (fixo 800x600: 93,5 com x 93,9 sem; variável Full HD: 60,8 x 60,3). Desligado por
     padrão; `RE5VK_ZEROCOPY=1` liga.
+- **re5vk no Mali (2026-11-06): emulação de float do D3D9 ligada de verdade.** As capturas do
+  usuário no A54 mostravam cena escura, manchas pretas e moiré só no re5vk (a DXVK, com
+  `d3d9.floatEmulation`, fica normal). O `float_emu()` de `vk_dxso.c` só ligava com
+  `RE5VK_FLOATEMU=1`, ao contrário do comentário; agora é padrão (`=0` desliga) e `rcp`, `rsq`,
+  `log` e `nrm` passam por `FClamp` em ±FLT_MAX, como no D3D9 (nunca inf, então nunca NaN a
+  jusante; na AMD o NaN some, o Mali o propaga). Teste novo em `test_vk_dxso` (o `rcp` emite
+  `FClamp`); 164 shaders de `work/shaders` passam no `spirv-val`. `RE5VK_D32=1` força D32F+S8 no
+  lugar do D24 para isolar sombra. **Não testado no aparelho ainda.**
+- **`VkPipelineCache` persistente no re5vk (2026-11-06, `re5vk.c`):** lido na criação do device
+  (cabeçalho conferido contra vendor/device/UUID do driver) e gravado a cada 600 Present com
+  pipeline novo e no `Release`, via arquivo temporário + rename. Arquivo `re5vk.pcache` na pasta
+  interna do app (Android) ou na atual; `RE5VK_PCACHE=<arquivo>` muda, `=0` desliga. `ctest`
+  32/32. Ganho a medir (engasgo na primeira aparição de efeito, segunda sessão em diante).
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.

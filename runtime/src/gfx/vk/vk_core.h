@@ -272,6 +272,7 @@ struct vk_device {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkPipelineCache pcache;
+    uint32_t pcache_saved; /* npipes na última gravação do cache em disco */
     vk_pipe_entry *pipes;
     uint32_t npipes, cappipes;
     vk_sampler_entry *samplers;

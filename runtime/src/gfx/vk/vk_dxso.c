@@ -873,8 +873,46 @@ static void do_break(cx *c, uint32_t cond)   /* cond 0 = incondicional */
 
 /* ---- instruções ---- */
 
+/* Multiplicação do D3D9: 0 * qualquer coisa (inclusive inf e NaN) = 0. O IEEE do Vulkan dá NaN em
+ * 0*inf, e um NaN numa cadeia do HDR (adaptação de exposição, desfoque) vira mancha na tela inteira;
+ * a DXVK emula isto no modo "strict" (d3d9.floatEmulation). RE5VK_FLOATEMU=0 desliga. */
+static int float_emu(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_FLOATEMU");
+        /* Ligada por padrão, como o comentário acima sempre disse (a condição só ligava com =1).
+         * No Mali (A54, 2026-11-06) a cena 3D saía escura, com manchas pretas e moiré: NaN de 0*inf
+         * e de rsq(0). A AMD do PC escondia (saturate(NaN) = 0); o Mali propaga. */
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* rcp/rsq/nrm/log do D3D9 não dão infinito: o resultado fica em +-FLT_MAX (como a DXVK com a
+ * emulação de float). Sem isso rsq(0) = inf e o próximo mul vira NaN. */
+static uint32_t finite_f(cx *c, uint32_t x)
+{
+    if (!float_emu()) return x;
+    return gl3(c, c->t_f32, GFClamp, x, kf(c, -3.402823466e+38f), kf(c, 3.402823466e+38f));
+}
+
+static uint32_t fmul4(cx *c, uint32_t a, uint32_t b)
+{
+    uint32_t m = e2(c, SOpFMul, c->t_v4f, a, b);
+    if (!float_emu()) return m;
+    uint32_t z = e2(c, SOpLogicalOr, c->t_v4b, e2(c, SOpFOrdEqual, c->t_v4b, a, c->k0),
+                    e2(c, SOpFOrdEqual, c->t_v4b, b, c->k0));
+    return e3(c, SOpSelect, c->t_v4f, z, c->k0, m);
+}
+
 static uint32_t dot(cx *c, uint32_t a, uint32_t b, int n)
 {
+    if (float_emu()) {
+        uint32_t p = fmul4(c, a, b), s = extract(c, c->t_f32, p, 0);
+        for (int i = 1; i < n; i++) s = e2(c, SOpFAdd, c->t_f32, s, extract(c, c->t_f32, p, (uint32_t)i));
+        return s;
+    }
     if (n == 4) return e2(c, SOpDot, c->t_f32, a, b);
     uint32_t t = n == 3 ? c->t_v3f : c->t_v2f;
     uint32_t x = id(c), y = id(c);
@@ -967,10 +1005,10 @@ static int translate(cx *c)
         case 1: r = S(0); break;   /* mov */
         case 2: r = e2(c, SOpFAdd, c->t_v4f, S(0), S(1)); break;
         case 3: r = e2(c, SOpFSub, c->t_v4f, S(0), S(1)); break;
-        case 4: v0 = S(0); v1 = S(1); v2 = S(2); r = e2(c, SOpFAdd, c->t_v4f, e2(c, SOpFMul, c->t_v4f, v0, v1), v2); break;
-        case 5: r = e2(c, SOpFMul, c->t_v4f, S(0), S(1)); break;
-        case 6: r = splat(c, e2(c, SOpFDiv, c->t_f32, kf(c, 1), x_of(c, S(0)))); break;   /* rcp */
-        case 7: r = splat(c, gl1(c, c->t_f32, GInverseSqrt, gl1(c, c->t_f32, GFAbs, x_of(c, S(0))))); break;
+        case 4: v0 = S(0); v1 = S(1); v2 = S(2); r = e2(c, SOpFAdd, c->t_v4f, fmul4(c, v0, v1), v2); break;
+        case 5: v0 = S(0); v1 = S(1); r = fmul4(c, v0, v1); break;
+        case 6: r = splat(c, finite_f(c, e2(c, SOpFDiv, c->t_f32, kf(c, 1), x_of(c, S(0))))); break;   /* rcp */
+        case 7: r = splat(c, finite_f(c, gl1(c, c->t_f32, GInverseSqrt, gl1(c, c->t_f32, GFAbs, x_of(c, S(0)))))); break;
         case 8: v0 = S(0); r = splat(c, dot(c, v0, S(1), 3)); break;
         case 9: v0 = S(0); r = splat(c, dot(c, v0, S(1), 4)); break;
         case 10: r = gl2(c, c->t_v4f, GFMin, S(0), S(1)); break;
@@ -982,7 +1020,7 @@ static int translate(cx *c)
             break;
         }
         case 14: case 78: r = splat(c, gl1(c, c->t_f32, GExp2, x_of(c, S(0)))); break;   /* exp, expp */
-        case 15: case 79: r = splat(c, gl1(c, c->t_f32, GLog2, gl1(c, c->t_f32, GFAbs, x_of(c, S(0))))); break;
+        case 15: case 79: r = splat(c, finite_f(c, gl1(c, c->t_f32, GLog2, gl1(c, c->t_f32, GFAbs, x_of(c, S(0)))))); break;
         case 16: {   /* lit */
             v0 = S(0);
             uint32_t x = extract(c, c->t_f32, v0, 0), y = extract(c, c->t_f32, v0, 1), w = extract(c, c->t_f32, v0, 3);
@@ -1008,7 +1046,7 @@ static int translate(cx *c)
         }
         case 18: {   /* lrp: s2 + s0 * (s1 - s2) */
             v0 = S(0); v1 = S(1); v2 = S(2);
-            r = e2(c, SOpFAdd, c->t_v4f, v2, e2(c, SOpFMul, c->t_v4f, v0, e2(c, SOpFSub, c->t_v4f, v1, v2)));
+            r = e2(c, SOpFAdd, c->t_v4f, v2, fmul4(c, v0, e2(c, SOpFSub, c->t_v4f, v1, v2)));
             break;
         }
         case 19: r = gl1(c, c->t_v4f, GFract, S(0)); break;
@@ -1025,7 +1063,11 @@ static int translate(cx *c)
         case 29: loop_end(c); continue;
         case 32: {   /* pow |x|^y */
             v0 = S(0); v1 = S(1);
-            r = splat(c, gl2(c, c->t_f32, GPow, gl1(c, c->t_f32, GFAbs, x_of(c, v0)), x_of(c, v1)));
+            uint32_t py = x_of(c, v1);
+            uint32_t pw = gl2(c, c->t_f32, GPow, gl1(c, c->t_f32, GFAbs, x_of(c, v0)), py);
+            if (float_emu())   /* pow(x, 0) = 1 também para x = 0 (no GLSL é indefinido) */
+                pw = e3(c, SOpSelect, c->t_f32, e2(c, SOpFOrdEqual, c->t_bool, py, kf(c, 0)), kf(c, 1), pw);
+            r = splat(c, pw);
             break;
         }
         case 33: {   /* crs */
@@ -1043,8 +1085,8 @@ static int translate(cx *c)
         case 35: r = gl1(c, c->t_v4f, GFAbs, S(0)); break;
         case 36: {   /* nrm: xyz / |xyz|, w = 1/|xyz| * w */
             v0 = S(0);
-            uint32_t inv = gl1(c, c->t_f32, GInverseSqrt, dot(c, v0, v0, 3));
-            r = e2(c, SOpVectorTimesScalar, c->t_v4f, v0, inv);
+            uint32_t inv = finite_f(c, gl1(c, c->t_f32, GInverseSqrt, dot(c, v0, v0, 3)));
+            r = float_emu() ? fmul4(c, v0, splat(c, inv)) : e2(c, SOpVectorTimesScalar, c->t_v4f, v0, inv);
             break;
         }
         case 37: {   /* sincos: x = cos, y = sin */
