@@ -1,154 +1,113 @@
 # Resident Evil 5: Gold Edition — Static Recompilation (`re5-recompiled`)
 
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20Android%20ARM64-blue.svg)](#arquitetura)
-[![Graphics](https://img.shields.io/badge/Graphics-Direct3D%209%20%E2%86%92%20Vulkan%20(DXVK%20Native)-orange.svg)](#camada-gr%C3%A1fica)
-[![Engine](https://img.shields.io/badge/Engine-Capcom%20MT%20Framework%201.4-red.svg)](#motor-mt-framework)
-[![Audio](https://img.shields.io/badge/Audio-FAudio%20%7C%20XAudio2%20%7C%20SDL2-green.svg)](#subsistemas-multim%C3%ADdia)
-[![Status](https://img.shields.io/badge/Status-Fase%200%20conclu%C3%ADda%20-yellow.svg)](docs/STATUS.md)
-[![License](https://img.shields.io/badge/License-MIT%20(Tooling%20%26%20Runtime)-lightgrey.svg)](#aviso-legal)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20Android%20ARM64-blue.svg)](#how-to-install)
+[![Graphics](https://img.shields.io/badge/Graphics-Direct3D%209%20%E2%86%92%20Vulkan%20(DXVK%20%2F%20re5vk)-orange.svg)](#graphics)
+[![Status](https://img.shields.io/badge/Status-0.1%20alpha-yellow.svg)](#status)
+[![License](https://img.shields.io/badge/License-MIT%20(tooling%20%26%20runtime)-lightgrey.svg)](#legal)
 
-Projeto de **recompilação estática de binário x86 (PE32)** de *Resident Evil 5: Gold Edition* (`re5dx9.exe`) para código C portável e moderno, viabilizando a execução nativa com aceleração gráfica **Vulkan** em desktop (Windows/Linux) e dispositivos móveis **Android (ARM64-v8a)** sem emulação dinâmica ou Wine/Box64.
+A **static recompilation** of *Resident Evil 5: Gold Edition* (Steam, `re5dx9.exe`, x86 PE32) into portable C,
+running natively on **Windows x64** and **Android ARM64** with Vulkan — no Wine, no Box64, no dynamic emulation.
 
-Baseado na metodologia e ferramentas do ecossistema [pcrecomp](https://github.com/sp00nznet/pcrecomp) e na arquitetura de referência do [nfsu2-recompiled](https://github.com/codepdbh/nfsu2-recompiled).
+Based on the [pcrecomp](https://github.com/sp00nznet/pcrecomp) tooling and the
+[nfsu2-recompiled](https://github.com/codepdbh/nfsu2-recompiled) reference architecture.
 
----
+## It runs on a phone
 
-> **Documentação do projeto:** [Plano por fase (o que a IA e você fazem em cada etapa)](docs/PLANO_DO_PROJETO.md) ·
-> [Status com evidências](docs/STATUS.md) · [Arquitetura e decisões](docs/ARQUITETURA.md) ·
-> [Reconhecimento do binário](docs/RECON_RE5.md)
+![RE5 benchmark results on Android](docs/media/android_dimensity7030_benchmark.webp)
 
-## Estrutura do Repositório
+▶️ **Video:** [docs/media/android_dimensity7030_benchmark.mp4](docs/media/android_dimensity7030_benchmark.mp4)
 
-```text
-re5-recompiled/
-├── CMakeLists.txt      # Build raiz (CMake + Ninja); presets em CMakePresets.json
-├── CLAUDE.md           # Guia para as sessões de IA: comandos, regras, convenções
-├── android/            # Projeto Android (Fase 5): estrutura planejada em android/README.md
-├── bin_input/          # Executável e arquivos originais do jogo (Git LFS; o repositório é privado)
-├── config/             # re5_config.toml, builds conhecidos, overrides/exclude/hooks, política de imports
-├── docs/               # Plano, status, arquitetura e relatório de reconhecimento
-├── generated/          # Código C gerado pelo lifter (src/ é regenerado, não versionado; stub/ antes da Fase 2)
-├── runtime/            # Runtime: memória do guest, dispatch, thunks, loader PE, threads, VFS, HLE Win32
-├── scripts/            # Pipeline: doctor, recon (portão do lifter), run_lift, gen_cpu_header, bootstrap
-├── tests/              # Unitários em C, ponta a ponta com PE32 sintético e testes Python
-├── third_party/        # Dependências e bibliotecas nativas de suporte
-│   ├── dxvk-native/    # Implementação Direct3D 9 nativa compilada diretamente sobre Vulkan
-│   ├── FAudio/         # Reimplementação de XAudio2, X3DAudio e XAPO sobre SDL2
-│   ├── FFmpeg/         # Decodificação de streams de vídeo WMV (Windows Media Video 9 / VC-1)
-│   ├── imgui/          # Dear ImGui para overlay de controles touch customizáveis em Android
-│   ├── libadrenotools/ # Suporte a injeção de drivers Vulkan customizados (Turnip/Mesa) no Android
-│   ├── SDL2/           # Gerenciamento de janelas, superfícies Vulkan, eventos e áudio
-│   ├── sse2neon/       # Tradução header-only de intrínsecos x86 SSE/SSE2 para ARM NEON
-│   └── dxvk/           # Referência da árvore upstream do DXVK
-└── tools/              # Ferramentas de lifting e análise
-    ├── pcrecomp/       # Ferramentas de desmonte x86, análise CFG e lifter para C
-    ├── nfsu2-reference/# Repositório de referência para integração de runtime e pipeline Android
-```
+Tested on a **MediaTek Dimensity 7030 (Mali-G610 MC3) phone with 8 GB of RAM**: the game's own variable benchmark
+at **1280x720, "High" settings, averages 25.2 fps** (37.0 / 26.4 / 17.2 / 24.3 fps across the four areas),
+with the DXVK renderer, the on-screen touch controls and the performance HUD shown in the picture.
 
----
+## Status
 
-## Dependências e Módulos Importados
+**0.1 alpha.** Playable from the title screen through gameplay on PC and on Android, with real limitations:
 
-Todos os submódulos e repositórios necessários foram integrados e verificados:
+| Area | State |
+|---|---|
+| Single player (PC) | ✅ Playable; the benchmark runs above 80 fps on a Ryzen 7 5700U laptop. |
+| Single player (Android) | ✅ Playable with touch controls or a gamepad; ~20–30 fps on mid-range phones. |
+| Renderer: DXVK | ✅ Default and most compatible (PC and Android). |
+| Renderer: re5vk (own Vulkan backend) | ⚠️ Faster on PC; on Android it starts on Mali and Adreno, but still shows **graphical glitches**. |
+| Multiplayer (LAN / Steam emulation) | ⚠️ **Not 100%**: joining can fail, and leaving a session may crash the game. |
+| Going to background on Android | ⚠️ Switching apps while in game may crash (the Vulkan surface is lost). |
+| Snapdragon + DXVK | ⚠️ Characters can appear in T-pose on the stock Adreno driver. |
 
-| Dependência | Versão / Commit | Finalidade Técnica |
-|---|---|---|
-| **dxvk-native** | `native-1.9.2b` (`c8dc91fa`) | Camada Direct3D 9 → Vulkan nativa sem dependência de DLLs do Windows |
-| **libadrenotools** | `master` (`8fae8ce`) | Carregamento dinâmico de drivers Turnip em SoCs Qualcomm Snapdragon |
-| **FAudio** | `master` (`6839b88`) | HLE para chamadas COM `XAudio2Create` e posicionamento 3D `X3DAudio` |
-| **SDL2** | `SDL2` (`8acf7cfc0`) | Janela cross-platform, eventos de input, `SDL_WINDOW_VULKAN` e backend de som |
-| **sse2neon** | `master` (`2272251`) | Tradução de operações vetoriais de 128 bits (__m128) para ARM64 NEON |
-| **imgui** | `master` (`4be0b47ec`) | Renderização do HUD touch, botões analógicos e editor de layout mobile |
-| **FFmpeg** | `master` (`bbd37149e4`)| Decodificação de cutscenes `.wmv` da MT Framework |
-| **pcrecomp** | `main` (`dd01905`) | Pipeline de desmontagem, catálogo de imports e lifter x86 → C |
-| **nfsu2-reference** | `main` (`f70a0e3`) | Referência para thunks COM D3D9 de 32 bits e WSI Android |
+### Optimization (work in progress)
 
----
+Mobile performance is the current focus. Done so far: the game threads run in parallel (`hle` lock mode),
+big-core pinning and an ADPF performance session, Android Game Mode "performance" support, CPU tuning for
+Cortex-A78/A55, and a persistent Vulkan pipeline cache for re5vk.
 
-## Arquitetura e Particularidades da MT Framework 1.4
+Known bottlenecks still being worked on:
 
-Diferente de executáveis single-thread dos anos 2000, o *Resident Evil 5* opera sobre o motor **MT Framework 1.4 da Capcom**, introduzindo desafios específicos de baixo nível:
+- **GPU clock on Samsung phones:** on an Exynos 1380 (Galaxy A54) the Mali GPU stays at its minimum clock because
+  Samsung's game service does not recognize a sideloaded APK as a game. Adding the app to *Game Launcher*
+  is the current workaround being tested.
+- **Shader compilation stutter** the first time an effect appears (cached after that).
+- **Memory:** Mali GPUs have no DXT/BC texture support, so textures are decoded on the CPU and kept twice;
+  transcoding to ETC2/ASTC is planned.
 
-```
-                      ┌────────────────────────┐
-                      │    re5dx9.exe (x86)    │
-                      └───────────┬────────────┘
-                                  │
-                 [ pcrecomp disasm32 ]
-                                  │
-                    [ lift32_cpu (Reentrante) ]
-                                  │
-                      ┌───────────▼────────────┐
-                      │    ~100.000 Funções C  │
-                      │   (~25M-35M linhas)    │
-                      └─────┬────────────┬─────┘
-                            │            │
-       ┌────────────────────┘            └────────────────────┐
-       ▼                                                      ▼
- ┌──────────────────────┐                               ┌──────────────────────┐
- │   Host Desktop PC    │                               │    Android ARM64     │
- │ (MSVC x86 / Clang64) │                               │ (NDK Clang + NEON)   │
- ├──────────────────────┤                               ├──────────────────────┤
- │ • Win32 HLE nativo   │                               │ • Memory Mapping 32b │
- │ • DXVK Native Vulkan │                               │ • sse2neon / DMB     │
- │ • FAudio + SDL2      │                               │ • DXVK + Turnip WSI  │
- └──────────────────────┘                               └──────────────────────┘
-```
+Details, numbers and evidence: [docs/STATUS.md](docs/STATUS.md) (in Portuguese).
 
-1. **Paralelismo Agressivo & Memory Ordering**:
-   * A MT Framework utiliza um sistema multithreaded de tarefas (*Worker Threads*) com *spinlocks* manuais e filas *lock-free*.
-   * **x86 TSO vs ARM64 Weak Ordering**: x86 tem consistência de memória forte por hardware e ARM64, ordenação fraca. Primeiro, um **lock global do guest** serializa a execução do código do jogo (correção antes de velocidade); relaxar esse lock com uma estratégia de TSO é uma etapa explícita de otimização (decisão D5 em [ARQUITETURA](docs/ARQUITETURA.md)).
-2. **Ponteiros de 32 bits em Hosts de 64 bits**:
-   * O código recompilado espera endereços de 32 bits a partir de `0x00400000` (o executável não tem relocações). O runtime reserva 4 GiB contíguos no host e todo acesso do guest soma essa base; objetos de 64 bits do host (COM da DXVK Native, arquivos, threads) chegam ao guest por uma *Handle Table* de 32 bits e vtables de thunks.
-3. **Ponto Flutuante e SIMD**:
-   * Física Havok 5.5 e transformações de matrizes utilizam SSE/SSE2, que o lifter traduz para C portável (lanes em union, sem intrínsecos); `sse2neon.h` fica para código escrito à mão no runtime.
-   * Se o jogo ligar flush-to-zero/denormals-are-zero, o modo é espelhado no registrador `FPCR` do ARM64.
+## How to install
 
----
+You need **your own legally purchased copy** of *Resident Evil 5: Gold Edition* (Steam). This project ships
+no game files.
 
-## Cronograma de Engenharia
+1. **Pack your game folder.** Make a `.zip` or `.rar` of your installed game folder (the one that contains
+   `nativePC_MT`) — or, on PC, just use the folder as it is.
+2. **Get the port binary for your platform** (`re5.exe` for Windows, the `.apk` for Android). Binaries are built
+   from this repository; see [Building](#building). Prebuilt releases are not published, because they would
+   contain recompiled game code (see [Legal](#legal)).
+3. **Windows:** put `re5.exe` (and the DLLs next to it) **inside the game folder**, next to `nativePC_MT`, and run it.
+   The game folder is detected from where `re5.exe` is; no command line is needed.
+4. **Android:** install the APK, open it, and pick your `.zip`/`.rar` in the launcher. It extracts the game into
+   the app's folder and you can start playing. Settings (renderer, resolution, FPS limit, controls layout,
+   language) are in the launcher.
 
-Detalhamento de cada etapa, com o que a IA faz e o que depende de você: [docs/PLANO_DO_PROJETO.md](docs/PLANO_DO_PROJETO.md).
+Tip for Samsung phones: add the app to **Game Launcher** and set Game Booster to *Performance*.
 
-| Fase | Foco Técnico Principal | Meta de Conclusão |
-|:---:|---|---|
-| **Fase 0** ✅ | **Fundação**<br>Build CMake, runtime base (memória do guest, dispatch, thunks, loader PE, threads, VFS), pipeline recon → catálogo → lift. | Pipeline testado de ponta a ponta com um PE32 sintético (`ctest` 6/6). |
-| **Fase 1** ⛔ | **Binário limpo e Análise Estática PE32**<br>Obter código sem SteamStub **e sem Enigma Protector**; seções, IAT real, v-tables e RTTI da MT Framework. | `scripts/recon.py` aprova a entrada; mapeamento em `docs/RECON_RE5.md` e `config/iat_overrides.json`. |
-| **Fase 2** | **Lifting x86 → C e Resolução de CFG**<br>Tradução de x86/SSE para código C reentrante (`CpuContext* ctx`) via `pcrecomp`. | Compilação limpa dos arquivos gerados em `generated/src/`. |
-| **Fase 3** | **Runtime HLE Win32 e Memória**<br>Mapeamento de espaço virtual de 32 bits, pool de threads POSIX e sistema de arquivos `.arc`. | Binário inicializa o `WinMain` e carrega configurações básicas. |
-| **Fase 4** | **Subsistemas Multimídia (PC Target)**<br>Thunks D3D9 para DXVK Native, áudio FAudio/XAudio2 e janela Vulkan via SDL2. | Jogo renderiza menus e entra em gameplay no PC nativo. |
-| **Fase 5** | **Cross-Compilation Android ARM64**<br>Compilação via NDK Clang, tradução SIMD via `sse2neon`, alinhamento de memória e WSI Android. | Biblioteca `libre5_recomp.so` gerada e executando em dispositivo Android. |
-| **Fase 6** | **Polimento Mobile e Otimização**<br>Overlay touch ImGui, transcodificação/decodificação de cutscenes WMV e tuning Vulkan (Turnip). | 60 FPS estáveis com controles na tela e suporte a gamepad. |
+## Building
 
----
+Requirements: CMake 3.22+, Ninja, Python 3.10+, MinGW-w64/Clang (Windows) or the Android NDK (r25+) and
+Android Studio/Gradle (Android). The input executable `re5dx9.clean.exe` (an unprotected x86 build of the game)
+must be provided by whoever owns the game, in `bin_input/`; this repository does not include it nor explain
+how to remove copy protection.
 
-## Como Começar
-
-### Pré-requisitos
-* **Compilador Desktop**: Visual Studio 2022 (MSVC x86/x64) ou Clang/GCC moderno no Linux.
-* **Build System**: CMake 3.22+ e Ninja.
-* **Android**: Android Studio, NDK r25+ e CMake.
-* **Python**: Python 3.10+ (para os scripts do `pcrecomp` e geradores de ponte COM).
-* **Binário Original**: Cópia legítima do jogo *Resident Evil 5: Gold Edition* (Steam).
-
-### Passo 0: Ambiente, build e testes
 ```bash
 pip install -r scripts/requirements.txt
-git lfs pull --include='bin_input/*'
-python3 scripts/doctor.py
-cmake --preset linux-debug && cmake --build --preset linux-debug
-ctest --preset linux-debug
+python scripts/doctor.py                       # is the environment ready?
+python scripts/recon.py --all                  # gate: is the input liftable?
+python scripts/run_lift.py catalog && python scripts/run_lift.py lift
+cmake --preset windows-x64 && cmake --build build/windows-x64
+cmake --preset android-arm64 && cmake --build build/android-arm64   # then ./gradlew assembleDebug in android/
 ```
 
-### Passo 1: Binário de entrada
+## Graphics
 
-O binário de entrada (`bin_input/re5dx9.clean.exe`, um executável x86 sem proteção) é fornecido por quem tem o jogo e nunca vai para o git; este repositório não inclui nem documenta como remover proteções de cópia.
-Verifique com `python3 scripts/recon.py --all`.
+- **DXVK** (default): Direct3D 9 → Vulkan (2.6.2 on PC, a native 1.9.2b port on Android).
+- **re5vk**: this project's own Direct3D 9 → Vulkan backend (`RE5_GFX=re5vk`), with its own DXSO → SPIR-V
+  shader translator.
 
----
+## Repository layout
 
-## Aviso Legal
+```text
+scripts/      pipeline: recon, lift, header generation, benchmarks, Android profiling
+config/       build config, known builds, overrides/hooks, import policy
+runtime/      guest memory, dispatch, thunks, PE loader, threads, VFS, Win32 HLE, D3D9 bridge, re5vk
+generated/    C code produced by the lifter (generated/src is never committed)
+android/      Android app: launcher, touch controls, HUD, settings (6 languages)
+tests/        C unit tests, end-to-end synthetic PE32, Python tests
+tools/        pcrecomp (vendored lifter)
+docs/         plan, status, architecture (Portuguese)
+```
 
-Este projeto **não distribui** código binário, assets, texturas, modelos, áudio ou marcas registradas de propriedade da **Capcom Co., Ltd.**
+## Legal
 
-Todos os arquivos originais do jogo devem ser fornecidos pelo usuário a partir de uma cópia legalmente adquirida de *Resident Evil 5*. O código deste repositório consiste estritamente em ferramentas de código aberto e runtimes de compatibilidade de engenharia limpa sob licença MIT.
+This project **does not distribute** binaries, code, assets, textures, models, audio or trademarks owned by
+**Capcom Co., Ltd.** All original game files must come from a legally purchased copy of *Resident Evil 5*.
+The code in this repository is open-source tooling and a clean-room compatibility runtime under the MIT license.
+*Resident Evil* is a trademark of Capcom. This project is not affiliated with or endorsed by Capcom.

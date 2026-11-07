@@ -25,6 +25,8 @@ EXE = os.path.join(ROOT, "bin_input", "re5dx9.clean.exe")
 DATA, DATA_SIZE = 0x20000000, 0x00100000
 STACK_LO, STACK_HI = 0x30000000, 0x30100000
 SENTINEL = 0x30200000
+STUB, STUB_VAL = SENTINEL + 0x800, SENTINEL + 0xF00
+STUB_RET = STUB + 6 + 5                     # depois do fld (6 bytes) e do call (5)
 REGS = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
 
 
@@ -34,6 +36,8 @@ class Case:
         self.regs["esp"] = STACK_HI - 0x400
         self.writes = []                     # (endereço, bytes)
         self.dumps = [(self.regs["esp"] - 0x140, 0x150)]   # pilha: pushes, locais e argumentos
+        self.ignore = ()                     # registradores voláteis que o override não imita
+        self.fld = None                      # double empilhado em st(0) antes da chamada (stub)
 
     def w32(self, a, v):
         self.writes.append((a, struct.pack("<I", v & 0xFFFFFFFF)))
@@ -85,7 +89,65 @@ def case_chain(rng):
     return k
 
 
-SCENES = {0x006702B0: case_adpcm, 0x00CD5FB0: case_chain}
+def case_memset(rng):
+    """0x00E63D00: memset(dst, val, n) cdecl; o CRT suja ecx/edx (voláteis)."""
+    k = Case(rng)
+    dst = DATA + rng.randrange(0, 64)
+    n = rng.choice((0, 1, 3, 4, 7, 255, 256, 257, rng.randrange(0, 4096), rng.randrange(0, 0x20000)))
+    val = rng.choice((0, 0xFF, rng.getrandbits(32)))
+    blob = os.urandom(0x21000)
+    k.writes += [(DATA + i, blob[i:i + 0x4000]) for i in range(0, len(blob), 0x4000)]   # linha W < 64 KB
+    for i, v in enumerate((SENTINEL, dst, val, n)):
+        k.w32(k.regs["esp"] + 4 * i, v)
+    k.dumps = [(DATA, 0x21000)]
+    k.ignore = ("ecx", "edx")
+    return k
+
+
+def case_memmove(rng):
+    """0x00E63EC0/0x00E69B90: memcpy/memmove(dst, src, n) com sobreposição nos dois sentidos."""
+    k = Case(rng)
+    n = rng.choice((0, 1, 2, 3, 4, 15, 16, 255, 256, 257, rng.randrange(0, 2048), rng.randrange(0, 0x8000)))
+    src = DATA + 0x8100 + rng.randrange(0, 64)   # src - n - 8 e dst + n ficam dentro de DATA..DATA+0x21000
+    dst = rng.choice((DATA + rng.randrange(0, 64), src + rng.randrange(-n - 8, n + 8), src))
+    blob = os.urandom(0x21000)
+    k.writes += [(DATA + i, blob[i:i + 0x4000]) for i in range(0, len(blob), 0x4000)]   # linha W < 64 KB
+    for i, v in enumerate((SENTINEL, dst, src, n)):
+        k.w32(k.regs["esp"] + 4 * i, v)
+    k.dumps = [(DATA, 0x21000)]
+    k.ignore = ("ecx", "edx")
+    return k
+
+
+def _ftol_value(rng):
+    return rng.choice((0.0, -0.0, 0.5, -0.5, 0.999999, -0.999999, 1.5, -1.5, 2.5, -2.5,
+                       2147483647.0, 2147483647.9, 2147483648.0, -2147483648.0, -2147483648.9, -2147483649.0,
+                       1e10, -1e10, 9.2e18, -9.2e18, 1e19, -1e19, float("inf"), float("-inf"), float("nan"),
+                       rng.uniform(-1e6, 1e6), rng.uniform(-3e9, 3e9), rng.uniform(-1e19, 1e19),
+                       float(rng.randrange(-2**40, 2**40)) + rng.choice((0.25, 0.5, 0.75))))
+
+
+def case_ftol_sse(rng):
+    """0x00E63D80: _ftol2_sse, st(0) -> eax (cvttsd2si); com SSE2 o CRT não toca edx/ecx."""
+    k = Case(rng)
+    k.fld = _ftol_value(rng)
+    k.dumps = []
+    return k
+
+
+def case_ftol(rng):
+    """0x00E63DB6: _ftol2 x87, st(0) -> edx:eax truncado; ecx é lixo do CRT."""
+    k = Case(rng)
+    k.fld = _ftol_value(rng)
+    k.dumps = []
+    k.ignore = ("ecx",)
+    return k
+
+
+# O _ftol2_sse só faz cvttsd2si se o CRT já marcou o SSE2 (0x012B11AC): o Unicorn roda com a flag em 1.
+SCENES = {0x006702B0: case_adpcm, 0x00CD5FB0: case_chain, 0x00E63D00: case_memset, 0x00E63EC0: case_memmove,
+          0x00E69B90: case_memmove, 0x00E63DB6: case_ftol, 0x00E63D80: case_ftol_sse}
+FLAG_SSE2 = 0x012B11AC
 
 HARNESS = r"""#include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +199,11 @@ int main(int argc, char **argv)
         } else if (line[0] == 'W') {
             uint32_t a = (uint32_t)strtoul(line + 2, &p, 16);
             for (p++; p[0] && p[1] && p[0] != '\n'; p += 2) mem[a++] = (uint8_t)(hex[(unsigned char)p[0]] << 4 | hex[(unsigned char)p[1]]);
+        } else if (line[0] == 'F') {
+            unsigned long long b = strtoull(line + 2, NULL, 16);
+            double v;
+            memcpy(&v, &b, 8);
+            fpush(c, v);
         } else if (line[0] == 'G') {
             fn(c);
             printf("R %%08X %%08X %%08X %%08X %%08X %%08X %%08X %%08X\n", c->eax, c->ecx, c->edx, c->ebx,
@@ -207,15 +274,23 @@ def main():
         script = os.path.join(work, f"{va:08X}.txt")
         with open(script, "w") as f:
             for k in cases:
-                f.write("C " + " ".join(f"{k.regs[n]:08X}" for n in REGS) + "\n")
-                for a, b in k.writes:
+                cregs = dict(k.regs)
+                writes = list(k.writes)
+                if k.fld is not None:            # o stub faz call: o C vê o retorno já na pilha
+                    cregs["esp"] -= 4
+                    writes.append((cregs["esp"], struct.pack("<I", STUB_RET)))
+                f.write("C " + " ".join(f"{cregs[n]:08X}" for n in REGS) + "\n")
+                for a, b in writes:
                     f.write(f"W {a:08X} {b.hex()}\n")
+                if k.fld is not None:
+                    f.write(f"F {struct.unpack('<Q', struct.pack('<d', k.fld))[0]:016X}\n")
                 f.write("G\n")
                 for a, n in k.dumps:
                     f.write(f"D {a:08X} {n:X}\n")
         p = subprocess.run([hexe, imgf, f"{va:08X}", script], capture_output=True, text=True)
         out = p.stdout.splitlines()
         per = 1 + len(cases[0].dumps)
+        assert all(len(k.dumps) == len(cases[0].dumps) for k in cases)
         bad = []
         for i, k in enumerate(cases):
             rows = out[i * per:(i + 1) * per] if len(k.dumps) + 1 == per else None
@@ -225,12 +300,40 @@ def main():
                 uc.reg_write(ureg[n], k.regs[n])
             for a, b in k.writes:
                 uc.mem_write(a, b)
+            uc.mem_write(FLAG_SSE2, struct.pack("<I", 1))
+            uc.reg_write(X.UC_X86_REG_FPCW, 0x027F)
+            uc.reg_write(X.UC_X86_REG_FPSW, 0)
+            uc.reg_write(X.UC_X86_REG_FPTAG, 0xFFFF)
+            start = va
+            if k.fld is not None:
+                # stub: fld qword [STUB_VAL]; call va; jmp SENTINEL
+                uc.mem_write(STUB_VAL, struct.pack("<d", k.fld))
+                code = b"\xDD\x05" + struct.pack("<I", STUB_VAL)
+                code += b"\xE8" + struct.pack("<i", va - (STUB + len(code) + 5))
+                assert STUB + len(code) == STUB_RET
+                code += b"\xE9" + struct.pack("<i", SENTINEL - (STUB_RET + 5))
+                if uc.mem_read(STUB, len(code)) != code:
+                    uc.mem_write(STUB, code)
+                    # O Unicorn guarda a tradução do stub: sem isto, a cena seguinte chamava o alvo antigo.
+                    if hasattr(uc, "ctl_flush_tb"):
+                        uc.ctl_flush_tb()
+                    else:
+                        uc.ctl_remove_cache(STUB, STUB + len(code))
+                start = STUB
             try:
-                uc.emu_start(va, SENTINEL, count=50_000_000)
+                uc.emu_start(start, SENTINEL, count=50_000_000)
             except UcError as ex:
                 bad.append((i, f"Unicorn: {ex}"))
                 continue
             want = ["R " + " ".join(f"{uc.reg_read(ureg[n]):08X}" for n in REGS)]
+            if k.ignore and rows:                # voláteis: compara os outros
+                rr, ww = rows[0].split(), want[0].split()
+                for n in k.ignore:
+                    j = 1 + REGS.index(n)
+                    if j < len(rr):
+                        rr[j] = ww[j] = "-"
+                rows = [" ".join(rr)] + rows[1:]
+                want = [" ".join(ww)] + want[1:]
             want += ["M " + bytes(uc.mem_read(a, n)).hex().upper() for a, n in k.dumps]
             if rows is None or len(rows) < per:
                 bad.append((i, f"o C parou (saída {p.returncode}: {out[-1:] if out else ''})"))

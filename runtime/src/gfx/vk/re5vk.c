@@ -516,6 +516,8 @@ static void slot_begin(vk_device *d, int i)
     d->vb_valid = 0;   /* command buffer novo: nenhum vertex/index buffer ligado */
     d->bound_ib = VK_NULL_HANDLE;
     /* UBO, descritores e estado dinâmico são por envio (o pool do set anterior é zerado na volta) */
+    d->set_cache_gen++;   /* os sets do cache eram do pool que acabou de zerar */
+    d->set_cache_n = 0;
     d->vs_dirty = d->ps_dirty = d->desc_dirty = d->dyn_dirty = 1;
     d->set = VK_NULL_HANDLE;
 }

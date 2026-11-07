@@ -7,6 +7,8 @@
  * depende, detecção de CPU, memcpy com saltos computados...) e documente o
  * motivo nos dois lugares.
  */
+#include <string.h>
+
 #include "re5/log.h"
 #include "re5/runtime.h"
 
@@ -17,6 +19,70 @@ void re5_ov_00426230(CPU *c)
      * Em host recompiled, a CPU sempre suporta CPUID. Retorna 1 em eax. */
     c->eax = 1;
     c->esp += 4; /* ret */
+}
+
+/* __sse2_available do CRT (_get_sse2_info, 0x00E7D4FE, chamada de 0x00E7D55E que grava 0x012B11AC):
+ * o mesmo teste do bit ID por pushfd/popfd do HasCPUID, e depois cpuid(1).EDX bit 26 + um movapd
+ * protegido por SEH. Sem o bit, o lift pulava o cpuid e o CRT inteiro rodava como numa CPU sem
+ * SSE2: _ftol2 pelo caminho x87 (0x00E63DB6, 3,3% da thread principal no perfil de 04/11),
+ * _controlfp sem o MXCSR e memset/memcpy sem a via vetorial. Toda CPU que roda o jogo tem SSE2 (o
+ * próprio exe usa SSE2 solto), então devolve 1 como no Windows. Função cdecl sem argumentos. */
+void re5_ov_00E7D4FE(CPU *c)
+{
+    c->eax = 1;
+    c->esp += 4;
+}
+
+/* memset do CRT (0x00E63D00), memcpy (0x00E63EC0) e memmove (0x00E69B90), cdecl: (dst, val|src, n),
+ * devolvem dst. O CRT do VS2005 trata sobreposição nos dois de cópia (o mesmo corpo), então os dois
+ * viram memmove do host. Eram o 3º lugar do perfil em carregamento e aparecem em jogo; o lift
+ * passava por laços de bytes e, com o SSE2 ligado acima, pelos laços de movdqa (_VEC_memcpy). */
+void re5_ov_00E63D00(CPU *c)
+{
+    uint32_t d = rd32(c->esp + 4u), v = rd32(c->esp + 8u), n = rd32(c->esp + 12u);
+    if (n) memset(rep_ptr(d), (int)(v & 0xFFu), n);
+    c->eax = d;
+    c->esp += 4u;
+}
+
+static void crt_memmove(CPU *c)
+{
+    uint32_t d = rd32(c->esp + 4u), s = rd32(c->esp + 8u), n = rd32(c->esp + 12u);
+    if (n && d != s) memmove(rep_ptr(d), rep_ptr(s), n);
+    c->eax = d;
+    c->esp += 4u;
+}
+
+void re5_ov_00E63EC0(CPU *c) { crt_memmove(c); }
+void re5_ov_00E69B90(CPU *c) { crt_memmove(c); }
+
+/* _ftol2_sse (0x00E63D80) com o SSE2 ligado, que é o que o Windows roda: tira st(0), trunca para
+ * int32 com cvttsd2si (fora da faixa ou NaN = 0x80000000) e devolve em eax. edx fica como estava
+ * (o caminho SSE2 do CRT não o toca), ecx também. */
+void re5_ov_00E63D80(CPU *c)
+{
+    double v = fpop(c);
+    uint32_t r;
+    if (v != v || v >= 2147483648.0 || v <= -2147483649.0) r = 0x80000000u;
+    else r = (uint32_t)(int32_t)v;
+    c->eax = r;
+    c->esp += 4u;
+}
+
+/* _ftol2 x87 (0x00E63DB6; o _ftol2_sse cai nele sem SSE2 e 15 pontos o chamam direto, como o
+ * limitador de quadro em 0x00426F42): tira st(0) e devolve em edx:eax o int64 truncado. O corpo do
+ * CRT arredonda com fistp pelo RC atual e corrige pelo sinal da diferença, o que dá truncamento;
+ * NaN e fora da faixa saem como o inteiro indefinido 0x8000000000000000 (o fistp). ecx do CRT é
+ * lixo para quem chama. */
+void re5_ov_00E63DB6(CPU *c)
+{
+    double v = fpop(c);
+    uint64_t r;
+    if (v != v || v >= 9223372036854775808.0 || v < -9223372036854775808.0) r = 0x8000000000000000ull;
+    else r = (uint64_t)(int64_t)v;
+    c->eax = (uint32_t)r;
+    c->edx = (uint32_t)(r >> 32);
+    c->esp += 4u;
 }
 
 /* sqrtf do jogo (fase P5): push ebp; fld dword [ebp+8]; fsqrt; pop ebp; ret. Era 9,7% das
@@ -170,6 +236,12 @@ void re5_ov_00CD5FB0(CPU *c)
 
 static const re5_override_def k_overrides[] = {
     {0x00426230u, re5_ov_00426230, "HasCPUID: teste de EFLAGS.ID via pushfd/popfd -> sempre 1"},
+    {0x00E7D4FEu, re5_ov_00E7D4FE, "_get_sse2_info do CRT: teste de EFLAGS.ID via pushfd/popfd -> SSE2 sempre"},
+    {0x00E63D00u, re5_ov_00E63D00, "memset do CRT -> memset do host"},
+    {0x00E63EC0u, re5_ov_00E63EC0, "memcpy do CRT (trata sobreposição) -> memmove do host"},
+    {0x00E69B90u, re5_ov_00E69B90, "memmove do CRT -> memmove do host"},
+    {0x00E63D80u, re5_ov_00E63D80, "_ftol2_sse do CRT: cvttsd2si de st(0) em eax"},
+    {0x00E63DB6u, re5_ov_00E63DB6, "_ftol2 x87 do CRT: st(0) truncado para int64 em edx:eax"},
     {0x00428D60u, re5_ov_00428D60, "sqrtf: fld dword [ebp+8]; fsqrt - folha pura, 9,7% das amostras em jogo"},
     {0x006702B0u, re5_ov_006702B0, "IMA ADPCM do áudio - folha pura, 6,6% das amostras em jogo"},
     {0x00CD5FB0u, re5_ov_00CD5FB0, "cadeia de pais (posição/cor/alfa) - folha pura, 3,8% das amostras em jogo"},

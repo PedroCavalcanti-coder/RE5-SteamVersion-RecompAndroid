@@ -30,11 +30,16 @@ GPU_FILES = [
     "/sys/kernel/gpu/gpu_busy",                          # Samsung Exynos (Mali)
     "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",      # Adreno
     "/sys/class/kgsl/kgsl-3d0/gpubusy",                  # Adreno (ocupado total)
-    "/sys/kernel/ged/hal/gpu_utilization",               # MediaTek
+    "/sys/kernel/ged/hal/gpu_utilization",               # MediaTek ("ocupado ocioso bloqueado")
     "/sys/class/misc/mali0/device/utilization",          # alguns Mali
 ]
+# Clock da GPU. Unidades variam (Exynos kHz, kgsl e devfreq Hz, GED da MediaTek "opp kHz"):
+# read_clock_mhz normaliza. O glob do devfreq pega Mali com devfreq do kernel (MediaTek, Tensor).
 GPU_CLOCK_FILES = ["/sys/kernel/gpu/gpu_clock", "/sys/class/kgsl/kgsl-3d0/gpuclk",
+                   "/sys/kernel/ged/hal/current_freqency", "/sys/class/devfreq/*mali*/cur_freq",
                    "/sys/class/misc/mali0/device/cur_freq"]
+GPU_MAXCLOCK_FILES = ["/sys/kernel/gpu/gpu_max_clock", "/sys/class/kgsl/kgsl-3d0/max_gpuclk",
+                      "/sys/class/devfreq/*mali*/max_freq", "/sys/class/misc/mali0/device/max_freq"]
 
 FPS_RE = re.compile(r"fps ([\d.]+) \(Present \d+\).*?lock_ms ([\d.]+)(?: d3d9_ms ([\d.]+) present_ms ([\d.]+))?")
 
@@ -80,7 +85,23 @@ def parse_stats(text):
     return rows
 
 
-def read_gpu(text):
+def read_clock_mhz(text):
+    """Clock da GPU em MHz, de Hz, kHz ou MHz; no GED da MediaTek ("opp kHz") o último número."""
+    nums = [int(x) for x in re.findall(r"\d+", text)]
+    if not nums:
+        return None
+    v = nums[-1] if len(nums) >= 2 else nums[0]
+    if v >= 10_000_000:      # Hz
+        return v / 1e6
+    if v >= 10_000:          # kHz
+        return v / 1e3
+    return float(v)
+
+
+def read_gpu(text, path=None):
+    if path and "/ged/" in path:   # MediaTek: "ocupado ocioso bloqueado", em %
+        m = re.search(r"(\d+)", text)
+        return float(m.group(1)) if m else None
     m = re.search(r"(\d+)\s+(\d+)", text)
     if m and int(m.group(2)) > 0 and "%" not in text:   # kgsl gpubusy: ocupado total
         return 100.0 * int(m.group(1)) / int(m.group(2))
@@ -157,6 +178,8 @@ def main():
     klass, maxf = core_classes(s)
     gpu_file = next((f for f in GPU_FILES if shell(f"cat {f} 2>/dev/null", s).strip()), None)
     clk_file = next((f for f in GPU_CLOCK_FILES if shell(f"cat {f} 2>/dev/null", s).strip()), None)
+    gmax = next((read_clock_mhz(t) for t in (shell(f"cat {f} 2>/dev/null", s) for f in GPU_MAXCLOCK_FILES)
+                 if t.strip()), None)
     print(f"android_perf: {model} ({soc}, vulkan {vk or '?'}), pid {pid}; GPU: {gpu_file or 'sem contador legível'}",
           file=sys.stderr)
 
@@ -209,12 +232,12 @@ def main():
             fr = [int(x) for x in parts[1].split() if x.isdigit()]
             if fr:
                 freqs.append(fr)
-            g = read_gpu(parts[2]) if parts[2].strip() else None
+            g = read_gpu(parts[2], gpu_file) if parts[2].strip() else None
             if g is not None:
                 gpu.append(g)
-            c = re.search(r"\d+", parts[3])
+            c = read_clock_mhz(parts[3])
             if c:
-                gclk.append(int(c.group()))
+                gclk.append(c)
             m = re.search(r"VmRSS:\s+(\d+)", parts[4])
             if m:
                 rss.append(int(m.group(1)) / 1024)
@@ -263,7 +286,8 @@ def main():
           " ".join(f"cpu{i}={mean_f[i]:.0f}({maxf.get(i, 0) // 1000})" for i in range(ncore)))
     if gpu:
         p(f"GPU ocupada: média {statistics.mean(gpu):.0f}%, pico {max(gpu):.0f}% ({gpu_file})" +
-          (f"; clock médio {statistics.mean(gclk):.0f}" if gclk else ""))
+          (f"; clock médio {statistics.mean(gclk):.0f} MHz" if gclk else "") +
+          (f" (máx {gmax:.0f} MHz, {100 * statistics.mean(gclk) / gmax:.0f}% do máximo)" if gclk and gmax else ""))
     else:
         p("GPU ocupada: sem contador legível sem root neste aparelho (use a escala de resolução da A0 para separar)")
     if rss:

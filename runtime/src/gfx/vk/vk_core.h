@@ -345,6 +345,19 @@ struct vk_device {
     int dyn_dirty, desc_dirty;
     int has_eds1, has_eds2;
     VkDescriptorSet set;
+    /* VkSampler do slot (sem e com comparação), válido até o próximo SetSamplerState nele:
+     * sampler_get é busca linear com memcmp em toda a lista. */
+    VkSampler smp_cache[VK_MAX_SAMPLERS][2];
+    /* Sets já escritos neste envio (o pool zera a cada slot_begin): o mesmo conjunto de UBOs,
+     * views e samplers volta muito num quadro (material A, B, A...). Chave = os handles. */
+    struct vk_set_cache_entry {
+        uint64_t key[2 + 2 * RE5VK_NBINDINGS];
+        uint32_t nkey;
+        uint64_t hash, gen;    /* gen != set_cache_gen: vaga */
+        VkDescriptorSet set;
+    } *set_cache;
+    uint32_t set_cache_n, set_cache_cap;
+    uint64_t set_cache_gen;   /* sobe a cada slot_begin (re5vk.c) */
     uint32_t pipe_hash_cap;
     struct { int on; float color[4][4]; float z; uint32_t stencil; DWORD flags; } pending_clear;
 

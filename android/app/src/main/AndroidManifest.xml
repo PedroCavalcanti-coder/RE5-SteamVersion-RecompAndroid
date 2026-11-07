@@ -22,6 +22,9 @@
         android:isGame="true"
         android:supportsRtl="true">
 
+        <!-- Modos do Game Mode (res/xml/game_mode_config.xml): performance e bateria -->
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
+
         <activity
             android:name=".LauncherActivity"
             android:exported="true"

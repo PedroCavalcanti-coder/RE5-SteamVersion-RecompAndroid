@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Game Mode do Android 13+ (a Samsung o repassa ao Game Booster/GOS): sem isto só existem os
+     modos "standard" e "custom", e no A54 a GPU ficou presa no clock mínimo (221 MHz) com 70-89%
+     de uso em jogo (2026-11-07). O modo "performance" pede ao sistema clock mais alto.
+     Teste: adb shell cmd game mode performance com.re5.recompiled -->
+<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsPerformanceGameMode="true"
+    android:supportsBatteryGameMode="true"
+    android:allowGameAngleDriver="false"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />

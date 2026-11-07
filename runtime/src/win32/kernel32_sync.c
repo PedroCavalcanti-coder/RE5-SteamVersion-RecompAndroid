@@ -156,6 +156,10 @@ typedef struct {
     uint32_t last_waiter;
     uint32_t last_owner;
     uint32_t spin;           /* SpinCount que o jogo deu à seção */
+    /* De onde o jogo chamou o EnterCriticalSection que bloqueou (endereço de retorno no guest):
+     * as seções disputadas moram no heap e mudam de endereço a cada execução, mas o ponto de
+     * chamada diz qual classe/lock é. Até 4 pontos por seção. */
+    uint32_t site[4], site_n[4];
 } k32_cs_contention;
 #define K32_CS_CONTEND_MAX 128
 static k32_cs_contention g_cs_contend[K32_CS_CONTEND_MAX];
@@ -175,7 +179,7 @@ static int cs_stats_on(void)
     return on;
 }
 
-static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner)
+static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner, uint32_t site)
 {
     if (!cs_stats_on()) return;
     if (!g_cs_contend_mu_ready) {
@@ -196,6 +200,14 @@ static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner)
             g_cs_contend[h].last_waiter = waiter;
             g_cs_contend[h].last_owner = owner;
             g_cs_contend[h].spin = k32_r32(cs + CS_SPIN);
+            k32_cs_contention *e = &g_cs_contend[h];
+            for (int j = 0; j < 4; j++) {
+                if (e->site[j] == site || !e->site_n[j]) {
+                    e->site[j] = site;
+                    e->site_n[j]++;
+                    break;
+                }
+            }
             break;
         }
     }
@@ -239,6 +251,11 @@ void re5_k32_cs_contend_report(void)
         RE5_INFO("profile", "    %7u bloqueios: CS 0x%08X SpinCount %u (último dono tid 0x%X, garçom tid 0x%X)%s%s",
                  best, cs, g_cs_contend[bi].spin & 0x00FFFFFFu, g_cs_contend[bi].last_owner, g_cs_contend[bi].last_waiter,
                  nm ? "  " : "", nm ? nm : "");
+        for (int j = 0; j < 4 && g_cs_contend[bi].site_n[j]; j++) {
+            const char *fn = re5_name_lookup(g_cs_contend[bi].site[j]);
+            RE5_INFO("profile", "             chamada de 0x%08X: %u%s%s", g_cs_contend[bi].site[j],
+                     g_cs_contend[bi].site_n[j], fn ? "  " : "", fn ? fn : "");
+        }
         g_cs_contend[bi].count = 0;
     }
     g_cs_contend_total = 0;
@@ -256,7 +273,7 @@ static void cs_enter_global(CPU *c)
         return;
     }
     uint32_t owner = k32_r32(cs + CS_OWNER);
-    cs_record_contention(cs, tid, owner);
+    cs_record_contention(cs, tid, owner, k32_r32(c->esp));
     cs_queue *q = csq_find(s, cs, 1);
     if (q->n == CS_QLEN) re5_fatal("kernel32", "mais de %d threads esperando a seção 0x%08X", CS_QLEN, cs);
     q->tid[q->n++] = tid;
@@ -390,7 +407,7 @@ static void cs_enter_hle(CPU *c)
     uint32_t cs = re5_arg(c, 0), tid = cur_tid();
     if (cs_hle_try(cs, tid)) return;
     volatile uint32_t *own = (volatile uint32_t *)re5_g2h(cs + CS_OWNER);
-    cs_record_contention(cs, tid, *own);
+    cs_record_contention(cs, tid, *own, k32_r32(c->esp));
     uint32_t spin = k32_r32(cs + CS_SPIN) & 0x00FFFFFFu;   /* os bits altos são flags */
     if (!spin) spin = CS_SPIN_DEFAULT;
     if (spin > CS_SPIN_MAX) spin = CS_SPIN_MAX;
@@ -1056,8 +1073,11 @@ static void k_SleepEx(CPU *c)
             re5_host_sleep_ms((uint32_t)(end - now < PUMP_SLICE_MS ? end - now : PUMP_SLICE_MS));
             re5_thread_pump();
         }
+    } else if (ms == K32_INFINITE_MS) {
+        re5_host_sleep_ms(0x7FFFFFFFu);
     } else {
-        re5_host_sleep_ms(ms == K32_INFINITE_MS ? 0x7FFFFFFFu : ms);
+        /* granularidade do Windows (k32_guest_sleep_us): n ms + um tique */
+        re5_host_sleep_us(k32_guest_sleep_us(ms));
     }
     RE5_BLOCKING_END();
     c->eax = 0;

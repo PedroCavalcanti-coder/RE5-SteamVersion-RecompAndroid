@@ -59,3 +59,8 @@ tools/re5_logger/
 tools/pcrecomp/tools/drm/
 scripts/pe_reconstruct.py
 tests/python/test_pe_reconstruct.py
+
+# Código/arquivos do jogo: nunca no git (D7). O APK local precisa deles, mas eles ficam só no disco.
+android/app/src/main/assets/re5dx9.clean.exe
+android/app/src/main/jniLibs/arm64-v8a/libre5.so
+android/app/src/main/jniLibs/arm64-v8a/libdxvk_d3d9_old.so

@@ -322,6 +322,60 @@ O que mudou:
     forçado no Android, `dmb ish` em toda cabeça de laço e o relógio por `cntvct_el0` (estourava o
     `uint64` com ~15 min de aparelho ligado). Ficou: modo paralelo ligado por padrão no app
     (`parallel_mode`) e JobThread padrão 4.
+- **Thread de som e `Sleep` no celular (2026-11-07, `kernel32.c`, `kernel32_sync.c`):** nos logs do
+  A54 de 07/11 (`work/android/perf_a54_*.txt`) uma thread `g006FAEE0` gasta 42-82% de um núcleo
+  grande; no PC (`work/bench/*/run.log`) a mesma thread gasta 4,6%. É o wrapper de thread do MT
+  Framework (`0x006FAEE0`, chama o método +4 do objeto); a que pesa é a do som (vtable
+  `0x010B0DE4`, laço `0x0048C590`: `call 0x0049D830; Sleep(1)` até sair; a outra, `0x0048C6C0`,
+  dorme 50 ms). No PC o laço roda a ~500/s (`work/bench/sleep_stats`: 4823 `Sleep` em
+  `0x0048C5D0` por 10 s; o mesmo em `0x00447141`), porque o `Sleep(1)` do Windows acorda no tique
+  seguinte (~2 ms); no Android o `nanosleep` acorda em ~1,07 ms e os dois laços rodavam ~1,8x mais.
+  No A54 em jogo há ~400 mil `EnterCriticalSection`/s e ~500 mil `Leave`/s a 16 fps (~56 mil por
+  quadro; no PC, ~3,7 mil): é trabalho por tempo, não por quadro; o laço do som é o suspeito
+  provável (não conferido por thread).
+  Agora, fora do Windows, `Sleep(n>0)`/`SleepEx` duram n ms + 1 tique (`RE5_SLEEP_TICK_US`,
+  padrão 1000; 0 volta ao sono exato; no Windows o tique é 0, o `Sleep` já é o real).
+  `test_kernel32` (`test_sleep`: conta e duração medida, também com `RE5_SLEEP_TICK_US=1000` no
+  Windows). Junto: o leitor de logcat do `GameActivity` para no primeiro quadro (antes seguia o
+  jogo inteiro, com um `setText` na UI por linha) e a thread principal se anexa à JVM antes de
+  receber o nome (o ART a renomeava para `Thread-2`, que o `android_perf.py` contava como
+  "outros"); o `android_perf.py` lê clock e uso da GPU da MediaTek (GED, devfreq) e dá o clock
+  em MHz com a fração do máximo. **Não medido no aparelho.**
+- **Rodada de otimização PC + celular (2026-11-07; usuário: original 179 fps x nosso 133 no PC).**
+  Nada medido no jogo ainda; o usuário testa.
+  - **CRT sem SSE2 (achado):** o `_get_sse2_info` do CRT (`0x00E7D4FE`) usa o mesmo teste do bit ID
+    por `pushfd/popfd` que quebrava o `HasCPUID`; o lift não guarda o bit, o `cpuid` era pulado e
+    `__sse2_available` (`0x012B11AC`) ficava 0. O jogo inteiro rodava o CRT de uma CPU sem SSE2:
+    `_ftol2` pelo caminho x87 (`0x00E63DB6`, 3,3% da thread principal no perfil de 04/11),
+    `_controlfp` sem o MXCSR, memset/memcpy sem a via vetorial. No Windows real a flag é 1.
+  - **Overrides novos (`overrides.c`, `config/overrides.txt`):** `0x00E7D4FE` (SSE2 = 1),
+    `memset` `0x00E63D00`, `memcpy` `0x00E63EC0` e `memmove` `0x00E69B90` (memmove do host),
+    `_ftol2_sse` `0x00E63D80` (cvttsd2si em eax) e `_ftol2` `0x00E63DB6` (int64 truncado em
+    edx:eax; 15 chamadores diretos, entre eles o limitador de quadro). `difftest_override.py`
+    ganhou cenas de memória e um stub que empilha st(0) (com o cache de tradução do Unicorn
+    limpo entre cenas e o x87 zerado por caso): **1500/1500 iguais nos 7 overrides**
+    (registradores voláteis do cdecl e locais abaixo do esp fora da comparação). Relift: 72.121
+    funções, 0 falhas, 2 arquivos regravados.
+  - **Lock do HLE gira antes de dormir** (`thread.c`, `RE5_HLE_SPIN`, padrão 2000, 0 = antes):
+    no perfil de 04/11 a thread de render passava 9,5% esperando o lock, 6% com ele já livre.
+  - **re5vk:** (1) só os 15 render states que entram na chave do pipeline/variante sobem
+    `pipe_gen`; Z, stencil, bias, cull, scissor e blend factor só sujam o estado dinâmico e
+    `ALPHAREF` o UBO (antes todo `SetRenderState` novo refazia variantes, chave e hash da
+    declaração no draw seguinte); (2) cache de descriptor sets por envio (chave = UBOs +
+    binding/view/sampler; com ~210 mil `SetTexture`/s quase todo draw fazia
+    `vkAllocateDescriptorSets` + `vkUpdateDescriptorSets`); (3) `VkSampler` em cache por slot até o
+    próximo `SetSamplerState` (era busca linear com `memcmp`); (4) barreira de fim de passe só com
+    os estágios reais (anexos -> fragmento/anexos/cópia), sem segurar o vértice do passe seguinte
+    (no Mali é a bolha que a Arm manda evitar); `RE5VK_BARRIER=all` volta à barreira total.
+  - **`RE5_PROFILE`** diz, para cada CS disputada, de que ponto do jogo vieram as esperas (até 4
+    endereços de retorno): as duas seções do heap que seguram a thread principal (25% do tempo
+    parada dela) mudam de endereço a cada execução, e o ponto de chamada é o que diz qual lock é.
+  - Pesquisa de Vulkan no Android: `docs/PESQUISA_VULKAN_ANDROID.md`.
+  - Evidência: `ctest` 32/32 no Windows (duas rodadas completas), build ARM64 e APK gerados.
+    **Pendente:** o `test_kernel32` caiu com SEGFAULT 2 vezes em ~900 execuções (uma no modo
+    global dentro do ctest, outra no hle com `RE5_HLE_SPIN=0`, ou seja, também sem o giro novo);
+    não reproduziu em 600 voltas seguidas nem sob o gdb. Corrida rara no teste ou no runtime, a
+    investigar.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.

@@ -112,6 +112,7 @@ typedef struct d9_obj {
     d9_dxt_shadow  *dxt;                   /* aponta para dxt_storage (ou do pai se surface) */
     d9_dxt_shadow   dxt_storage;           /* armazenamento para Texture e CubeTexture */
     uint32_t        dxt_surface_sub;       /* subresource herdado da textura pai (se surface) */
+    uint32_t        q_issued;              /* consulta: g_presents + 1 no Issue(END); 0 = nunca */
 } d9_obj;
 
 #define D9_HASH 4096u
@@ -858,11 +859,13 @@ static void d_Reset(CPU *c)
 
 /* RE5_FPS_LOG=1: uma linha por segundo com os Present daquele segundo (medir
  * o benchmark sem o perfil, que custa desempenho). */
+static uint64_t g_q_calls, g_q_false;   /* Query::GetData: chamadas e S_FALSE (ver q_GetData) */
+
 static void fps_log(void)
 {
     static int on = -1;
     static uint32_t t0, n0;
-    static uint64_t th0, d30, dr0, hp0, lw0, dp0, dn0, pn0;
+    static uint64_t th0, d30, dr0, hp0, lw0, dp0, dn0, pn0, qc0, qf0;
     if (on < 0) {
         on = getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") && *getenv("RE5_FPS_LOG") != '0';
         re5_stats_on = on;
@@ -882,13 +885,17 @@ static void fps_log(void)
          * do jogo; present_ms: o Present, onde a DXVK espera a GPU). */
         RE5_INFO("d3d9",
                  "fps %.1f (Present %u) thunks %llu d3d9 %llu draws %llu heap %llu dispatch %llu lock_ms %.1f "
-                 "d3d9_ms %.1f present_ms %.1f",
+                 "d3d9_ms %.1f present_ms %.1f query %llu query_false %llu",
                  (double)(g_presents - n0) * 1000.0 / dt, g_presents,
                  (unsigned long long)((th - th0) * 1000.0 / dt), (unsigned long long)((d3 - d30) * 1000.0 / dt),
                  (unsigned long long)((dr - dr0) * 1000.0 / dt), (unsigned long long)((hp - hp0) * 1000.0 / dt),
                  (unsigned long long)(dp > dp0 ? (dp - dp0) * 1000.0 / dt : 0),
                  (double)(lw - lw0) / 1e6 * 1000.0 / dt, (double)(dn - dn0) / 1e6 * 1000.0 / dt,
-                 (double)(pn - pn0) / 1e6 * 1000.0 / dt);
+                 (double)(pn - pn0) / 1e6 * 1000.0 / dt,
+                 (unsigned long long)((g_q_calls - qc0) * 1000.0 / dt),
+                 (unsigned long long)((g_q_false - qf0) * 1000.0 / dt));
+        qc0 = g_q_calls;
+        qf0 = g_q_false;
         th0 = th; d30 = d3; dr0 = dr; hp0 = hp; lw0 = lw; dp0 = dp; dn0 = dn; pn0 = pn;
         static int tick, cpu_tick;
         if (++cpu_tick % 30 == 0) {   /* CPU por thread a cada 30 s */
@@ -1002,6 +1009,56 @@ static uint64_t frame_cap(void)
         else SDL_Delay(0);
     }
     return re5_stat_now_ns() - start;
+}
+
+/* ---- consultas de evento ----
+ * O RE5 usa D3DQUERYTYPE_EVENT para esperar a GPU entre quadros. No celular isso deixa a GPU parada
+ * enquanto a CPU monta o quadro seguinte; com ~75% de uso o governador da Mali do A54 não sai do
+ * clock mínimo (221 de 949 MHz, 07/11) e o jogo fica preso a ~20 fps em qualquer resolução.
+ * RE5_FPS_LOG conta as chamadas de GetData e quantas devolveram S_FALSE ("ainda não").
+ * RE5_QUERY_LAG=<n> (teste, desligado): evento emitido há n ou mais Present conta como pronto, para
+ * a GPU ter n quadros de folga; quem limita os quadros em voo passa a ser a própria DXVK. */
+
+static int query_lag(void)
+{
+    static int lag = -1;
+    if (lag < 0) {
+        const char *e = getenv("RE5_QUERY_LAG");
+        lag = e ? atoi(e) : 0;
+        if (lag < 0) lag = 0;
+        if (lag) RE5_INFO("d3d9", "RE5_QUERY_LAG=%d: consulta de evento pronta %d Present depois do Issue", lag, lag);
+    }
+    return lag;
+}
+
+static void q_Issue(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_QUERY);
+    IDirect3DQuery9 *q = (IDirect3DQuery9 *)o->host;
+    DWORD flags = re5_arg(c, 1);
+    if (flags & D3DISSUE_END) o->q_issued = g_presents + 1;
+    c->eax = (uint32_t)q->lpVtbl->Issue(q, flags);
+}
+
+static void q_GetData(CPU *c)
+{
+    d9_obj *o = self_obj(c, D9K_QUERY);
+    IDirect3DQuery9 *q = (IDirect3DQuery9 *)o->host;
+    void *data = d9_ptr(re5_arg(c, 1));
+    DWORD size = re5_arg(c, 2), flags = re5_arg(c, 3);
+    HRESULT hr = q->lpVtbl->GetData(q, data, size, flags);
+    __atomic_fetch_add(&g_q_calls, 1, __ATOMIC_RELAXED);
+    if (hr == S_FALSE) {
+        int lag = query_lag();
+        if (lag && o->q_issued && g_presents + 1 - o->q_issued >= (uint32_t)lag &&
+            q->lpVtbl->GetType(q) == D3DQUERYTYPE_EVENT) {
+            if (data && size >= sizeof(BOOL)) *(BOOL *)data = TRUE;
+            hr = S_OK;
+        } else {
+            __atomic_fetch_add(&g_q_false, 1, __ATOMIC_RELAXED);
+        }
+    }
+    c->eax = (uint32_t)hr;
 }
 
 static void d_Present(CPU *c)
@@ -1614,6 +1671,8 @@ static const d9_manual k_manual[] = {
     {D9K_DEVICE, "GetCreationParameters", d_GetCreationParameters},
     {D9K_DEVICE, "Reset", d_Reset},
     {D9K_DEVICE, "Present", d_Present},
+    {D9K_QUERY, "Issue", q_Issue},
+    {D9K_QUERY, "GetData", q_GetData},
     {D9K_DEVICE, "SetVertexShaderConstantF", d_SetVertexShaderConstantF},
     {D9K_DEVICE, "CreateTexture", d_CreateTexture},
     {D9K_DEVICE, "CreateVertexShader", d_CreateVertexShader},

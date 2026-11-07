@@ -445,6 +445,10 @@ public class GameActivity extends SDLActivity {
                         String msg = sep >= 0 ? line.substring(sep + 2) : line;
                         boolean firstFrame = msg.contains(FIRST_FRAME_MARK);
                         main.post(() -> onLogLine(msg, firstFrame));
+                        // Depois do primeiro quadro o painel de log some: seguir lendo deixava um
+                        // processo logcat acordado e um setText na thread de UI a cada linha do
+                        // runtime (o RE5_FPS_LOG escreve várias por segundo) o jogo inteiro.
+                        if (firstFrame) break;
                     }
                 }
             } catch (Exception e) {

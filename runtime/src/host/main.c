@@ -3,7 +3,8 @@
  *
  *   re5 [--exe PATH] [--game-dir DIR] [--user-dir DIR] [--census] [--missing]
  *
- *   --exe       executável limpo do jogo (padrão: bin_input/re5dx9.clean.exe)
+ *   --exe       executável limpo do jogo (padrão: re5dx9.clean.exe ao lado do re5.exe, senão
+ *               bin_input/re5dx9.clean.exe do repositório)
  *   --game-dir  pasta de instalação com nativePC/ (padrão: pasta do --exe)
  *   --census    só carrega a imagem e imprime quantos imports têm HLE
  *   --missing   com --census, lista os imports que faltam
@@ -45,6 +46,12 @@ static void guest_main(void *p)
     }
     t->start_va = a->entry;
     t->is_main = 1;
+#if defined(__ANDROID__)
+    /* O ART renomeia para "Thread-N" a thread nativa que se anexa à JVM sem nome (o SDL anexa
+     * esta no primeiro JNI dela). Anexada antes, o nome abaixo fica, e o android_perf.py e o
+     * RE5_FPS_LOG a contam como re5-main (nos logs de 07/11 aparecia como Thread-2). */
+    (void)SDL_AndroidGetJNIEnv();
+#endif
     re5_thread_set_host_name("re5-main");
     re5_guest_lock();
     a->result = re5_guest_call(t, a->entry, 0, NULL);
@@ -142,6 +149,20 @@ static int re5_main_entry(int argc, char **argv)
     }
 
     char dir[1024];
+    static char beside[1100];
+    if (!exe_given) {
+        /* Instalação do jogador: re5.exe dentro da pasta do jogo, ao lado do re5dx9.clean.exe e da
+         * nativePC_MT. Então a pasta do próprio executável é a pasta do jogo. */
+        char *base = SDL_GetBasePath();
+        if (base) {
+            snprintf(beside, sizeof beside, "%sre5dx9.clean.exe", base);
+            SDL_free(base);
+            if (file_exists(beside)) {
+                exe = beside;
+                exe_given = 1;
+            }
+        }
+    }
     if (!exe_given) {
         find_repo_root(exe);
         /* Os dados do jogo ficam em bin_input/game (o que o .bat passa em --game-dir). */

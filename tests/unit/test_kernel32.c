@@ -468,6 +468,38 @@ static void test_herd(void)
     call("CloseHandle", 1, g_ev_pong);
 }
 
+/* Sleep com a granularidade do Windows (k32_guest_sleep_us): fora do Windows, Sleep(n>0) dura
+ * n ms + 1 tique (os laços de Sleep(1) do jogo rodam a ~500/s como no PC, não a ~1000/s). */
+uint64_t k32_guest_sleep_us(uint32_t ms);
+
+static void test_sleep(void)
+{
+#if defined(_WIN32)
+    uint64_t tick = 0;
+#else
+    uint64_t tick = 1000;
+#endif
+    const char *e = getenv("RE5_SLEEP_TICK_US");
+    if (e && *e) tick = strtoul(e, NULL, 10);
+    CHECK(k32_guest_sleep_us(0) == 0);
+    CHECK(k32_guest_sleep_us(1) == 1000 + tick);
+    CHECK(k32_guest_sleep_us(50) == 50000 + tick);
+    /* Duração real: 10 Sleep(1) e 10 SleepEx(1) pelo relógio do guest (QPC de 10 MHz). */
+    uint32_t q = gbuf(16);
+    call("QueryPerformanceCounter", 1, q);
+    uint64_t t0 = rd32(q) | (uint64_t)rd32(q + 4) << 32;
+    for (int i = 0; i < 10; i++) {
+        call("Sleep", 1, 1u);
+        call("SleepEx", 2, 1u, 0u);
+    }
+    call("QueryPerformanceCounter", 1, q + 8);
+    uint64_t t1 = rd32(q + 8) | (uint64_t)rd32(q + 12) << 32;
+    uint64_t us_each = (t1 - t0) / 10u / 20u;
+    printf("test_sleep: Sleep(1) médio %llu us (esperado >= %llu)\n", (unsigned long long)us_each,
+           (unsigned long long)(1000 + tick));
+    CHECK(us_each >= 950 + tick);
+}
+
 static void test_nls(void)
 {
     CHECK_EQ_U32(call("GetACP", 0), 1252);
@@ -760,6 +792,7 @@ int main(int argc, char **argv)
     test_cs_stress();
     test_nls();
     test_env();
+    test_sleep();
     if (argc > 1) test_files(argv[1]);
 
     /* winmm: timeGetTime anda com o GetTickCount; timeBeginPeriod valida 1..1000 ms. */

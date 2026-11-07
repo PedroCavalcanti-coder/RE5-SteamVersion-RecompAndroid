@@ -29,7 +29,10 @@ static uint64_t host_ns(void)
     return (uint64_t)((double)t.QuadPart * 1e9 / (double)f.QuadPart);
 }
 static void host_sleep_ms(uint32_t ms) { Sleep(ms); }
+static void host_sleep_us(uint64_t us) { Sleep((DWORD)((us + 999u) / 1000u)); }
+#define K32_SLEEP_TICK_DEFAULT_US 0u      /* o Sleep do Windows já tem o tique */
 #else
+#include <errno.h>
 #include <time.h>
 static uint64_t host_ns(void)
 {
@@ -42,7 +45,27 @@ static void host_sleep_ms(uint32_t ms)
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     nanosleep(&ts, NULL);
 }
+static void host_sleep_us(uint64_t us)
+{
+    struct timespec ts = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L};
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+}
+#define K32_SLEEP_TICK_DEFAULT_US 1000u
 #endif
+
+uint64_t k32_guest_sleep_us(uint32_t ms)
+{
+    static int64_t tick = -1;
+    if (tick < 0) {
+        const char *e = getenv("RE5_SLEEP_TICK_US");
+        int64_t v = e && *e ? (int64_t)strtoul(e, NULL, 10) : (int64_t)K32_SLEEP_TICK_DEFAULT_US;
+        if (v > 100000) v = 100000;
+        if (e && *e) RE5_INFO("kernel32", "RE5_SLEEP_TICK_US=%lld: Sleep(n>0) dura n ms + %lld us", (long long)v,
+                              (long long)v);
+        tick = v;
+    }
+    return ms ? (uint64_t)ms * 1000u + (uint64_t)tick : 0;
+}
 
 #define K32_ERROR_MOD_NOT_FOUND  126u
 #define K32_ERROR_PROC_NOT_FOUND 127u
@@ -123,7 +146,8 @@ static void k_Sleep(CPU *c)
 {
     uint32_t ms = re5_arg(c, 0);
     RE5_BLOCKING_BEGIN();
-    host_sleep_ms(ms);
+    if (ms) host_sleep_us(k32_guest_sleep_us(ms));
+    else host_sleep_ms(0);
     RE5_BLOCKING_END();
 }
 

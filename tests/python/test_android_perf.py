@@ -39,6 +39,16 @@ class AndroidPerf(unittest.TestCase):
         self.assertEqual(android_perf.read_gpu("45 %\n"), 45.0)
         self.assertEqual(android_perf.read_gpu("37"), 37.0)
         self.assertAlmostEqual(android_perf.read_gpu("250 1000"), 25.0)   # kgsl gpubusy
+        # MediaTek GED: "ocupado ocioso bloqueado" (não é ocupado/total)
+        self.assertEqual(android_perf.read_gpu("26 74 0\n", "/sys/kernel/ged/hal/gpu_utilization"), 26.0)
+
+    def test_clock(self):
+        c = android_perf.read_clock_mhz
+        self.assertAlmostEqual(c("229966\n"), 229.966)        # Exynos, kHz
+        self.assertAlmostEqual(c("585000000\n"), 585.0)       # kgsl/devfreq, Hz
+        self.assertAlmostEqual(c("3 390000\n"), 390.0)        # GED da MediaTek: opp e kHz
+        self.assertEqual(c("702"), 702.0)                     # MHz
+        self.assertIsNone(c(""))
 
     def test_fps_line(self):
         new = ("I/RE5Native( 123): [INFO ] d3d9      fps 28.0 (Present 900) thunks 1 d3d9 2 draws 3 heap 4 "

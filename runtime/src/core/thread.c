@@ -330,9 +330,50 @@ static int hle_try(void)
     return __atomic_compare_exchange_n(&g_hle_held, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
 }
 
+/* Giro antes de dormir (2026-11-07): as posses do lock do HLE são de microssegundos, e dormir
+ * na variável de condição custa mais que isso para acordar. RE5_PROFILE no re5vk (04/11): a thread
+ * de render passava 9,5% esperando o lock, 6% com ele já livre ("passando a vez": a latência de
+ * acordar). RE5_HLE_SPIN=<n> muda o giro (0 = dorme direto, como antes). Com um núcleo só não
+ * gira (quem tem o lock não roda enquanto giramos). */
+static long re5_host_cpu_count(void)
+{
+#if defined(RE5_HOST_WINDOWS)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (long)si.dwNumberOfProcessors;
+#else
+    return sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+}
+
+static uint32_t hle_spin(void)
+{
+    static int64_t spin = -1;
+    if (spin < 0) {
+        const char *e = getenv("RE5_HLE_SPIN");
+        int64_t v = e && *e ? (int64_t)strtoul(e, NULL, 10) : 2000;
+        if (re5_host_cpu_count() < 2) v = 0;
+        spin = v;
+    }
+    return (uint32_t)spin;
+}
+
+static inline void hle_pause(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
 static void hle_take(void)
 {
     if (hle_try()) return;
+    for (uint32_t i = 0, n = hle_spin(); i < n; i++) {
+        hle_pause();
+        if (!__atomic_load_n(&g_hle_held, __ATOMIC_RELAXED) && hle_try()) return;
+    }
     re5_mutex_lock(&g_hle_mu);
     __atomic_add_fetch(&g_hle_waiting, 1, __ATOMIC_SEQ_CST);
     while (!hle_try()) {

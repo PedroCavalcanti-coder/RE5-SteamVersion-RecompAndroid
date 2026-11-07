@@ -47,6 +47,14 @@ int      k32_heap_free(uint32_t heap, uint32_t ptr);
 /* Milissegundos do relógio monotônico do host (GetTickCount, timeGetTime). */
 uint32_t k32_tick_ms(void);
 
+/* Duração real de um Sleep(ms) do guest, em microssegundos, com a granularidade do Windows:
+ * lá o Sleep(n>0) acorda no tique do timer depois do prazo, ~n+1 ms com timeBeginPeriod(1)
+ * (no PC do usuário, os laços de Sleep(1) do som e de 0x00447141 rodam a ~500/s, não 1000/s).
+ * Num host que não é Windows o nanosleep acorda em n ms e esses laços giravam ~1,8x mais.
+ * RE5_SLEEP_TICK_US=<us> muda o tique somado (padrão 1000 fora do Windows, 0 no Windows, onde
+ * o Sleep já é o real); 0 volta ao sono exato. ms = 0 fica 0 (o Sleep(0) só cede a vez). */
+uint64_t k32_guest_sleep_us(uint32_t ms);
+
 /* Sinaliza um evento do guest (OVERLAPPED.hEvent). 0 se o handle não é evento. */
 int k32_event_signal(uint32_t h);
 

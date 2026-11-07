@@ -72,6 +72,15 @@ if(NOT MSVC)
     if(RE5_MARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86")
         target_compile_options(re5_cpu INTERFACE -march=${RE5_MARCH})
     endif()
+    # Android ARM64: agenda as instruções para os núcleos dos celulares-alvo (A54, Dimensity 7030:
+    # A78 + A55; Z Flip5: X3/A715/A510). Só -mtune: o binário continua ARMv8.0 e roda em qualquer
+    # aparelho. As atômicas já saem como LSE em tempo de execução (outline atomics, padrão do NDK).
+    if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        set(RE5_ANDROID_TUNE "cortex-a78" CACHE STRING "-mtune= no Android ARM64 (vazio = padrão do NDK)")
+        if(RE5_ANDROID_TUNE)
+            target_compile_options(re5_cpu INTERFACE -mtune=${RE5_ANDROID_TUNE})
+        endif()
+    endif()
 endif()
 
 # Cobertura de funções (RE5_COV, teclas F8/F9 com RE5_COV=1): uma leitura numa tabela de 11 MB a

@@ -106,6 +106,7 @@ void re5vk_state_reset(vk_device *d)
     d->vp = (D3DVIEWPORT9){0, 0, bb->w, bb->h, 0.0f, 1.0f};
     d->scissor = (RECT){0, 0, (LONG)bb->w, (LONG)bb->h};
     d->vs_dirty = d->ps_dirty = d->dyn_dirty = d->desc_dirty = 1;
+    memset(d->smp_cache, 0, sizeof d->smp_cache);
     d->pending_clear.on = 0;
     d->pipe_gen++;
 }
@@ -173,12 +174,48 @@ static void begin_rendering(vk_device *d)
     d->dyn_dirty = 1;
 }
 
+/* Barreira de fim de passe (2026-11-07). Antes era ALL_COMMANDS -> ALL_COMMANDS: em GPU por tiles
+ * (Mali) isso segura o vértice do passe seguinte até o fragmento deste acabar, a bolha que a Arm
+ * manda evitar (docs/PESQUISA_VULKAN_ANDROID.md). Aqui: escritas de anexo (cor, profundidade) ->
+ * quem pode ler o alvo depois: o fragmento (amostrar), os anexos do passe seguinte (LOAD) e as
+ * cópias (StretchRect e leituras do alvo, que ainda põem a barreira total delas). O VS não entra:
+ * textura de vértice amostrando um alvo recém-desenhado pede RE5VK_BARRIER=all, que volta à
+ * barreira total. As imagens ficam em GENERAL, então uma barreira de memória basta. */
+static void pass_end_barrier(VkCommandBuffer cb)
+{
+    static int all = -1;
+    if (all < 0) {
+        const char *e = getenv("RE5VK_BARRIER");
+        all = e && !strcmp(e, "all");
+        if (all) RE5_INFO("re5vk", "RE5VK_BARRIER=all: barreira total no fim de cada passe");
+    }
+    if (all) {
+        re5vk_barrier_all(cb);
+        return;
+    }
+    VkMemoryBarrier b = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                         VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(cb,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &b, 0, NULL, 0, NULL);
+}
+
 void re5vk_end_rendering(vk_device *d)
 {
     if (!d->rendering && d->pending_clear.on) begin_rendering(d);   /* um Clear sem draw: aplica */
     if (!d->rendering) return;
     vkCmdEndRendering(re5vk_cmd(d));
-    re5vk_barrier_all(re5vk_cmd(d));   /* o que o passe escreveu fica visível para amostrar e copiar */
+    pass_end_barrier(re5vk_cmd(d));   /* o que o passe escreveu fica visível para amostrar e copiar */
     d->rendering = 0;
 }
 
@@ -370,9 +407,24 @@ static HRESULT STDMETHODCALLTYPE v_SetRenderState(IDirect3DDevice9 *self, D3DREN
     if ((uint32_t)s >= 256) return D3DERR_INVALIDCALL;
     if (d->rs[s] == v) return D3D_OK;
     d->rs[s] = v;
-    d->dyn_dirty = 1;
-    d->pipe_gen++;
-    if (s == D3DRS_ALPHAREF) d->ps_dirty = 1;
+    /* Só os estados que entram na chave do pipeline ou na variante do PS (prepare) refazem a
+     * busca; Z, stencil, bias, cull, scissor e blend factor são estado dinâmico (set_dynamic), e
+     * ALPHAREF vai no UBO. Antes todo SetRenderState com valor novo subia pipe_gen, e o draw
+     * seguinte recalculava variantes, chave e hash da declaração. */
+    switch (s) {
+    case D3DRS_ALPHATESTENABLE: case D3DRS_ALPHAFUNC: case D3DRS_FILLMODE: case D3DRS_ALPHABLENDENABLE:
+    case D3DRS_SRCBLEND: case D3DRS_DESTBLEND: case D3DRS_BLENDOP: case D3DRS_SEPARATEALPHABLENDENABLE:
+    case D3DRS_SRCBLENDALPHA: case D3DRS_DESTBLENDALPHA: case D3DRS_BLENDOPALPHA: case D3DRS_COLORWRITEENABLE:
+    case D3DRS_COLORWRITEENABLE1: case D3DRS_COLORWRITEENABLE2: case D3DRS_COLORWRITEENABLE3:
+        d->pipe_gen++;
+        break;
+    case D3DRS_ALPHAREF:
+        d->ps_dirty = 1;
+        break;
+    default:
+        d->dyn_dirty = 1;
+        break;
+    }
     return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE v_GetRenderState(IDirect3DDevice9 *self, D3DRENDERSTATETYPE s, DWORD *v)
@@ -389,6 +441,7 @@ static HRESULT STDMETHODCALLTYPE v_SetSamplerState(IDirect3DDevice9 *self, DWORD
     if (d->ss[s][t] != v) {
         d->ss[s][t] = v;
         d->desc_dirty = 1;
+        d->smp_cache[s][0] = d->smp_cache[s][1] = VK_NULL_HANDLE;
     }
     return D3D_OK;
 }
@@ -631,6 +684,44 @@ static VkSampler sampler_get(vk_device *d, int s, int compare)
     memcpy(d->samplers[d->nsamplers].key, key, sizeof key);
     d->samplers[d->nsamplers++].s = smp;
     return smp;
+}
+
+static VkSampler sampler_cached(vk_device *d, int s, int compare)
+{
+    VkSampler *p = &d->smp_cache[s][compare != 0];
+    if (!*p) *p = sampler_get(d, s, compare);
+    return *p;
+}
+
+/* ---- cache de descriptor sets por envio ---- */
+
+#define SET_CACHE_CAP 4096u   /* potência de 2; metade cheia = para de guardar até o próximo envio */
+
+static uint64_t set_key_hash(const uint64_t *k, uint32_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < n; i++) h = (h ^ k[i]) * 0x100000001b3ull;
+    return h ^ (h >> 29);
+}
+
+/* Devolve o slot da chave (achado ou vago); NULL sem tabela. */
+static struct vk_set_cache_entry *set_cache_slot(vk_device *d, const uint64_t *k, uint32_t n, uint64_t h, int *found)
+{
+    *found = 0;
+    if (!d->set_cache) {
+        d->set_cache = calloc(SET_CACHE_CAP, sizeof *d->set_cache);
+        if (!d->set_cache) return NULL;
+        d->set_cache_cap = SET_CACHE_CAP;
+    }
+    uint32_t m = d->set_cache_cap - 1;
+    for (uint32_t i = (uint32_t)h & m;; i = (i + 1) & m) {
+        struct vk_set_cache_entry *e = &d->set_cache[i];
+        if (e->gen != d->set_cache_gen) return e;
+        if (e->hash == h && e->nkey == n && !memcmp(e->key, k, n * sizeof k[0])) {
+            *found = 1;
+            return e;
+        }
+    }
 }
 
 /* ---- pipelines ---- */
@@ -1139,42 +1230,71 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     /* descritores: reaproveitados enquanto texturas, samplers e shaders não mudam */
     static VkBuffer last_vs_buf, last_ps_buf;
     if (d->desc_dirty || !d->set || last_vs_buf != d->vs_ubo_buf || last_ps_buf != d->ps_ubo_buf) {
-        d->set = re5vk_alloc_set(d);
-        VkWriteDescriptorSet w[RE5VK_NBINDINGS];
-        VkDescriptorBufferInfo bi[2] = {{d->vs_ubo_buf, 0, RE5VK_VS_UBO_SIZE}, {d->ps_ubo_buf, 0, RE5VK_PS_UBO_SIZE}};
         VkDescriptorImageInfo ii[20];
-        uint32_t nw = 0;
-        for (int i = 0; i < 2; i++)
-            w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
-                                             .dstBinding = (uint32_t)i, .descriptorCount = 1,
-                                             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-                                             .pBufferInfo = &bi[i]};
+        uint32_t bind[20];
         uint32_t ni = 0;
         for (int s = 0; s < 16; s++) {
             if (!(psi->samplers >> s & 1)) continue;
             int dep;
             vk_image *im = bound_image(d, s, psi->sampler_type[s], &dep);
-            ii[ni] = (VkDescriptorImageInfo){sampler_get(d, s, dep && (psv.depth_samplers >> s & 1)),
+            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, s, dep && (psv.depth_samplers >> s & 1)),
                                              re5vk_image_sampled_view(d, im, d->ss[s][D3DSAMP_SRGBTEXTURE] != 0),
                                              VK_IMAGE_LAYOUT_GENERAL};
-            w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
-                                             .dstBinding = RE5VK_BIND_PS_SAMP + (uint32_t)s, .descriptorCount = 1,
-                                             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                             .pImageInfo = &ii[ni++]};
+            bind[ni++] = RE5VK_BIND_PS_SAMP + (uint32_t)s;
         }
         for (int s = 0; s < 4; s++) {
             if (!(vsi->samplers >> s & 1)) continue;
             int dep;
             vk_image *im = bound_image(d, 16 + s, vsi->sampler_type[s], &dep);
-            ii[ni] = (VkDescriptorImageInfo){sampler_get(d, 16 + s, 0),
+            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, 16 + s, 0),
                                              re5vk_image_sampled_view(d, im, d->ss[16 + s][D3DSAMP_SRGBTEXTURE] != 0),
                                              VK_IMAGE_LAYOUT_GENERAL};
-            w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
-                                             .dstBinding = RE5VK_BIND_VS_SAMP + (uint32_t)s, .descriptorCount = 1,
-                                             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                             .pImageInfo = &ii[ni++]};
+            bind[ni++] = RE5VK_BIND_VS_SAMP + (uint32_t)s;
         }
-        vkUpdateDescriptorSets(d->dev, nw, w, 0, NULL);
+        /* Mesmo conjunto (UBOs, bindings, views, samplers) já escrito neste envio: reusa o set. */
+        uint64_t key[2 + 2 * RE5VK_NBINDINGS];
+        uint32_t nk = 0;
+        key[nk++] = (uint64_t)(uintptr_t)d->vs_ubo_buf;
+        key[nk++] = (uint64_t)(uintptr_t)d->ps_ubo_buf;
+        for (uint32_t i = 0; i < ni; i++) {
+            key[nk++] = (uint64_t)(uintptr_t)ii[i].imageView ^ ((uint64_t)bind[i] << 56);
+            key[nk++] = (uint64_t)(uintptr_t)ii[i].sampler;
+        }
+        uint64_t h = set_key_hash(key, nk);
+        int found;
+        struct vk_set_cache_entry *e = set_cache_slot(d, key, nk, h, &found);
+        if (found) {
+            d->set = e->set;
+        } else {
+            d->set = re5vk_alloc_set(d);   /* pode mandar o envio e zerar o cache (gen novo) */
+            VkWriteDescriptorSet w[RE5VK_NBINDINGS];
+            VkDescriptorBufferInfo bi[2] = {{d->vs_ubo_buf, 0, RE5VK_VS_UBO_SIZE},
+                                            {d->ps_ubo_buf, 0, RE5VK_PS_UBO_SIZE}};
+            uint32_t nw = 0;
+            for (int i = 0; i < 2; i++)
+                w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
+                                                 .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                                                 .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                                                 .pBufferInfo = &bi[i]};
+            for (uint32_t i = 0; i < ni; i++)
+                w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = d->set,
+                                                 .dstBinding = bind[i], .descriptorCount = 1,
+                                                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                 .pImageInfo = &ii[i]};
+            vkUpdateDescriptorSets(d->dev, nw, w, 0, NULL);
+            /* Guarda (refaz a busca: o alloc pode ter trocado o envio e esvaziado a tabela). */
+            if (d->set_cache_n < d->set_cache_cap / 2u || !d->set_cache) {
+                e = set_cache_slot(d, key, nk, h, &found);
+                if (e && !found && d->set_cache_n < d->set_cache_cap / 2u) {
+                    memcpy(e->key, key, nk * sizeof key[0]);
+                    e->nkey = nk;
+                    e->hash = h;
+                    e->gen = d->set_cache_gen;
+                    e->set = d->set;
+                    d->set_cache_n++;
+                }
+            }
+        }
         last_vs_buf = d->vs_ubo_buf;
         last_ps_buf = d->ps_ubo_buf;
         d->desc_dirty = 0;
@@ -1289,7 +1409,12 @@ static HRESULT STDMETHODCALLTYPE v_StretchRect(IDirect3DDevice9 *self, IDirect3D
     return D3D_OK;
 }
 
-void re5vk_draw_destroy(vk_device *d) { (void)d; }
+void re5vk_draw_destroy(vk_device *d)
+{
+    free(d->set_cache);
+    d->set_cache = NULL;
+    d->set_cache_cap = d->set_cache_n = 0;
+}
 
 void re5vk_draw_vtable(struct IDirect3DDevice9Vtbl *vt)
 {
