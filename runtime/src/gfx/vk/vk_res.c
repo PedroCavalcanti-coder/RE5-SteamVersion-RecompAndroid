@@ -53,7 +53,7 @@ static const vk_format k_formats[] = {
     {D3DFMT_D16_LOCKABLE, VK_FORMAT_D16_UNORM, ID, 1, 1, 2, 1, 0},
     {D3DFMT_D32, VK_FORMAT_D32_SFLOAT, ID, 1, 1, 4, 1, 0},
     {D3DFMT_D32F_LOCKABLE, VK_FORMAT_D32_SFLOAT, ID, 1, 1, 4, 1, 0},
-    {FOURCC('I', 'N', 'T', 'Z'), VK_FORMAT_D24_UNORM_S8_UINT, ID, 1, 1, 4, 1, 1},
+    {FOURCC('I', 'N', 'T', 'Z'), VK_FORMAT_D24_UNORM_S8_UINT, SW(R, R, R, R), 1, 1, 4, 1, 1},
 };
 
 const vk_format *re5vk_format(D3DFORMAT f)
@@ -274,6 +274,7 @@ void re5vk_image_destroy(vk_device *d, vk_image *im)
 static void upload(vk_device *d, vk_image *im, uint32_t layer, uint32_t level, uint32_t x, uint32_t y, uint32_t z,
                    uint32_t w, uint32_t h, uint32_t depth, const uint8_t *data, uint32_t pitch, uint32_t slice)
 {
+    if (!w || !h || !depth) return;
     const vk_format *f = im->fmt;
     uint32_t bw = f->bw, bh = f->bh;
     uint32_t row = (w + bw - 1) / bw * f->bytes, rows = (h + bh - 1) / bh;
@@ -623,9 +624,11 @@ static HRESULT tex_unlock(vk_texture *t, uint32_t layer, uint32_t level)
         if (y2 > lh) y2 = lh;
         uint32_t z = t->img.type == VK_IMAGE_TYPE_3D ? bx.Front : 0;
         uint32_t nz = t->img.type == VK_IMAGE_TYPE_3D ? bx.Back - bx.Front : 1;
-        const uint8_t *src = t->locks[i].data + (size_t)z * pitch * rows + (size_t)(y / f->bh) * pitch +
-                             (size_t)(x / f->bw) * f->bytes;
-        upload(d, &t->img, layer, level, x, y, z, x2 - x, y2 - y, nz, src, pitch, pitch * rows);
+        if (x2 > x && y2 > y) {
+            const uint8_t *src = t->locks[i].data + (size_t)z * pitch * rows + (size_t)(y / f->bh) * pitch +
+                                 (size_t)(x / f->bw) * f->bytes;
+            upload(d, &t->img, layer, level, x, y, z, x2 - x, y2 - y, nz, src, pitch, pitch * rows);
+        }
         t->locks[i].on = 0;
     }
     re5vk_unlock(d);
@@ -975,7 +978,8 @@ HRESULT re5vk_shader_variant(vk_device *d, vk_shader *s, const re5vk_dxso_varian
                              const re5vk_shader **info)
 {
     for (int i = 0; i < s->nv; i++) {
-        if (s->v[i].var.depth_samplers == var->depth_samplers && s->v[i].var.alpha_func == var->alpha_func) {
+        if (s->v[i].var.depth_samplers == var->depth_samplers && s->v[i].var.alpha_func == var->alpha_func &&
+            s->v[i].var.in_uint == var->in_uint && s->v[i].var.in_sint == var->in_sint) {
             *mod = s->v[i].mod;
             *info = &s->v[i].info;
             return D3D_OK;

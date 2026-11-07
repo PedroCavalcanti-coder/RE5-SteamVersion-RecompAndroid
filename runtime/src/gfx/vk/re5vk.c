@@ -24,6 +24,7 @@
 #endif
 
 #include "vk_core.h"
+#include "vk_blit_spv.h"
 #include "re5/re5vk.h"
 #include "re5/thunks.h"
 #include "re5/guest_base.h"
@@ -190,7 +191,12 @@ static HMONITOR STDMETHODCALLTYPE d_GetAdapterMonitor(IDirect3D9 *self, UINT a)
 static HRESULT STDMETHODCALLTYPE d_CreateDevice(IDirect3D9 *self, UINT a, D3DDEVTYPE t, HWND focus, DWORD flags,
                                                 D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out)
 {
-    return re5vk_device_create((vk_d3d9 *)self, a, t, focus, flags, pp, out);
+    HRESULT hr = re5vk_device_create((vk_d3d9 *)self, a, t, focus, flags, pp, out);
+    if (FAILED(hr) && INNER(self)) {
+        RE5_WARN("re5vk", "re5vk_device_create falhou (0x%08X); caindo de volta para o backend DXVK", (uint32_t)hr);
+        return INNER(self)->lpVtbl->CreateDevice(INNER(self), a, t, focus, flags, pp, out);
+    }
+    return hr;
 }
 
 static const struct IDirect3D9Vtbl k_d3d9_vtbl = {
@@ -673,6 +679,127 @@ static void slots_create(vk_device *d)
 
 /* ---- swapchain ---- */
 
+static void present_pipe_create(vk_device *d)
+{
+    if (d->present_pipe) {
+        vkDestroyPipeline(d->dev, d->present_pipe, NULL);
+        d->present_pipe = VK_NULL_HANDLE;
+    }
+    if (!d->present_sampler) {
+        VkSamplerCreateInfo sci = {
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = VK_FILTER_LINEAR,
+            .minFilter = VK_FILTER_LINEAR,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        };
+        VK_CHECK(vkCreateSampler(d->dev, &sci, NULL, &d->present_sampler));
+    }
+    if (!d->present_dsl) {
+        VkDescriptorSetLayoutBinding b = {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+        VkDescriptorSetLayoutCreateInfo lci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &b,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(d->dev, &lci, NULL, &d->present_dsl));
+        VkPipelineLayoutCreateInfo plci = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1,
+            .pSetLayouts = &d->present_dsl,
+        };
+        VK_CHECK(vkCreatePipelineLayout(d->dev, &plci, NULL, &d->present_layout));
+        VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+        VkDescriptorPoolCreateInfo dpci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &dps,
+        };
+        VK_CHECK(vkCreateDescriptorPool(d->dev, &dpci, NULL, &d->present_pool));
+        VkDescriptorSetAllocateInfo dsai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = d->present_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &d->present_dsl,
+        };
+        VK_CHECK(vkAllocateDescriptorSets(d->dev, &dsai, &d->present_set));
+    }
+    VkShaderModuleCreateInfo smci_vs = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sizeof k_blit_vs_spv,
+        .pCode = k_blit_vs_spv,
+    };
+    VkShaderModule vs_mod;
+    VK_CHECK(vkCreateShaderModule(d->dev, &smci_vs, NULL, &vs_mod));
+
+    VkShaderModuleCreateInfo smci_ps = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sizeof k_blit_ps_spv,
+        .pCode = k_blit_ps_spv,
+    };
+    VkShaderModule ps_mod;
+    VK_CHECK(vkCreateShaderModule(d->dev, &smci_ps, NULL, &ps_mod));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vs_mod, .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = ps_mod, .pName = "main"},
+    };
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                            .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .lineWidth = 1.0f,
+    };
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    VkPipelineColorBlendStateCreateInfo bs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = 1, .pAttachments = &cba};
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                           .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo rinfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &d->swap_format,
+    };
+    VkGraphicsPipelineCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &rinfo,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &vi,
+        .pInputAssemblyState = &ia,
+        .pViewportState = &vp,
+        .pRasterizationState = &rs,
+        .pMultisampleState = &ms,
+        .pColorBlendState = &bs,
+        .pDynamicState = &dy,
+        .layout = d->present_layout,
+    };
+    VK_CHECK(vkCreateGraphicsPipelines(d->dev, d->pcache, 1, &ci, NULL, &d->present_pipe));
+    vkDestroyShaderModule(d->dev, vs_mod, NULL);
+    vkDestroyShaderModule(d->dev, ps_mod, NULL);
+}
+
 static void swapchain_create(vk_device *d)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -722,6 +849,19 @@ static void swapchain_create(vk_device *d)
     for (int p = 0; p < 3 && mode == VK_PRESENT_MODE_FIFO_KHR; p++)
         for (uint32_t i = 0; i < nm; i++)
             if (modes[i] == pref[p]) { mode = pref[p]; break; }
+
+    /* Compatibilidade Snapdragon (Adreno) e GPUs móveis: caps.supportedUsageFlags pode não ter
+     * TRANSFER_DST (proibido pela spec do Vulkan pedir bit não suportado; no Adreno falha com
+     * VK_ERROR_INITIALIZATION_FAILED). Se não tiver TRANSFER_DST ou suporte a blit dst, a apresentação
+     * cai automaticamente para desenho via render pass dinâmico (present_pipe_create). */
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    d->swap_has_transfer_dst = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
+
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(d->phys, d->swap_format, &fp);
+    d->can_blit_to_swap = d->swap_has_transfer_dst && ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0);
+
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = d->surface,
@@ -730,7 +870,7 @@ static void swapchain_create(vk_device *d)
         .imageColorSpace = cs,
         .imageExtent = d->swap_extent,
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageUsage = usage,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = xf,
         .compositeAlpha = alpha,
@@ -745,13 +885,29 @@ static void swapchain_create(vk_device *d)
     d->nimages = VK_MAX_IMAGES;
     VK_CHECK(vkGetSwapchainImagesKHR(d->dev, d->swap, &d->nimages, d->images));
     for (uint32_t i = 0; i < d->nimages; i++) {
+        if (d->image_views[i]) {
+            vkDestroyImageView(d->dev, d->image_views[i], NULL);
+            d->image_views[i] = VK_NULL_HANDLE;
+        }
+        VkImageViewCreateInfo vi = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = d->images[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = d->swap_format,
+            .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        VK_CHECK(vkCreateImageView(d->dev, &vi, NULL, &d->image_views[i]));
         if (d->done[i]) continue;
         VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(d->dev, &si, NULL, &d->done[i]));
     }
-    RE5_INFO("re5vk", "swapchain %ux%u, formato %d, %u imagens, %s", d->swap_extent.width, d->swap_extent.height,
+    present_pipe_create(d);
+    RE5_INFO("re5vk", "swapchain %ux%u, formato %d, %u imagens, %s (apresentação: %s)", d->swap_extent.width, d->swap_extent.height,
              (int)d->swap_format, d->nimages,
-             mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO");
+             mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO",
+             d->can_blit_to_swap ? "blit" : "render");
 }
 
 /* ---- back buffer e profundidade automática ---- */
@@ -944,22 +1100,70 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
         re5vk_unlock(d);
         return D3D_OK;
     }
-    if (r < 0) re5_fatal("re5vk", "vkAcquireNextImageKHR -> %s", re5vk_result(r));
+    if (r < 0 && r != VK_SUBOPTIMAL_KHR) re5_fatal("re5vk", "vkAcquireNextImageKHR -> %s", re5vk_result(r));
     VkImage img = d->images[idx];
     re5vk_barrier_all(cb);
-    image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                  VK_ACCESS_TRANSFER_WRITE_BIT);
     vk_image *bb = d->backbuffer->img;
-    VkImageBlit blit = {
-        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .srcOffsets = {{0, 0, 0}, {(int32_t)bb->w, (int32_t)bb->h, 1}},
-        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .dstOffsets = {{0, 0, 0}, {(int32_t)d->swap_extent.width, (int32_t)d->swap_extent.height, 1}},
-    };
-    vkCmdBlitImage(cb, bb->image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                   VK_FILTER_LINEAR);
-    image_barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                  VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    if (d->can_blit_to_swap) {
+        image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                      VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit blit = {
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .srcOffsets = {{0, 0, 0}, {(int32_t)bb->w, (int32_t)bb->h, 1}},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstOffsets = {{0, 0, 0}, {(int32_t)d->swap_extent.width, (int32_t)d->swap_extent.height, 1}},
+        };
+        vkCmdBlitImage(cb, bb->image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_LINEAR);
+        image_barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    } else {
+        /* Render fallback para Snapdragon / Adreno e GPUs sem TRANSFER_DST no swapchain */
+        VkDescriptorImageInfo dii = {
+            .sampler = d->present_sampler,
+            .imageView = bb->view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        VkWriteDescriptorSet w = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = d->present_set,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &dii,
+        };
+        if (d->present_view != bb->view) {   /* o set pode estar em uso por um quadro em voo */
+            vkUpdateDescriptorSets(d->dev, 1, &w, 0, NULL);
+            d->present_view = bb->view;
+        }
+        image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRenderingAttachmentInfo rai = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = d->image_views[idx],
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        };
+        VkRenderingInfo ri = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = {{0, 0}, d->swap_extent},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &rai,
+        };
+        vkCmdBeginRendering(cb, &ri);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->present_pipe);
+        VkViewport v = {0.0f, 0.0f, (float)d->swap_extent.width, (float)d->swap_extent.height, 0.0f, 1.0f};
+        vkCmdSetViewport(cb, 0, 1, &v);
+        VkRect2D sc = {{0, 0}, d->swap_extent};
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->present_layout, 0, 1, &d->present_set, 0, NULL);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRendering(cb);
+        image_barrier(cb, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0);
+    }
     bb->last_use = d->serial;
     int prev = d->cur;
     uint64_t this_serial = d->serial;
@@ -972,7 +1176,8 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
         .pSwapchains = &d->swap,
         .pImageIndices = &idx,
     };
-    /* A espera da GPU e do compositor não segura o device: outras threads podem criar recursos. */
+    /* vkQueuePresentKHR com o mutex: a fila do Vulkan exige acesso exclusivo, e outra thread pode
+     * estar num re5vk_flush (Lock de buffer, GetRenderTargetData). */
     r = vkQueuePresentKHR(d->queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         vkDeviceWaitIdle(d->dev);
@@ -982,7 +1187,8 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
     }
     slot_begin(d, (prev + 1) % VK_SLOTS);
     re5vk_unlock(d);
-    /* limite de quadros em voo, fora do mutex */
+    /* Limite de quadros em voo. A espera é com o mutex: fora dele, outra thread pode reusar o slot
+     * (vkResetFences no slot_begin) enquanto esta espera a fence, e a espera nunca termina. */
     if (this_serial > (uint64_t)latency()) {
         re5vk_lock(d);
         uint64_t want = this_serial - (uint64_t)latency();
@@ -1143,6 +1349,16 @@ static void layout_create(vk_device *d)
     free(blob);
 }
 
+/* Falha antes do device: solta superfície e instância (a DXVK, no fallback, cria a dela na
+ * mesma janela; no Android a ANativeWindow só aceita um produtor conectado). */
+static HRESULT early_fail(vk_device *d)
+{
+    if (d->surface) vkDestroySurfaceKHR(d->inst, d->surface, NULL);
+    if (d->inst) vkDestroyInstance(d->inst, NULL);
+    free(d);
+    return D3DERR_NOTAVAILABLE;
+}
+
 HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags,
                             D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out)
 {
@@ -1208,8 +1424,13 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
                             NULL
 #endif
     };
+    /* Versão negociada com o carregador: permite Vulkan 1.1+ em dispositivos Snapdragon / Android */
+    uint32_t inst_ver = VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion enum_ver = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceVersion");
+    if (enum_ver) enum_ver(&inst_ver);
+    uint32_t req_ver = inst_ver >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "re5",
-                             .pEngineName = "re5vk", .apiVersion = VK_API_VERSION_1_3};
+                             .pEngineName = "re5vk", .apiVersion = req_ver};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                 .enabledExtensionCount = 2, .ppEnabledExtensionNames = iexts};
     VK_CHECK(vkCreateInstance(&ici, NULL, &d->inst));
@@ -1227,14 +1448,23 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
     VK_CHECK(vkCreateAndroidSurfaceKHR(d->inst, &sci, NULL, &d->surface));
 #endif
 
-    /* GPU: a primeira com Vulkan 1.3 e uma fila de gráficos que apresenta nesta superfície. */
+    /* GPU: a primeira com Vulkan 1.1+ e dynamic rendering (1.3 core ou VK_KHR_dynamic_rendering),
+     * e uma fila de gráficos que apresenta nesta superfície. */
     uint32_t npd = 8;
     VkPhysicalDevice pds[8];
     VK_CHECK(vkEnumeratePhysicalDevices(d->inst, &npd, pds));
     for (uint32_t i = 0; i < npd && !d->phys; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        if (p.apiVersion < VK_API_VERSION_1_1) continue;
+        uint32_t next = 0;
+        vkEnumerateDeviceExtensionProperties(pds[i], NULL, &next, NULL);
+        VkExtensionProperties *pexts = calloc(next ? next : 1, sizeof *pexts);
+        if (pexts) vkEnumerateDeviceExtensionProperties(pds[i], NULL, &next, pexts);
+        int has_dyn = (p.apiVersion >= VK_API_VERSION_1_3) ||
+                      (pexts && has_ext(pexts, next, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME));
+        free(pexts);
+        if (!has_dyn) continue;
         uint32_t nq = 16;
         VkQueueFamilyProperties qp[16];
         vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, qp);
@@ -1248,45 +1478,121 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
             }
         }
     }
-    if (!d->phys) re5_fatal("re5vk", "nenhuma GPU com Vulkan 1.3 e fila de gráficos que apresente na janela");
+    if (!d->phys) {
+        RE5_WARN("re5vk", "nenhuma GPU compatível com dynamic rendering encontrada");
+        return early_fail(d);
+    }
     vkGetPhysicalDeviceProperties(d->phys, &d->props);
     vkGetPhysicalDeviceMemoryProperties(d->phys, &d->memprops);
     uint32_t next = 0;
     vkEnumerateDeviceExtensionProperties(d->phys, NULL, &next, NULL);
     VkExtensionProperties *exts = calloc(next ? next : 1, sizeof *exts);
     if (exts) vkEnumerateDeviceExtensionProperties(d->phys, NULL, &next, exts);
-    if (!exts || !has_ext(exts, next, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
-        re5_fatal("re5vk", "GPU '%s' sem VK_KHR_swapchain", d->props.deviceName);
+    if (!exts || !has_ext(exts, next, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+        RE5_WARN("re5vk", "GPU '%s' sem VK_KHR_swapchain", d->props.deviceName);
+        free(exts);
+        return early_fail(d);
+    }
     const char *zc_env = getenv("RE5VK_ZEROCOPY");
-    /* Desligado por padrão: empate no A/B do usuário (93,5 x 93,9 fixo; 60,8 x 60,3 variável) e gasta
-     * espaço de endereço do guest. RE5VK_ZEROCOPY=1 liga. */
     int want_zc = zc_env && *zc_env == '1' && has_ext(exts, next, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    int has_dyn_ext = has_ext(exts, next, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    int has_eds1 = has_ext(exts, next, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    int has_eds2 = has_ext(exts, next, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
     free(exts);
 
+    const char *dexts[8];
+    uint32_t ndexts = 0;
+    dexts[ndexts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    if (has_dyn_ext) dexts[ndexts++] = VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
+    if (has_eds1 && !(d->props.apiVersion >= VK_API_VERSION_1_3)) dexts[ndexts++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
+    if (has_eds2 && !(d->props.apiVersion >= VK_API_VERSION_1_3)) dexts[ndexts++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
+    if (want_zc) dexts[ndexts++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13};
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT feds1 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT feds2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT};
+
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    void **q_tail = &f2.pNext;
+    int use_f13 = (req_ver >= VK_API_VERSION_1_3) && (d->props.apiVersion >= VK_API_VERSION_1_3);
+    if (use_f13) {
+        *q_tail = &f13;
+        q_tail = &f13.pNext;
+    } else if (has_dyn_ext) {
+        *q_tail = &fdr;
+        q_tail = &fdr.pNext;
+    }
+    if (has_eds1) {
+        *q_tail = &feds1;
+        q_tail = &feds1.pNext;
+    }
+    if (has_eds2) {
+        *q_tail = &feds2;
+        q_tail = &feds2.pNext;
+    }
     vkGetPhysicalDeviceFeatures2(d->phys, &f2);
-    if (!f13.dynamicRendering) re5_fatal("re5vk", "GPU '%s' sem dynamicRendering", d->props.deviceName);
+
+    int dyn_ok = (use_f13 && f13.dynamicRendering) || (has_dyn_ext && fdr.dynamicRendering);
+    if (!dyn_ok) {
+        RE5_WARN("re5vk", "GPU '%s' sem dynamicRendering", d->props.deviceName);
+        return early_fail(d);
+    }
+
+    /* Estado dinâmico estendido 1 e 2: núcleo no Vulkan 1.3 (o driver não precisa anunciar a
+     * extensão), extensão antes disso. O re5vk põe cull, profundidade, stencil e topologia SÓ como
+     * estado dinâmico; sem ele nada disso seria configurado (a primeira versão do fallback do
+     * Snapdragon desligava tudo quando a extensão não aparecia na lista - inclusive no A54 e no PC
+     * com 1.3 - e o jogo desenhava sem teste de profundidade). Sem os dois: DXVK. */
+    d->has_eds1 = use_f13 || (has_eds1 && feds1.extendedDynamicState);
+    d->has_eds2 = use_f13 || (has_eds2 && feds2.extendedDynamicState2);
+    if (!d->has_eds1 || !d->has_eds2) {
+        RE5_WARN("re5vk", "GPU '%s' sem extendedDynamicState%s", d->props.deviceName, d->has_eds1 ? "2" : "");
+        return early_fail(d);
+    }
+
     VkPhysicalDeviceVulkan13Features e13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE};
-    VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e13};
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR edr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+                                                      .dynamicRendering = VK_TRUE};
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eeds1 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+                                                            .extendedDynamicState = VK_TRUE};
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eeds2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+                                                             .extendedDynamicState2 = VK_TRUE};
+    VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    void **e_tail = &e2.pNext;
+    if (use_f13) {
+        *e_tail = &e13;
+        e_tail = &e13.pNext;
+    } else if (has_dyn_ext) {
+        *e_tail = &edr;
+        e_tail = &edr.pNext;
+    }
+    if (!use_f13 && has_eds1) {
+        *e_tail = &eeds1;
+        e_tail = &eeds1.pNext;
+    }
+    if (!use_f13 && has_eds2) {
+        *e_tail = &eeds2;
+        e_tail = &eeds2.pNext;
+    }
     e2.features.samplerAnisotropy = f2.features.samplerAnisotropy;
     e2.features.textureCompressionBC = f2.features.textureCompressionBC;
     e2.features.robustBufferAccess = f2.features.robustBufferAccess;   /* c[a0] fora do limite lê 0, como no D3D9 */
     e2.features.independentBlend = f2.features.independentBlend;
     e2.features.depthBiasClamp = f2.features.depthBiasClamp;
     e2.features.fillModeNonSolid = f2.features.fillModeNonSolid;
-    RE5_INFO("re5vk", "GPU '%s' (Vulkan %u.%u.%u, driver 0x%X), fila %u, BC %s", d->props.deviceName,
+    RE5_INFO("re5vk", "GPU '%s' (Vulkan %u.%u.%u, driver 0x%X), fila %u, BC %s, EDS1 %s, EDS2 %s", d->props.deviceName,
              VK_API_VERSION_MAJOR(d->props.apiVersion), VK_API_VERSION_MINOR(d->props.apiVersion),
              VK_API_VERSION_PATCH(d->props.apiVersion), d->props.driverVersion, d->qfam,
-             f2.features.textureCompressionBC ? "sim" : "não");
+             f2.features.textureCompressionBC ? "sim" : "não",
+             d->has_eds1 ? "sim" : "não", d->has_eds2 ? "sim" : "não");
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = d->qfam,
                                    .queueCount = 1, .pQueuePriorities = &prio};
-    const char *dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &e2, .queueCreateInfoCount = 1,
-                              .pQueueCreateInfos = &qci, .enabledExtensionCount = want_zc ? 2u : 1u,
+                              .pQueueCreateInfos = &qci, .enabledExtensionCount = ndexts,
                               .ppEnabledExtensionNames = dexts};
     VK_CHECK(vkCreateDevice(d->phys, &dci, NULL, &d->dev));
     if (want_zc) {
@@ -1296,8 +1602,8 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
     }
     RE5_INFO("re5vk", "buffers dinâmicos na memória do guest (Unlock sem cópia): %s",
              d->zerocopy ? "sim" : !(zc_env && *zc_env == '1') ? "não (RE5VK_ZEROCOPY=1 liga)" : "não (sem VK_EXT_external_memory_host)");
-#define VK_LOAD_DEVICE(name)                                                                                       \
-    if (!(name = (PFN_##name)vkGetDeviceProcAddr(d->dev, #name))) re5_fatal("re5vk", "sem %s", #name);
+
+#define VK_LOAD_DEVICE(name)                                                                                           do {                                                                                                                   /* nome do núcleo (1.3) ou da extensão (KHR/EXT, drivers 1.1/1.2 de celular) */                                  name = (PFN_##name)vkGetDeviceProcAddr(d->dev, #name);                                                            if (!name) name = (PFN_##name)vkGetDeviceProcAddr(d->dev, #name "KHR");                                            if (!name) name = (PFN_##name)vkGetDeviceProcAddr(d->dev, #name "EXT");                                            if (!name) re5_fatal("re5vk", "sem %s", #name);                                                                } while (0);
     VK_DEVICE_FNS(VK_LOAD_DEVICE)
     vkGetDeviceQueue(d->dev, d->qfam, 0, &d->queue);
 

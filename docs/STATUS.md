@@ -304,6 +304,24 @@ O que mudou:
     `Sleep(1)` a 500/s são threads de fundo (`0x0048C5D0`, `0x00447141`); os 8 workers ficam ~80%
     em `WaitForSingleObject` esperando job; o caminho crítico é a principal + a de render. As
     esperas do jogo são todas `INFINITE`.
+- **re5vk no Snapdragon (Z Flip5, Adreno 740) - roda (usuário, 2026-11-07):**
+  - Apresentação: se a swapchain não aceita `TRANSFER_DST`, desenha o back buffer num triângulo
+    (`present_pipe`, `vk_blit_spv.h`) em vez do blit. Vulkan 1.1/1.2 com
+    `VK_KHR_dynamic_rendering` + `extendedDynamicState` 1 e 2 aceitos (nomes KHR/EXT); sem eles,
+    `CreateDevice` cai para a DXVK, soltando superfície e instância.
+  - Vértices `UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`: os formatos `*SCALED` são opcionais e o Adreno não
+    os tem (fatal "D3DDECLTYPE 5 (Vulkan 39) sem suporte de vértice"). Agora vão como `UINT`/`SINT`
+    e o VS converte (variante `in_uint`/`in_sint`, `OpConvertUToF`/`SToF`). Teste em `test_vk_dxso`
+    (não rodado nesta rodada: o PC deu tela azul 0xC2, de driver, durante um build; só o Android
+    foi compilado depois, com `-j 4`).
+  - INTZ/DF16/DF24 amostrados sem comparação e com a profundidade em RRRR, como a DXVK.
+  - Revertido de uma rodada de outra IA (pioravam o re5vk ou eram inseguros): EDS desligado quando
+    a extensão não aparecia na lista (no 1.3 é núcleo: cull/profundidade/stencil sumiam), `Present`
+    e espera de fence fora do mutex, `storeOp DONT_CARE` na profundidade reaproveitada, barreira
+    entre passes sem os bits de escrita, `maxLod = minLod`, clear dos alvos por render pass, D32
+    forçado no Android, `dmb ish` em toda cabeça de laço e o relógio por `cntvct_el0` (estourava o
+    `uint64` com ~15 min de aparelho ligado). Ficou: modo paralelo ligado por padrão no app
+    (`parallel_mode`) e JobThread padrão 4.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.

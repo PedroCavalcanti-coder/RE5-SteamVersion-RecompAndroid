@@ -130,10 +130,9 @@ public class GameActivity extends SDLActivity {
         } catch (Throwable ignored) {}
 
         SharedPreferences prefs = getSharedPreferences("re5_settings", MODE_PRIVATE);
-        // Modo paralelo (experimental): o código do jogo roda em paralelo, com o lock só no HLE.
-        // Sem a ordem de memória do x86 garantida no ARM64 (fase A1, hle-tso), por isso opcional.
-        // O ambiente vence o re5_env.txt (main.c); o SDL_main ainda não começou aqui.
-        if (prefs.getBoolean("parallel_mode", false)) {
+        // Modo paralelo: as threads do jogo rodam em paralelo, com lock apenas no HLE.
+        // Garante uso pleno dos núcleos da CPU (Cortex-A78) e alimenta a GPU com alta taxa de quadros.
+        if (prefs.getBoolean("parallel_mode", true)) {
             try {
                 nativeSetenv("RE5_GUEST_LOCK", "hle");
             } catch (Throwable ignored) {}

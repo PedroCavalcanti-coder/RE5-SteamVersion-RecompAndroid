@@ -161,8 +161,11 @@ static const uint32_t ps_flow[] = {
 
 static void run_builtin(void)
 {
-    re5vk_dxso_variant plain = {0, 0}, depth = {1u << 3, 5 /* GREATER */};
+    re5vk_dxso_variant plain = {0}, depth = {.depth_samplers = 1u << 3, .alpha_func = 5 /* GREATER */};
+    /* Adreno sem *SCALED: v1 sem sinal e v2 com sinal chegam como inteiro e viram float */
+    re5vk_dxso_variant ints = {.in_uint = 1u << 1, .in_sint = 1u << 2};
     check_shader("vs_basic", vs_basic, sizeof vs_basic / 4, &plain);
+    check_shader("vs_basic (entradas inteiras)", vs_basic, sizeof vs_basic / 4, &ints);
     check_shader("ps_basic", ps_basic, sizeof ps_basic / 4, &plain);
     check_shader("ps_basic (profundidade + alpha test)", ps_basic, sizeof ps_basic / 4, &depth);
     check_shader("ps_flow", ps_flow, sizeof ps_flow / 4, &plain);
@@ -207,6 +210,28 @@ static void run_builtin(void)
         free(c7.spv);
     }
     free(s.spv);
+    {   /* entradas inteiras: um OpConvertUToF (112) e um OpConvertSToF (111) a mais */
+        int u = 0, sg = 0, u0 = 0, sg0 = 0;
+        re5vk_shader si;
+        CHECK(re5vk_dxso_compile(vs_basic, sizeof vs_basic / 4, &ints, &si, err, sizeof err) == 0);
+        for (size_t w = 5; w < si.nwords;) {
+            uint32_t op = si.spv[w] & 0xFFFFu, len = si.spv[w] >> 16;
+            u += op == 112;
+            sg += op == 111;
+            w += len ? len : 1;
+        }
+        free(si.spv);
+        CHECK(re5vk_dxso_compile(vs_basic, sizeof vs_basic / 4, &plain, &si, err, sizeof err) == 0);
+        for (size_t w = 5; w < si.nwords;) {
+            uint32_t op = si.spv[w] & 0xFFFFu, len = si.spv[w] >> 16;
+            u0 += op == 112;
+            sg0 += op == 111;
+            w += len ? len : 1;
+        }
+        free(si.spv);
+        CHECK(u > u0);
+        CHECK(sg > sg0);
+    }
     CHECK(re5vk_dxso_compile(ps_basic, sizeof ps_basic / 4, &plain, &s, err, sizeof err) == 0);
     CHECK_EQ_U32(s.samplers, 0xF);
     CHECK_EQ_U32(s.sampler_type[1], RE5VK_TEX_CUBE);
@@ -241,7 +266,7 @@ static int run_dir(const char *dir)
         uint32_t *code = malloc(1u << 20);
         size_t nw = fread(code, 4, (1u << 20) / 4, f);
         fclose(f);
-        re5vk_dxso_variant v0 = {0, 0}, v1 = {0xFFFF, 4};
+        re5vk_dxso_variant v0 = {0}, v1 = {.depth_samplers = 0xFFFF, .alpha_func = 4};
         check_shader(e->d_name, code, nw, &v0);
         if (e->d_name[0] == 'p') check_shader(e->d_name, code, nw, &v1);
         free(code);

@@ -64,7 +64,7 @@ enum {
     SOpVectorShuffle = 79, SOpCompositeConstruct = 80, SOpCompositeExtract = 81,
     SOpImageSampleImplicitLod = 87, SOpImageSampleExplicitLod = 88, SOpImageSampleDrefImplicitLod = 89,
     SOpImageSampleDrefExplicitLod = 90, SOpImageSampleProjImplicitLod = 91, SOpImageSampleProjDrefImplicitLod = 93,
-    SOpConvertFToS = 110, SOpConvertSToF = 111, SOpFNegate = 127, SOpIAdd = 128, SOpFAdd = 129, SOpFSub = 131,
+    SOpConvertFToS = 110, SOpConvertSToF = 111, SOpConvertUToF = 112, SOpFNegate = 127, SOpIAdd = 128, SOpFAdd = 129, SOpFSub = 131,
     SOpFMul = 133, SOpFDiv = 136, SOpVectorTimesScalar = 142, SOpDot = 148, SOpAny = 154, SOpLogicalOr = 166,
     SOpLogicalAnd = 167, SOpLogicalNot = 168, SOpSelect = 169, SOpINotEqual = 171, SOpSLessThan = 177,
     SOpFOrdEqual = 180, SOpFOrdNotEqual = 182, SOpFOrdLessThan = 184, SOpFOrdGreaterThan = 186,
@@ -114,7 +114,7 @@ typedef struct {
     wbuf head, decor, globals, fvars, finit, body;
     uint32_t next_id;
     uint32_t glsl;
-    uint32_t t_void, t_bool, t_f32, t_i32, t_u32, t_v2f, t_v3f, t_v4f, t_v4i, t_v4b, t_fn;
+    uint32_t t_void, t_bool, t_f32, t_i32, t_u32, t_v2f, t_v3f, t_v4f, t_v4i, t_v4u, t_v4b, t_fn;
     uint32_t k0, k1;             /* vec4(0), vec4(1) */
     uint32_t img_type[2][4], simg_type[2][4];   /* [profundidade][dim] */
     uint32_t ptr_cache[64][3];   /* (classe, tipo) -> id */
@@ -220,6 +220,7 @@ static void setup_types(cx *c)
     c->t_v3f = id(c); OP(&c->globals, SOpTypeVector, c->t_v3f, c->t_f32, 3);
     c->t_v4f = id(c); OP(&c->globals, SOpTypeVector, c->t_v4f, c->t_f32, 4);
     c->t_v4i = id(c); OP(&c->globals, SOpTypeVector, c->t_v4i, c->t_i32, 4);
+    c->t_v4u = id(c); OP(&c->globals, SOpTypeVector, c->t_v4u, c->t_u32, 4);
     c->t_v4b = id(c); OP(&c->globals, SOpTypeVector, c->t_v4b, c->t_bool, 4);
     c->t_fn = id(c); OP(&c->globals, SOpTypeFunction, c->t_fn, c->t_void);
     c->k0 = kv4(c, 0, 0, 0, 0);
@@ -449,6 +450,8 @@ static uint32_t read_reg(cx *c, uint32_t type, uint32_t n, uint32_t idx_id)
     case R_INPUT:
         if (n >= 16 || !c->vin[n]) { fail(c, "v%u sem dcl", n); return kv4(c, 0, 0, 0, 0); }
         if (idx_id) { fail(c, "v[] relativo"); return kv4(c, 0, 0, 0, 0); }
+        if (!c->pixel && (c->var.in_uint >> n & 1)) return e1(c, SOpConvertUToF, c->t_v4f, load(c, c->t_v4u, c->vin[n]));
+        if (!c->pixel && (c->var.in_sint >> n & 1)) return e1(c, SOpConvertSToF, c->t_v4f, load(c, c->t_v4i, c->vin[n]));
         return load(c, c->t_v4f, c->vin[n]);
     case R_CONST: return read_const(c, n, idx_id);
     case R_CONST2: case R_CONST3: case R_CONST4: return read_const(c, n + 2048u * (type - R_CONST2 + 1), idx_id);
@@ -677,7 +680,9 @@ static void do_dcl(cx *c, uint32_t dcl, uint32_t reg)
     }
     if (type == R_INPUT) {
         if (n >= 16) { fail(c, "v%u", n); return; }
-        c->vin[n] = gvar(c, SC_Input, c->t_v4f);
+        uint32_t vt = !c->pixel && (c->var.in_uint >> n & 1) ? c->t_v4u
+                    : !c->pixel && (c->var.in_sint >> n & 1) ? c->t_v4i : c->t_v4f;
+        c->vin[n] = gvar(c, SC_Input, vt);
         uint32_t loc = c->pixel ? re5vk_dxso_location(usage, index) : n;
         OP(&c->decor, SOpDecorate, c->vin[n], D_Location, loc);
         if (c->pixel && ((reg >> 20) & 4)) OP(&c->decor, SOpDecorate, c->vin[n], D_Centroid);
@@ -1224,7 +1229,8 @@ int re5vk_dxso_compile(const uint32_t *code, size_t ndw, const re5vk_dxso_varian
     c->code = code;
     c->ndw = ndw;
     c->pixel = pixel;
-    c->var = var ? *var : (re5vk_dxso_variant){0, 0};
+    if (var) c->var = *var;
+    else memset(&c->var, 0, sizeof c->var);
     c->out = out;
     c->err = err;
     c->errsz = errsz;

@@ -635,6 +635,46 @@ static VkSampler sampler_get(vk_device *d, int s, int compare)
 
 /* ---- pipelines ---- */
 
+static VkFormat vertex_format(BYTE type);
+
+/* Formato do atributo para a GPU. Os *SCALED (inteiro lido como float) são opcionais no Vulkan e
+ * o Adreno não os tem: nesse caso o atributo vai como UINT/SINT e o VS converte (variante
+ * in_uint/in_sint). *intk: 0 float, 1 sem sinal, 2 com sinal. */
+static VkFormat vertex_format_dev(vk_device *d, BYTE type, int *intk)
+{
+    VkFormat vf = vertex_format(type), alt = VK_FORMAT_UNDEFINED;
+    int k = 0;
+    *intk = 0;
+    switch (type) {
+    case D3DDECLTYPE_UBYTE4: alt = VK_FORMAT_R8G8B8A8_UINT; k = 1; break;
+    case D3DDECLTYPE_SHORT2: alt = VK_FORMAT_R16G16_SINT; k = 2; break;
+    case D3DDECLTYPE_SHORT4: alt = VK_FORMAT_R16G16B16A16_SINT; k = 2; break;
+    case D3DDECLTYPE_UDEC3: alt = VK_FORMAT_A2B10G10R10_UINT_PACK32; k = 1; break;
+    default: return vf;
+    }
+    static int8_t scaled_ok[32];   /* por D3DDECLTYPE: 0 não sabido, 1 sim, -1 não (um device só) */
+    if (!scaled_ok[type]) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(d->phys, vf, &fp);
+        scaled_ok[type] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : -1;
+        if (scaled_ok[type] < 0)
+            RE5_INFO("re5vk", "D3DDECLTYPE %u: sem o formato SCALED %d, vai como inteiro (%d) e o VS converte",
+                     (unsigned)type, (int)vf, (int)alt);
+    }
+    if (scaled_ok[type] > 0) return vf;
+    *intk = k;
+    return alt;
+}
+
+/* Elemento da declaração que alimenta o v<r> do VS (pela semântica). */
+static const D3DVERTEXELEMENT9 *decl_elem(vk_device *d, const re5vk_shader *vsi, uint32_t r)
+{
+    for (uint32_t i = 0; d->decl && i < d->decl->n; i++)
+        if (d->decl->el[i].Usage == vsi->in_usage[r] && d->decl->el[i].UsageIndex == vsi->in_index[r])
+            return &d->decl->el[i];
+    return NULL;
+}
+
 static VkFormat vertex_format(BYTE type)
 {
     switch (type) {
@@ -786,18 +826,16 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
     int need_zero = 0;
     for (uint32_t r = 0; r < 16; r++) {
         if (!(vsi->inputs >> r & 1)) continue;
-        const D3DVERTEXELEMENT9 *e = NULL;
-        for (uint32_t i = 0; d->decl && i < d->decl->n; i++)
-            if (d->decl->el[i].Usage == vsi->in_usage[r] && d->decl->el[i].UsageIndex == vsi->in_index[r]) {
-                e = &d->decl->el[i];
-                break;
-            }
+        const D3DVERTEXELEMENT9 *e = decl_elem(d, vsi, r);
         if (!e) {   /* sem dado: buffer zerado com stride 0 */
             attr[na++] = (VkVertexInputAttributeDescription){r, 15, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
             need_zero = 1;
             continue;
         }
-        VkFormat vf = vertex_format(e->Type);
+        int intk;
+        VkFormat vf = vertex_format_dev(d, e->Type, &intk);
+        if (intk != ((k->vsv.in_uint >> r & 1) ? 1 : (k->vsv.in_sint >> r & 1) ? 2 : 0))
+            re5_fatal("re5vk", "v%u: variante do VS não bate com o formato de vértice", r);
         if (vf == VK_FORMAT_UNDEFINED) re5_fatal("re5vk", "D3DDECLTYPE %u sem tradução", (unsigned)e->Type);
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(d->phys, vf, &fp);
@@ -899,7 +937,13 @@ static VkCompareOp cmp_op(DWORD f) { return (VkCompareOp)(f >= 1 && f <= 8 ? f -
 static int tex_is_depth(vk_obj *t)
 {
     if (!t || (t->kind != VKO_TEXTURE)) return 0;
-    return ((vk_texture *)t)->img.fmt->depth;
+    vk_texture *tex = (vk_texture *)t;
+    /* INTZ/DF16/DF24 devolvem a profundidade crua, sem comparação (como a DXVK,
+     * D3D9CommonTexture::DetermineShadowState); só D16/D24 comuns são mapa de sombra. */
+    if (tex->format == FOURCC('I', 'N', 'T', 'Z') || tex->format == FOURCC('D', 'F', '1', '6') ||
+        tex->format == FOURCC('D', 'F', '2', '4'))
+        return 0;
+    return tex->img.fmt->depth;
 }
 
 static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
@@ -995,11 +1039,21 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         psi = d->last_psi;
         psv = d->last_psv;
     } else {
-        re5vk_dxso_variant vsv = {0, 0};
+        re5vk_dxso_variant vsv;
+        memset(&vsv, 0, sizeof vsv);
         VkShaderModule vsm, psm;
         /* variantes */
-        psv = (re5vk_dxso_variant){0, 0};
+        memset(&psv, 0, sizeof psv);
         re5vk_shader_variant(d, d->vs, &vsv, &vsm, &vsi);
+        /* entradas inteiras (GPU sem *SCALED): a variante sai das entradas do VS e da declaração */
+        for (uint32_t r = 0; r < 16; r++) {
+            const D3DVERTEXELEMENT9 *e = (vsi->inputs >> r & 1) ? decl_elem(d, vsi, r) : NULL;
+            int intk = 0;
+            if (e) vertex_format_dev(d, e->Type, &intk);
+            if (intk == 1) vsv.in_uint |= (uint16_t)(1u << r);
+            if (intk == 2) vsv.in_sint |= (uint16_t)(1u << r);
+        }
+        if (vsv.in_uint || vsv.in_sint) re5vk_shader_variant(d, d->vs, &vsv, &vsm, &vsi);
         /* primeiro sem as profundidades, para saber os samplers do PS */
         psv.alpha_func = RS(d, D3DRS_ALPHATESTENABLE) ? (uint8_t)RS(d, D3DRS_ALPHAFUNC) : 0;
         if (psv.alpha_func == D3DCMP_ALWAYS) psv.alpha_func = 0;

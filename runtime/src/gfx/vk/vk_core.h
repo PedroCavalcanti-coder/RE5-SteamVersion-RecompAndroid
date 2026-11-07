@@ -32,6 +32,10 @@
 #include "../../core/host_sync.h"
 #include "vk_dxso.h"
 
+#ifndef FOURCC
+#define FOURCC(a, b, c, d) ((D3DFORMAT)((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24))
+#endif
+
 /* ---- funções do Vulkan (carregadas em tempo de execução) ---- */
 
 #define VK_GLOBAL_FNS(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties)
@@ -211,7 +215,7 @@ typedef struct {
     uint32_t n;                /* sem o D3DDECL_END */
 } vk_decl;
 
-#define VK_MAX_VARIANTS 8
+#define VK_MAX_VARIANTS 16   /* PS: profundidade x alpha test; VS: entradas inteiras (Adreno) */
 typedef struct {
     vk_obj o;
     uint32_t *code;
@@ -257,6 +261,16 @@ struct vk_device {
     VkExtent2D swap_extent;
     uint32_t nimages;
     VkImage images[VK_MAX_IMAGES];
+    VkImageView image_views[VK_MAX_IMAGES];
+    int swap_has_transfer_dst;
+    int can_blit_to_swap;
+    VkSampler present_sampler;
+    VkDescriptorSetLayout present_dsl;
+    VkPipelineLayout present_layout;
+    VkDescriptorPool present_pool;
+    VkDescriptorSet present_set;
+    VkImageView present_view;   /* o que o present_set aponta */
+    VkPipeline present_pipe;
     VkSemaphore done[VK_MAX_IMAGES];
     VkSemaphore acquired[VK_SLOTS];
 
@@ -329,6 +343,7 @@ struct vk_device {
     VkExtent2D render_area;
     VkPipeline bound_pipe;
     int dyn_dirty, desc_dirty;
+    int has_eds1, has_eds2;
     VkDescriptorSet set;
     uint32_t pipe_hash_cap;
     struct { int on; float color[4][4]; float z; uint32_t stencil; DWORD flags; } pending_clear;

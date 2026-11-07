@@ -35,7 +35,11 @@ enum { RE5VK_TEX_2D = 2, RE5VK_TEX_CUBE = 3, RE5VK_TEX_3D = 4 };
 /* Variante do shader (a chave do cache de módulos junto com o bytecode). */
 typedef struct {
     uint16_t depth_samplers;   /* PS: samplers ligados a textura de profundidade (comparação com .z) */
+    /* VS: entradas v<n> que chegam como inteiro sem sinal / com sinal e viram float no shader.
+     * Para GPUs sem os formatos de vértice *SCALED (Adreno): UBYTE4, SHORT2/4, UDEC3. */
+    uint16_t in_uint, in_sint;
     uint8_t  alpha_func;       /* PS: D3DCMPFUNC do alpha test; 0 ou 8 (ALWAYS) = sem teste */
+    uint8_t  pad_;             /* sem enchimento implícito: a variante entra no hash da pipeline */
 } re5vk_dxso_variant;
 
 typedef struct {

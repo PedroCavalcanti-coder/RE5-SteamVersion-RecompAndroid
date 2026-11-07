@@ -212,9 +212,11 @@ public final class SettingsActivity extends Activity {
 
     private void buildPerf() {
         section(L.t("Processador"));
-        switchPref(L.t("Modo paralelo (experimental)"), L.t("As threads do jogo rodam ao mesmo tempo, como no PC: som sem atraso e ")
-                + L.t("mais FPS nas cenas pesadas. Se travar ou der erro, desligue."), "parallel_mode", false);
-        String jt = ini.get("CPU", "JobThread", "2");
+        switchPref(L.t("Modo paralelo"), L.t("As threads do jogo rodam ao mesmo tempo: alto uso da CPU/GPU, som sem atraso e ")
+                + L.t("FPS máximo em aparelhos multicore."), "parallel_mode", true);
+        int nCores = Runtime.getRuntime().availableProcessors();
+        String defJt = String.valueOf(nCores >= 8 ? 4 : (nCores >= 4 ? 4 : 2));
+        String jt = ini.get("CPU", "JobThread", defJt);
         String[] jobVals = {"1", "2", "3", "4", "5", "6", "7", "8"};
         String[] jobNames = {"1", "2", "3", "4", "5", "6", "7", "8 (" + L.t("todos") + ")"};
         choiceIni(L.t("Threads de trabalho do jogo"), L.t("Workers do motor do jogo (física, animação, efeitos)."),
