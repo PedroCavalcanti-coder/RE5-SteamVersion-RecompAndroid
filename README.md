@@ -57,8 +57,10 @@ Details, numbers and evidence: [docs/STATUS.md](docs/STATUS.md) (in Portuguese).
 You need **your own legally purchased copy** of *Resident Evil 5: Gold Edition* (Steam). This project ships
 no game files.
 
-1. **Pack your game folder.** Make a `.zip` or `.rar` of your installed game folder (the one that contains
-   `nativePC_MT`) — or, on PC, just use the folder as it is.
+1. **Prepare your game folder.** It must contain `nativePC_MT` and **`re5dx9.clean.exe`**: an unprotected
+   executable made from **your own** copy (Steam build of 2023-02-13; the app checks its SHA-256
+   `4534003f…a4036`). Neither the APK nor this repository includes it, and this project does not explain how to
+   remove copy protection. Make a `.zip` or `.rar` of that folder — or, on PC, just use the folder as it is.
 2. **Get the port binary for your platform** (`re5.exe` for Windows, the `.apk` for Android). Binaries are built
    from this repository; see [Building](#building). Prebuilt releases are not published, because they would
    contain recompiled game code (see [Legal](#legal)).

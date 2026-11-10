@@ -120,7 +120,6 @@ public class GameActivity extends SDLActivity {
 
         gameDir = getIntent().getStringExtra("GAME_DIR");
         if (gameDir == null) gameDir = GameStorage.gameDir(this).getAbsolutePath();
-        provisionCleanExecutable();
 
         super.onCreate(savedInstanceState);
         if (isFinishing()) return;   // recriada pelo sistema: shouldStartGame recusou
@@ -409,24 +408,6 @@ public class GameActivity extends SDLActivity {
             }
         } catch (Exception ignored) {}
         return Runtime.getRuntime().totalMemory() / 1024;
-    }
-
-    /** O re5dx9.clean.exe (despejo já desempacotado) vai no APK; copia para a pasta do jogo. */
-    private void provisionCleanExecutable() {
-        File clean = new File(gameDir, GameStorage.CLEAN_EXE_NAME);
-        if (clean.exists()) return;
-        File tmp = new File(gameDir, GameStorage.CLEAN_EXE_NAME + ".part");
-        try (InputStream in = getAssets().open(GameStorage.CLEAN_EXE_NAME);
-             FileOutputStream out = new FileOutputStream(tmp)) {
-            byte[] buf = new byte[1 << 16];
-            int r;
-            while ((r = in.read(buf)) != -1) out.write(buf, 0, r);
-        } catch (Exception e) {
-            Log.w(TAG, "não foi possível copiar " + GameStorage.CLEAN_EXE_NAME + ": " + e.getMessage());
-            tmp.delete();
-            return;
-        }
-        tmp.renameTo(clean);
     }
 
     /** Lê o logcat deste processo a partir de agora e mostra as últimas linhas do runtime. */

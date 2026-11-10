@@ -5,7 +5,8 @@ plugins {
 android {
     namespace 'com.re5.recompiled'
     compileSdk 35
-    ndkVersion '30.0.16248370'
+    buildToolsVersion '36.0.0'
+    ndkVersion '27.2.12479018'
 
     defaultConfig {
         applicationId 'com.re5.recompiled'

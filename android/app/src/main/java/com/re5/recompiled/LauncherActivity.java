@@ -195,6 +195,20 @@ public final class LauncherActivity extends Activity {
 
     private void launchGame() {
         File dir = GameStorage.gameDir(this);
+        new Thread(() -> {   /* o hash de 16 MB fora da thread de UI */
+            String err = GameStorage.checkCleanExe(dir);
+            main.post(() -> {
+                if (err == null) startGame(dir);
+                else new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle(L.t("Executável do jogo"))
+                        .setMessage(err)
+                        .setPositiveButton(L.t("Fechar"), null)
+                        .show();
+            });
+        }, "re5-exe-check").start();
+    }
+
+    private void startGame(File dir) {
         GameSession.markStarted(this);
         Intent intent = new Intent(this, GameActivity.class);
         intent.putExtra("GAME_DIR", dir.getAbsolutePath());

@@ -6,6 +6,32 @@ import os
 import sys
 
 T = {
+"Falta o re5dx9.clean.exe na pasta do jogo. Este app não traz arquivos do jogo: coloque o seu ": (
+    "re5dx9.clean.exe is missing from the game folder. This app ships no game files: put your own ",
+    "Falta re5dx9.clean.exe en la carpeta del juego. Esta app no incluye archivos del juego: coloca tu propio ",
+    "游戏文件夹中缺少 re5dx9.clean.exe。本应用不包含任何游戏文件：请放入你自己的 ",
+    "В папке игры нет re5dx9.clean.exe. Приложение не содержит файлов игры: положите свой ",
+    "ゲームフォルダーに re5dx9.clean.exe がありません。このアプリにゲームファイルは含まれていません。ご自身の "),
+"re5dx9.clean.exe (executável sem proteção, gerado da sua cópia) junto da pasta nativePC_MT, ": (
+    "re5dx9.clean.exe (unprotected executable made from your copy) next to the nativePC_MT folder, ",
+    "re5dx9.clean.exe (ejecutable sin protección, generado de tu copia) junto a la carpeta nativePC_MT, ",
+    "re5dx9.clean.exe（由你的副本生成的无保护可执行文件）放在 nativePC_MT 文件夹旁边，",
+    "re5dx9.clean.exe (исполняемый файл без защиты из вашей копии) рядом с папкой nativePC_MT ",
+    "re5dx9.clean.exe（あなたのコピーから作った保護なしの実行ファイル）を nativePC_MT フォルダーの隣に置くか、"),
+"ou inclua-o no .zip/.rar do jogo.": (
+    "or include it in the game .zip/.rar.",
+    "o inclúyelo en el .zip/.rar del juego.",
+    "或将其放入游戏的 .zip/.rar 中。",
+    "или добавьте его в .zip/.rar игры.",
+    "ゲームの .zip/.rar に入れてください。"),
+"O re5dx9.clean.exe da pasta do jogo não é a build suportada (Steam, 13/02/2023).": (
+    "The re5dx9.clean.exe in the game folder is not the supported build (Steam, 2023-02-13).",
+    "El re5dx9.clean.exe de la carpeta del juego no es la versión compatible (Steam, 13/02/2023).",
+    "游戏文件夹中的 re5dx9.clean.exe 不是受支持的版本（Steam，2023-02-13）。",
+    "re5dx9.clean.exe в папке игры — не поддерживаемая сборка (Steam, 13.02.2023).",
+    "ゲームフォルダーの re5dx9.clean.exe は対応ビルド（Steam、2023-02-13）ではありません。"),
+"esperado: ": ("expected: ", "esperado: ", "预期：", "ожидалось: ", "期待値: "),
+"Executável do jogo": ("Game executable", "Ejecutable del juego", "游戏可执行文件", "Исполняемый файл игры", "ゲームの実行ファイル"),
 "\n\nO que já foi movido está na pasta do app; toque em mover de novo para continuar.": (
     "\n\nWhat was already moved is in the app folder; tap move again to continue.",
     "\n\nLo que ya se movió está en la carpeta de la app; toca mover otra vez para continuar.",

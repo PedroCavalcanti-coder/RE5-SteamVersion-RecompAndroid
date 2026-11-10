@@ -60,6 +60,39 @@ public final class GameStorage {
         return new File(dir, EXE_NAME).isFile() || new File(dir, CLEAN_EXE_NAME).isFile();
     }
 
+    /** SHA-256 do re5dx9.clean.exe para o qual o código deste APK foi gerado
+     *  (config/known_builds.json, "steam-2023-02-13-oep-dump-reconstructed"). */
+    public static final String CLEAN_EXE_SHA256 = "4534003fe7949750c8c2bffd337f9d735eb9d27498a66e77e77cf1a87dfa4036";
+
+    /** O APK não leva nenhum arquivo do jogo: o re5dx9.clean.exe vem da pasta do jogo do usuário,
+     *  preparado por ele. null se está lá e é a build certa; senão, a mensagem para o usuário. */
+    public static String checkCleanExe(File dir) {
+        File exe = new File(dir, CLEAN_EXE_NAME);
+        if (!exe.isFile())
+            return L.t("Falta o re5dx9.clean.exe na pasta do jogo. Este app não traz arquivos do jogo: coloque o seu ")
+                    + L.t("re5dx9.clean.exe (executável sem proteção, gerado da sua cópia) junto da pasta nativePC_MT, ")
+                    + L.t("ou inclua-o no .zip/.rar do jogo.") + "\n\n" + dir.getAbsolutePath();
+        String h = sha256(exe);
+        if (!CLEAN_EXE_SHA256.equalsIgnoreCase(h))
+            return L.t("O re5dx9.clean.exe da pasta do jogo não é a build suportada (Steam, 13/02/2023).")
+                    + "\n\nSHA-256: " + h + "\n" + L.t("esperado: ") + CLEAN_EXE_SHA256;
+        return null;
+    }
+
+    static String sha256(File f) {
+        try (java.io.InputStream in = new java.io.FileInputStream(f)) {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[1 << 16];
+            int r;
+            while ((r = in.read(buf)) != -1) md.update(buf, 0, r);
+            StringBuilder sb = new StringBuilder();
+            for (byte b : md.digest()) sb.append(String.format(java.util.Locale.US, "%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
     public static boolean isInstalled(File dir) {
         return hasData(dir) && hasExe(dir);
     }
