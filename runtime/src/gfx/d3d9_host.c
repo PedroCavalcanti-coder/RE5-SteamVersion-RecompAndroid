@@ -24,6 +24,7 @@
 #include "re5/runtime.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/re5vk.h"
+#include "re5/vk_loader.h"
 #include "re5/user32.h"
 
 #if defined(RE5_HOST_WINDOWS)
@@ -195,6 +196,16 @@ static void load(void)
     g_create9 = (create9_fn)dlsym(lib, "Direct3DCreate9");
     if (!g_create9) re5_fatal("d3d9", "%s não exporta Direct3DCreate9", path);
 #if defined(__ANDROID__)
+    void *vk_gipa = re5_vk_get_instance_proc_addr();
+    if (re5_vk_is_custom_driver() && vk_gipa) {
+        void (*set_gipa)(void *) = (void (*)(void *))dlsym(lib, "dxvkAndroidSetInstanceProcAddr");
+        if (set_gipa) {
+            set_gipa(vk_gipa);
+            RE5_INFO("d3d9", "DXVK usando driver Vulkan customizado via adrenotools");
+        } else {
+            RE5_WARN("d3d9", "%s não exporta dxvkAndroidSetInstanceProcAddr; DXVK usará driver do sistema", path);
+        }
+    }
     /* O WSI do Android (android/dxvk/android_wsi.cpp) lista os modos do
      * adaptador a partir do tamanho da tela, antes de existir device. */
     void (*set_screen)(uint32_t, uint32_t) = (void (*)(uint32_t, uint32_t))dlsym(lib, "re5_dxvk_set_screen");

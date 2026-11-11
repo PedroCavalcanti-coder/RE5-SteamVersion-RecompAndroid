@@ -16,9 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
-#include <dlfcn.h>
-#endif
 #if defined(__ANDROID__)
 #include <SDL2/SDL.h> /* SDL_AndroidGetInternalStoragePath, para o cache de pipelines */
 #endif
@@ -26,6 +23,7 @@
 #include "vk_core.h"
 #include "vk_blit_spv.h"
 #include "re5/re5vk.h"
+#include "re5/vk_loader.h"
 #include "re5/thunks.h"
 #include "re5/guest_base.h"
 #include "re5/guest_memory.h"
@@ -43,20 +41,7 @@ VK_DEVICE_FNS(VK_DEFINE)
 static void vk_load_loader(void)
 {
     if (vkGetInstanceProcAddr) return;
-#if defined(_WIN32)
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    if (!lib) re5_fatal("re5vk", "sem vulkan-1.dll (erro %lu)", (unsigned long)GetLastError());
-    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(lib, "vkGetInstanceProcAddr");
-#else
-#if defined(__ANDROID__)
-    const char *name = "libvulkan.so";
-#else
-    const char *name = "libvulkan.so.1";
-#endif
-    void *lib = dlopen(name, RTLD_NOW | RTLD_LOCAL);
-    if (!lib) re5_fatal("re5vk", "dlopen(\"%s\") falhou: %s", name, dlerror());
-    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
-#endif
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)re5_vk_get_instance_proc_addr();
     if (!vkGetInstanceProcAddr) re5_fatal("re5vk", "o carregador do Vulkan não exporta vkGetInstanceProcAddr");
 #define VK_LOAD_GLOBAL(name)                                                                                       \
     if (!(name = (PFN_##name)vkGetInstanceProcAddr(NULL, #name))) re5_fatal("re5vk", "sem %s", #name);

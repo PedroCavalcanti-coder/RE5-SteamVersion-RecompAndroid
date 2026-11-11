@@ -113,6 +113,7 @@ add_library(re5_runtime STATIC
     src/gfx/vk/re5vk.c
     src/gfx/vk/vk_draw.c
     src/gfx/vk/vk_dxso.c
+    src/gfx/vk/vk_loader.c
     src/gfx/vk/vk_res.c
     src/gfx/vk/vk_tbdr.c
     src/win32/advapi32.c
@@ -197,4 +198,8 @@ if(NOT MSVC)
     endif()
     find_package(Threads REQUIRED)
     target_link_libraries(re5_runtime PUBLIC Threads::Threads m)
+endif()
+if(TARGET adrenotools)
+    target_link_libraries(re5_runtime PUBLIC adrenotools)
+    target_compile_definitions(re5_runtime PRIVATE RE5_HAS_ADRENOTOOLS=1)
 endif()

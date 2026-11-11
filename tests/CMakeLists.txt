@@ -29,6 +29,11 @@ set_tests_properties(d3d9_query_lag PROPERTIES ENVIRONMENT "RE5_QUERY_LAG=2")
 add_executable(test_vk_tbdr unit/test_vk_tbdr.c "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk/vk_tbdr.c")
 add_test(NAME vk_tbdr COMMAND test_vk_tbdr)
 
+# Carregador compartilhado de driver Vulkan customizado (AdrenoTools / sistema).
+add_executable(test_vk_loader unit/test_vk_loader.c)
+target_link_libraries(test_vk_loader PRIVATE re5_runtime)
+add_test(NAME vk_loader COMMAND test_vk_loader)
+
 add_executable(test_dxt_decode unit/test_dxt_decode.c)
 add_test(NAME dxt_decode COMMAND test_dxt_decode)
 

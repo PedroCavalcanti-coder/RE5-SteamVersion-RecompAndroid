@@ -8,6 +8,7 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.TypedValue;
@@ -29,6 +30,8 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.IOException;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -44,6 +47,7 @@ public final class SettingsActivity extends Activity {
 
     public static final String EXTRA_TAB = "tab";
     public static final String RESULT_OPEN_LAN = "open_lan";
+    private static final int REQ_IMPORT_DRIVER = 4101;
 
     static final int TAB_GRAPHICS = 0, TAB_CONTROLS = 1, TAB_HUD = 2, TAB_PERF = 3, TAB_NET = 4, TAB_ADV = 5;
     private static final String[] TABS = {L.t("Gráficos"), L.t("Controles"), "HUD", L.t("Desempenho"), L.t("Rede"), L.t("Avançado")};
@@ -155,9 +159,16 @@ public final class SettingsActivity extends Activity {
                 new String[]{L.t("Padrão (3)"), L.t("1 (menor atraso)"), "2", "3"}, new String[]{"", "1", "2", "3"}, "gfx_latency");
         disabledRow(L.t("FSR 1.0 (AMD FidelityFX)"), L.t("Ampliação com nitidez da resolução interna para a tela. Chega na próxima ")
                 + L.t("versão, no Vulkan próprio."));
-        disabledRow(L.t("Driver Vulkan: Turnip"), isAdreno()
-                ? L.t("Driver Mesa para GPU Adreno (Snapdragon). Chega na próxima versão.")
-                : L.t("Turnip só funciona em GPU Adreno (Snapdragon). Este aparelho usa ") + gpuFamily() + L.t(": fica o driver do sistema."));
+        if (isAdreno()) {
+            buildVulkanDriverRow();
+            switchPref(L.t("Modo Turbo GPU (Adreno)"),
+                    L.t("Mantém clocks altos da GPU Adreno (pode aumentar aquecimento)."),
+                    "gfx_adreno_turbo", false);
+        } else {
+            disabledRow(L.t("Driver Vulkan customizado"),
+                    L.t("Drivers AdrenoTools (Turnip) só funcionam em GPU Adreno (Snapdragon). Este aparelho usa ")
+                            + gpuFamily() + L.t(": fica o driver do sistema."));
+        }
 
         section(L.t("Qualidade do jogo (config.ini)"));
         if (!ini.exists()) note(L.t("O config.ini aparece depois que o jogo abrir uma vez; até lá vale o padrão do jogo."));
@@ -396,9 +407,141 @@ public final class SettingsActivity extends Activity {
 
     // ------------------------------------------------------------------ utilidades
 
+    private void buildVulkanDriverRow() {
+        List<GpuDriverManager.DriverInfo> installed = GpuDriverManager.list(this);
+        String curId = prefs.getString("gfx_driver_id", "");
+        String curLabel = L.t("Sistema (padrão)");
+
+        String[] names = new String[installed.size() + 1];
+        String[] ids = new String[installed.size() + 1];
+        names[0] = L.t("Sistema (padrão)");
+        ids[0] = "";
+        int sel = 0;
+        for (int i = 0; i < installed.size(); i++) {
+            GpuDriverManager.DriverInfo d = installed.get(i);
+            names[i + 1] = d.displayLabel();
+            ids[i + 1] = d.id;
+            if (d.id.equals(curId)) {
+                sel = i + 1;
+                curLabel = d.displayLabel();
+            }
+        }
+
+        LinearLayout c = card(L.t("Driver Vulkan customizado"),
+                L.t("Turnip/Adreno (.zip) via AdrenoTools. Vale no DXVK e no Vulkan próprio."));
+        TextView v = text(curLabel + "  ›", 13, TEXT_DIM, false);
+        v.setMaxWidth(dp(150));
+        v.setGravity(Gravity.END);
+        c.addView(v);
+        final int selected = sel;
+        c.setOnClickListener(x -> {
+            AlertDialog.Builder b = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle(L.t("Driver Vulkan customizado"))
+                    .setSingleChoiceItems(names, selected, (d, w) -> {
+                        prefs.edit().putString("gfx_driver_id", ids[w]).apply();
+                        d.dismiss();
+                        showTab(tab);
+                    })
+                    .setNeutralButton(L.t("Importar .zip…"), (d, w) -> launchDriverPicker());
+            if (!installed.isEmpty()) {
+                b.setNegativeButton(L.t("Remover…"), (d, w) -> showRemoveDriverDialog(installed));
+            }
+            b.show();
+        });
+    }
+
+    private void launchDriverPicker() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/zip");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                "application/zip", "application/x-zip-compressed", "application/octet-stream"});
+        try {
+            startActivityForResult(i, REQ_IMPORT_DRIVER);
+        } catch (Exception e) {
+            Toast.makeText(this, L.t("Nenhum seletor de arquivos disponível."), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void showRemoveDriverDialog(List<GpuDriverManager.DriverInfo> installed) {
+        String[] labels = new String[installed.size()];
+        for (int i = 0; i < installed.size(); i++) labels[i] = installed.get(i).displayLabel();
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(L.t("Remover driver instalado"))
+                .setItems(labels, (d, w) -> confirmDeleteDriver(installed.get(w)))
+                .setNegativeButton(L.t("Cancelar"), null)
+                .show();
+    }
+
+    private void confirmDeleteDriver(GpuDriverManager.DriverInfo info) {
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(L.t("Remover driver"))
+                .setMessage(info.displayLabel())
+                .setPositiveButton(L.t("Remover"), (d, w) -> {
+                    boolean ok = GpuDriverManager.delete(this, info.id);
+                    if (info.id.equals(prefs.getString("gfx_driver_id", ""))) {
+                        prefs.edit().putString("gfx_driver_id", "").apply();
+                    }
+                    Toast.makeText(this, ok ? L.t("Driver removido.") : L.t("Não foi possível remover o driver."), Toast.LENGTH_SHORT).show();
+                    showTab(tab);
+                })
+                .setNegativeButton(L.t("Cancelar"), null)
+                .show();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_IMPORT_DRIVER || resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        final Uri uri = data.getData();
+        final AlertDialog waitDlg = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(L.t("Driver Vulkan customizado"))
+                .setMessage(L.t("Importando e validando driver…"))
+                .setCancelable(false)
+                .create();
+        waitDlg.show();
+
+        new Thread(() -> {
+            try {
+                final GpuDriverManager.DriverInfo info = GpuDriverManager.importZip(SettingsActivity.this, uri);
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) {
+                        waitDlg.dismiss();
+                        prefs.edit().putString("gfx_driver_id", info.id).apply();
+                        Toast.makeText(SettingsActivity.this,
+                                L.t("Driver instalado: ") + info.displayLabel(), Toast.LENGTH_LONG).show();
+                        showTab(tab);
+                    }
+                });
+            } catch (final IOException e) {
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) {
+                        waitDlg.dismiss();
+                        new AlertDialog.Builder(SettingsActivity.this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                                .setTitle(L.t("Falha ao importar driver"))
+                                .setMessage(e.getMessage())
+                                .setPositiveButton("OK", null)
+                                .show();
+                    }
+                });
+            }
+        }, "re5-driver-import").start();
+    }
+
     private boolean isAdreno() {
-        String soc = Build.VERSION.SDK_INT >= 31 ? Build.SOC_MANUFACTURER : "";
-        return "QTI".equalsIgnoreCase(soc) || Build.HARDWARE.toLowerCase(Locale.ROOT).contains("qcom");
+        String soc = (Build.VERSION.SDK_INT >= 31 && Build.SOC_MANUFACTURER != null)
+                ? Build.SOC_MANUFACTURER.toLowerCase(Locale.ROOT) : "";
+        String model = (Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL != null)
+                ? Build.SOC_MODEL.toLowerCase(Locale.ROOT) : "";
+        String hw = (Build.HARDWARE != null ? Build.HARDWARE : "").toLowerCase(Locale.ROOT);
+        if (soc.contains("qti") || soc.contains("qualcomm")
+                || hw.contains("qcom") || hw.contains("qualcomm")
+                || model.startsWith("sm") || model.startsWith("sdm") || model.startsWith("qcs")) {
+            return true;
+        }
+        return new File("/dev/kgsl-3d0").exists();
     }
 
     private String gpuFamily() {

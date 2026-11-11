@@ -146,6 +146,7 @@ public class GameActivity extends SDLActivity {
         setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");
         setenvPref(prefs, "gfx_present", "RE5VK_PRESENT");
         setenvPref(prefs, "gfx_latency", "RE5VK_LATENCY");
+        applyVulkanDriverEnv(prefs);
         boolean hudEnabled = prefs.getBoolean("hud_enabled", true);
         hudItems = prefs.getInt("hud_items", HudPrefs.DEFAULT_ITEMS);
 
@@ -184,6 +185,29 @@ public class GameActivity extends SDLActivity {
         try {
             nativeSetenv(env, v);
         } catch (Throwable ignored) {}
+    }
+
+    private void applyVulkanDriverEnv(SharedPreferences prefs) {
+        try {
+            String nativeLibDir = getApplicationInfo().nativeLibraryDir;
+            if (nativeLibDir != null && !nativeLibDir.isEmpty()) {
+                nativeSetenv("RE5VK_HOOK_DIR", nativeLibDir);
+            }
+            GpuDriverManager.DriverInfo drv = GpuDriverManager.getSelected(this, prefs.getString("gfx_driver_id", ""));
+            if (drv != null) {
+                File tmpDir = new File(getCacheDir(), "adrenotools_tmp");
+                //noinspection ResultOfMethodCallIgnored
+                tmpDir.mkdirs();
+                nativeSetenv("RE5VK_DRIVER_PATH", drv.driverPathWithSlash());
+                nativeSetenv("RE5VK_DRIVER_LIB", drv.libraryName);
+                nativeSetenv("RE5VK_DRIVER_TMP", tmpDir.getAbsolutePath());
+            }
+            if (prefs.getBoolean("gfx_adreno_turbo", false)) {
+                nativeSetenv("RE5VK_ADRENO_TURBO", "1");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "driver env: " + t);
+        }
     }
 
     private void acquireNetworkLocks() {
