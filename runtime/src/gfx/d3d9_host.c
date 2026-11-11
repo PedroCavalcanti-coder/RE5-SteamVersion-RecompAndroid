@@ -134,12 +134,18 @@ static int best_dxvk_tier(void)
 static void load(void)
 {
     if (g_create9) return;
+    re5_gfx_backend gfx = re5_gfx_mode();
 #if defined(RE5_HOST_WINDOWS)
     /* Padrão: Vulkan pela DXVK mais nova que a GPU aceita, em
      * dxvk\<versão>\d3d9.dll ao lado do re5.exe (o build copia de
      * scripts/build_dxvk.sh); sem nenhuma, o d3d9.dll do sistema.
      * RE5_DXVK=<versão> escolhe a versão; RE5_D3D9_DLL, a DLL inteira. */
     const char *path = getenv("RE5_D3D9_DLL");
+    if (gfx == RE5_GFX_GL && (!path || !*path)) {
+        re5_fatal("d3d9",
+                  "RE5_GFX=gl requer um tradutor D3D9->OpenGL externo em RE5_D3D9_DLL. "
+                  "O runtime embutido suporta apenas dxvk e re5vk.");
+    }
     char dxvk[MAX_PATH];
     if (!path || !*path) {
         path = "d3d9.dll";
@@ -174,6 +180,19 @@ static void load(void)
     RE5_INFO("d3d9", "Direct3D do host: %s", full);
 #else
     const char *path = getenv("RE5_D3D9_LIB");
+    if (gfx == RE5_GFX_GL) {
+        if (!path || !*path) {
+            re5_fatal("d3d9",
+                      "RE5_GFX=gl requer um tradutor D3D9->OpenGL ES externo em RE5_D3D9_LIB "
+                      "(ex.: libwined3d/Nine). O runtime embutido suporta apenas dxvk e re5vk.");
+        }
+        void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!lib) re5_fatal("d3d9", "dlopen(\"%s\") falhou: %s", path, dlerror());
+        g_create9 = (create9_fn)dlsym(lib, "Direct3DCreate9");
+        if (!g_create9) re5_fatal("d3d9", "%s não exporta Direct3DCreate9", path);
+        RE5_INFO("d3d9", "Direct3D do host (RE5_GFX=gl externo): %s", path);
+        return;
+    }
     if (!path || !*path) path = "libdxvk_d3d9.so";
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* a janela que a ponte entrega é um SDL_Window* */
 #if defined(__ANDROID__)
@@ -222,16 +241,35 @@ static void load(void)
 #endif
 }
 
+int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out)
+{
+    re5_gfx_backend mode = RE5_GFX_DXVK;
+    if (env && *env) {
+        if (!strcmp(env, "dxvk")) mode = RE5_GFX_DXVK;
+        else if (!strcmp(env, "re5vk")) mode = RE5_GFX_RE5VK;
+        else if (!strcmp(env, "gl")) mode = RE5_GFX_GL;
+        else return -1;
+    }
+    if (out) *out = mode;
+    return 0;
+}
+
+re5_gfx_backend re5_gfx_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *g = getenv("RE5_GFX");
+        re5_gfx_backend parsed = RE5_GFX_DXVK;
+        if (re5_parse_gfx_mode(g, &parsed) != 0)
+            re5_fatal("d3d9", "RE5_GFX=%s: valores aceitos: dxvk (padrão), re5vk, gl", g);
+        mode = (int)parsed;
+    }
+    return (re5_gfx_backend)mode;
+}
+
 int re5vk_enabled(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *g = getenv("RE5_GFX");
-        if (!g || !*g || !strcmp(g, "dxvk")) on = 0;
-        else if (!strcmp(g, "re5vk")) on = 1;
-        else re5_fatal("d3d9", "RE5_GFX=%s: valores aceitos: dxvk (padrão), re5vk", g);
-    }
-    return on;
+    return re5_gfx_mode() == RE5_GFX_RE5VK;
 }
 
 /* RE5_GFX=re5vk: o IDirect3D9 da DXVK continua respondendo as consultas do adaptador e o

@@ -217,6 +217,7 @@
  "Salvar variáveis": "変数を保存",
  "Segura o jogo num ritmo fixo: menos calor e bateria, quadro mais estável.": "ゲームを一定のペースに保ちます。発熱と電池消費が減り、フレームが安定します。",
  "Sem limite": "制限なし",
+ "Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt.": "Direct3D 9 から GLES への内蔵トランスレーターはありません。テストするには「詳細設定 → re5_env.txt」で RE5_D3D9_LIB を指定してください。",
  "Sensibilidade da câmera": "カメラ感度",
  "Sincronia vertical (Vulkan próprio)": "垂直同期（独自 Vulkan）",
  "Sistema (padrão)": "システム（標準）",

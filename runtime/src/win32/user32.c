@@ -33,6 +33,7 @@
 #include <SDL2/SDL_syswm.h>
 
 #include "re5/coldebug.h"
+#include "re5/d3d9_bridge.h"
 #include "re5/lan_menu.h"
 #include "re5/runtime.h"
 #include "re5/touch.h"
@@ -42,6 +43,13 @@
 #if defined(RE5_HOST_WINDOWS)
 #include <windows.h>
 #endif
+
+uint32_t re5_user32_android_window_flags(uint32_t base_flags, re5_gfx_backend gfx, int is_android)
+{
+    if (!is_android) return base_flags;
+    if (gfx == RE5_GFX_GL) return base_flags | (uint32_t)SDL_WINDOW_OPENGL;
+    return base_flags | (uint32_t)SDL_WINDOW_VULKAN;
+}
 
 /* ---- constantes do Win32 (prefixadas: o windows.h do host define as mesmas) ---- */
 
@@ -600,8 +608,17 @@ static uint32_t create_window(CPU *c, int wide)
 #if defined(__ANDROID__)
         /* Sem flag de gráficos o SDL2 do Android cria a janela com OpenGL, e a
          * EGLSurface dela ocupa o ANativeWindow: o vkCreateAndroidSurfaceKHR da
-         * DXVK falha ("Failed to create surface", CreateDevice NOTAVAILABLE). */
-        flags |= SDL_WINDOW_VULKAN;
+         * DXVK falha ("Failed to create surface", CreateDevice NOTAVAILABLE).
+         * Quando RE5_GFX=gl for usado com um tradutor externo via RE5_D3D9_LIB,
+         * solicita superfície OpenGL ES 3.0 em vez de Vulkan. */
+        re5_gfx_backend gfx = re5_gfx_mode();
+        if (gfx == RE5_GFX_GL) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        }
+        flags = re5_user32_android_window_flags(flags, gfx, 1);
 #endif
         win->sdl = SDL_CreateWindow(win->title[0] ? win->title : "Resident Evil 5", ox, oy, cw, ch, flags);
         if (!win->sdl) re5_fatal("user32", "SDL_CreateWindow(%dx%d) falhou: %s", cw, ch, SDL_GetError());

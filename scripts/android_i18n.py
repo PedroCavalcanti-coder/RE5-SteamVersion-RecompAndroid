@@ -664,6 +664,18 @@ T = {
     "无法移除驱动。",
     "Не удалось удалить драйвер.",
     "ドライバーを削除できませんでした。"),
+"OpenGL ES 3.x (RE5_GFX=gl)": (
+    "OpenGL ES 3.x (RE5_GFX=gl)",
+    "OpenGL ES 3.x (RE5_GFX=gl)",
+    "OpenGL ES 3.x (RE5_GFX=gl)",
+    "OpenGL ES 3.x (RE5_GFX=gl)",
+    "OpenGL ES 3.x (RE5_GFX=gl)"),
+"Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt.": (
+    "No built-in Direct3D 9 to GLES translator. To test, set RE5_D3D9_LIB in Advanced → re5_env.txt.",
+    "Sin traductor Direct3D 9 a GLES integrado. Para probar, define RE5_D3D9_LIB en Avanzado → re5_env.txt.",
+    "没有内置的 Direct3D 9 转 GLES 翻译器。如需测试，请在“高级 → re5_env.txt”中设置 RE5_D3D9_LIB。",
+    "Нет встроенного транслятора Direct3D 9 в GLES. Для теста укажите RE5_D3D9_LIB в Дополнительно → re5_env.txt.",
+    "Direct3D 9 から GLES への内蔵トランスレーターはありません。テストするには「詳細設定 → re5_env.txt」で RE5_D3D9_LIB を指定してください。"),
 "Remover": ("Remove", "Eliminar", "移除", "Удалить", "削除"),
 "Remover driver": ("Remove driver", "Eliminar controlador", "移除驱动", "Удалить драйвер", "ドライバーを削除"),
 "Remover driver instalado": (

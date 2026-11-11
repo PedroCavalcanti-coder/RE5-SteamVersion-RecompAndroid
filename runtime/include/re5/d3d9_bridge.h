@@ -21,6 +21,16 @@
 
 #include <stdint.h>
 
+typedef enum {
+    RE5_GFX_DXVK  = 0,
+    RE5_GFX_RE5VK = 1,
+    RE5_GFX_GL    = 2
+} re5_gfx_backend;
+
+/* Interpreta RE5_GFX ("", "dxvk", "re5vk", "gl"). 0 = valido, -1 = desconhecido. */
+int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out);
+re5_gfx_backend re5_gfx_mode(void);
+
 typedef struct {
     const char *name;
     /* Direct3DCreate9 do host: devolve um IDirect3D9* do host, ou NULL. */

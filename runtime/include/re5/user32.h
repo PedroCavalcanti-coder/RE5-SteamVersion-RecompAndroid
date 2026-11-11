@@ -6,8 +6,12 @@
 #define RE5_USER32_H
 
 #include <stdint.h>
+#include "re5/d3d9_bridge.h"
 
 struct SDL_Window;
+
+/* Ajusta flags do SDL_CreateWindow conforme o backend grafico no Android. */
+uint32_t re5_user32_android_window_flags(uint32_t base_flags, re5_gfx_backend gfx, int is_android);
 
 /* Janela SDL2 do HWND do guest; NULL se o HWND não existe ou se não há
  * janela de verdade (RE5_HEADLESS). */

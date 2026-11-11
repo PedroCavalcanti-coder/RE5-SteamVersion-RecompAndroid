@@ -218,6 +218,7 @@
  "Salvar variáveis": "保存变量",
  "Segura o jogo num ritmo fixo: menos calor e bateria, quadro mais estável.": "让游戏保持固定节奏：发热和耗电更少，帧更稳定。",
  "Sem limite": "不限制",
+ "Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt.": "没有内置的 Direct3D 9 转 GLES 翻译器。如需测试，请在“高级 → re5_env.txt”中设置 RE5_D3D9_LIB。",
  "Sensibilidade da câmera": "镜头灵敏度",
  "Sincronia vertical (Vulkan próprio)": "垂直同步（自研 Vulkan）",
  "Sistema (padrão)": "系统（默认）",

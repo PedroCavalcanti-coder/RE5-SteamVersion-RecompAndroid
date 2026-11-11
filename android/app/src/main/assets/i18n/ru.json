@@ -219,6 +219,7 @@
  "Salvar variáveis": "Сохранить переменные",
  "Segura o jogo num ritmo fixo: menos calor e bateria, quadro mais estável.": "Держит игру в постоянном темпе: меньше нагрев и расход батареи, ровнее кадры.",
  "Sem limite": "Без ограничения",
+ "Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt.": "Нет встроенного транслятора Direct3D 9 в GLES. Для теста укажите RE5_D3D9_LIB в Дополнительно → re5_env.txt.",
  "Sensibilidade da câmera": "Чувствительность камеры",
  "Sincronia vertical (Vulkan próprio)": "Вертикальная синхронизация (свой Vulkan)",
  "Sistema (padrão)": "Системный (по умолчанию)",

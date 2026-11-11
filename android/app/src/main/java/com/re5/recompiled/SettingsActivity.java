@@ -159,6 +159,8 @@ public final class SettingsActivity extends Activity {
                 new String[]{L.t("Padrão (3)"), L.t("1 (menor atraso)"), "2", "3"}, new String[]{"", "1", "2", "3"}, "gfx_latency");
         disabledRow(L.t("FSR 1.0 (AMD FidelityFX)"), L.t("Ampliação com nitidez da resolução interna para a tela. Chega na próxima ")
                 + L.t("versão, no Vulkan próprio."));
+        disabledRow(L.t("OpenGL ES 3.x (RE5_GFX=gl)"),
+                L.t("Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt."));
         if (isAdreno()) {
             buildVulkanDriverRow();
             switchPref(L.t("Modo Turbo GPU (Adreno)"),
