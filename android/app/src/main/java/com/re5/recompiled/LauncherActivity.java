@@ -109,7 +109,7 @@ public final class LauncherActivity extends Activity {
 
     private void refresh() {
         File dir = GameStorage.gameDir(this);
-        boolean installed = GameStorage.isInstalled(dir);
+        boolean installed = GameStorage.isInstalled(this, dir);
         boolean perm = hasStoragePermission();
         File legacy = GameStorage.legacyDir();
         boolean legacyData = perm && GameStorage.hasData(legacy);
@@ -195,7 +195,8 @@ public final class LauncherActivity extends Activity {
 
     private void launchGame() {
         File dir = GameStorage.gameDir(this);
-        new Thread(() -> {   /* o hash de 16 MB fora da thread de UI */
+        new Thread(() -> {   /* extração opcional do asset de teste + hash de 16 MB fora da thread de UI */
+            GameStorage.provisionCleanFromAssets(this, dir);
             String err = GameStorage.checkCleanExe(dir);
             main.post(() -> {
                 if (err == null) startGame(dir);

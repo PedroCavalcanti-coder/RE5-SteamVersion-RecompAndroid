@@ -120,6 +120,7 @@ public class GameActivity extends SDLActivity {
 
         gameDir = getIntent().getStringExtra("GAME_DIR");
         if (gameDir == null) gameDir = GameStorage.gameDir(this).getAbsolutePath();
+        GameStorage.provisionCleanFromAssets(this, new File(gameDir));
 
         super.onCreate(savedInstanceState);
         if (isFinishing()) return;   // recriada pelo sistema: shouldStartGame recusou

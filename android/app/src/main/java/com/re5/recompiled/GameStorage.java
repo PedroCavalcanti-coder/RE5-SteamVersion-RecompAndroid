@@ -56,8 +56,45 @@ public final class GameStorage {
         return data.isDirectory();
     }
 
+    private static volatile Boolean sHasCleanAsset;
+
     public static boolean hasExe(File dir) {
         return new File(dir, EXE_NAME).isFile() || new File(dir, CLEAN_EXE_NAME).isFile();
+    }
+
+    public static boolean hasCleanAsset(Context ctx) {
+        Boolean cached = sHasCleanAsset;
+        if (cached != null) return cached;
+        boolean ok = false;
+        try (InputStream in = ctx.getAssets().open(CLEAN_EXE_NAME)) {
+            ok = true;
+        } catch (IOException ignored) {
+        }
+        sHasCleanAsset = ok;
+        return ok;
+    }
+
+    /** Copia re5dx9.clean.exe dos assets do APK (quando empacotado localmente para testes)
+     *  para {@code dir} se ainda não existir ou estiver corrompido. Sem o asset no APK, não faz nada. */
+    public static void provisionCleanFromAssets(Context ctx, File dir) {
+        File exe = new File(dir, CLEAN_EXE_NAME);
+        if (exe.isFile() && CLEAN_EXE_SHA256.equalsIgnoreCase(sha256(exe))) return;
+        if (!hasCleanAsset(ctx)) return;
+        File tmp = new File(dir, CLEAN_EXE_NAME + ".part");
+        try (InputStream in = ctx.getAssets().open(CLEAN_EXE_NAME);
+             OutputStream out = new FileOutputStream(tmp)) {
+            byte[] buf = new byte[1 << 16];
+            int r;
+            while ((r = in.read(buf)) != -1) out.write(buf, 0, r);
+        } catch (IOException e) {
+            tmp.delete();
+            return;
+        }
+        if (exe.exists() && !exe.delete()) {
+            tmp.delete();
+            return;
+        }
+        if (!tmp.renameTo(exe)) tmp.delete();
     }
 
     /** SHA-256 do re5dx9.clean.exe para o qual o código deste APK foi gerado
@@ -95,6 +132,10 @@ public final class GameStorage {
 
     public static boolean isInstalled(File dir) {
         return hasData(dir) && hasExe(dir);
+    }
+
+    public static boolean isInstalled(Context ctx, File dir) {
+        return hasData(dir) && (hasExe(dir) || hasCleanAsset(ctx));
     }
 
     public static long sizeOf(File f) {
