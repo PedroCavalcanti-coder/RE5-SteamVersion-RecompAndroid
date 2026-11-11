@@ -113,6 +113,7 @@ typedef struct d9_obj {
     d9_dxt_shadow   dxt_storage;           /* armazenamento para Texture e CubeTexture */
     uint32_t        dxt_surface_sub;       /* subresource herdado da textura pai (se surface) */
     uint32_t        q_issued;              /* consulta: g_presents + 1 no Issue(END); 0 = nunca */
+    int8_t          q_event_cached;        /* 0 = desconhecido, 1 = D3DQUERYTYPE_EVENT, -1 = outro */
 } d9_obj;
 
 #define D9_HASH 4096u
@@ -1013,18 +1014,23 @@ static uint64_t frame_cap(void)
 
 /* ---- consultas de evento ----
  * O RE5 usa D3DQUERYTYPE_EVENT para esperar a GPU entre quadros. No celular isso deixa a GPU parada
- * enquanto a CPU monta o quadro seguinte; com ~75% de uso o governador da Mali do A54 não sai do
- * clock mínimo (221 de 949 MHz, 07/11) e o jogo fica preso a ~20 fps em qualquer resolução.
+ * enquanto a CPU monta o quadro seguinte; com ~75% de uso o governador da GPU móvel (Mali/Adreno)
+ * não sobe de clock e a CPU espera em D3DGETDATA_FLUSH em todo quadro.
  * RE5_FPS_LOG conta as chamadas de GetData e quantas devolveram S_FALSE ("ainda não").
- * RE5_QUERY_LAG=<n> (teste, desligado): evento emitido há n ou mais Present conta como pronto, para
- * a GPU ter n quadros de folga; quem limita os quadros em voo passa a ser a própria DXVK. */
+ * RE5_QUERY_LAG=<n> (padrão 2 no Android, 0 no PC): evento emitido há n ou mais Present conta como
+ * pronto ANTES de chamar o backend (evita lock/flush por D3DGETDATA_FLUSH); quem limita os quadros em
+ * voo passa a ser o RE5VK_LATENCY / swapchain da DXVK. */
 
 static int query_lag(void)
 {
     static int lag = -1;
     if (lag < 0) {
         const char *e = getenv("RE5_QUERY_LAG");
+#if defined(__ANDROID__)
+        lag = e ? atoi(e) : 2;
+#else
         lag = e ? atoi(e) : 0;
+#endif
         if (lag < 0) lag = 0;
         if (lag) RE5_INFO("d3d9", "RE5_QUERY_LAG=%d: consulta de evento pronta %d Present depois do Issue", lag, lag);
     }
@@ -1046,18 +1052,19 @@ static void q_GetData(CPU *c)
     IDirect3DQuery9 *q = (IDirect3DQuery9 *)o->host;
     void *data = d9_ptr(re5_arg(c, 1));
     DWORD size = re5_arg(c, 2), flags = re5_arg(c, 3);
-    HRESULT hr = q->lpVtbl->GetData(q, data, size, flags);
     __atomic_fetch_add(&g_q_calls, 1, __ATOMIC_RELAXED);
-    if (hr == S_FALSE) {
-        int lag = query_lag();
-        if (lag && o->q_issued && g_presents + 1 - o->q_issued >= (uint32_t)lag &&
-            q->lpVtbl->GetType(q) == D3DQUERYTYPE_EVENT) {
+    int lag = query_lag();
+    if (lag && o->q_issued && g_presents + 1u - o->q_issued >= (uint32_t)lag) {
+        if (!o->q_event_cached)
+            o->q_event_cached = (q->lpVtbl->GetType(q) == D3DQUERYTYPE_EVENT) ? 1 : -1;
+        if (o->q_event_cached > 0) {
             if (data && size >= sizeof(BOOL)) *(BOOL *)data = TRUE;
-            hr = S_OK;
-        } else {
-            __atomic_fetch_add(&g_q_false, 1, __ATOMIC_RELAXED);
+            c->eax = (uint32_t)D3D_OK;
+            return;
         }
     }
+    HRESULT hr = q->lpVtbl->GetData(q, data, size, flags);
+    if (hr == S_FALSE) __atomic_fetch_add(&g_q_false, 1, __ATOMIC_RELAXED);
     c->eax = (uint32_t)hr;
 }
 

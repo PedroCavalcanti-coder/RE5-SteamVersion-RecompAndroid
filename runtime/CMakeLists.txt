@@ -114,6 +114,7 @@ add_library(re5_runtime STATIC
     src/gfx/vk/vk_draw.c
     src/gfx/vk/vk_dxso.c
     src/gfx/vk/vk_res.c
+    src/gfx/vk/vk_tbdr.c
     src/win32/advapi32.c
     src/win32/avifil32.c
     src/win32/coldebug.c

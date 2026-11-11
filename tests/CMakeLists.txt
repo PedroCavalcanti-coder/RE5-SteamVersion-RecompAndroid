@@ -22,6 +22,12 @@ set_tests_properties(kernel32_hle PROPERTIES ENVIRONMENT "RE5_GUEST_LOCK=hle")
 add_executable(test_d3d9 unit/test_d3d9.c)
 target_link_libraries(test_d3d9 PRIVATE re5_runtime re5_d3d9_headers)
 add_test(NAME d3d9 COMMAND test_d3d9)
+add_test(NAME d3d9_query_lag COMMAND test_d3d9 --query-lag)
+set_tests_properties(d3d9_query_lag PROPERTIES ENVIRONMENT "RE5_QUERY_LAG=2")
+
+# Oráculo TBDR do re5vk (STORE_OP_DONT_CARE, sticky_live, invalidacao).
+add_executable(test_vk_tbdr unit/test_vk_tbdr.c "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk/vk_tbdr.c")
+add_test(NAME vk_tbdr COMMAND test_vk_tbdr)
 
 add_executable(test_dxt_decode unit/test_dxt_decode.c)
 add_test(NAME dxt_decode COMMAND test_dxt_decode)

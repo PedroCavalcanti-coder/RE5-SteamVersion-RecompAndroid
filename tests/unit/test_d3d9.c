@@ -78,8 +78,20 @@ FAKE_REFS(IDirect3DSurface9)
 FAKE_REFS(IDirect3DVertexBuffer9)
 FAKE_REFS(IDirect3DTexture9)
 FAKE_REFS(IDirect3DVolumeTexture9)
+FAKE_REFS(IDirect3DQuery9)
+
+typedef struct {
+    const void   *lpVtbl;
+    ULONG         refs;
+    D3DQUERYTYPE  type;
+    UINT          issue_calls, getdata_calls, gettype_calls;
+    HRESULT       getdata_hr;
+    BOOL          getdata_val;
+    DWORD         last_flags;
+} fake_query;
 
 static fake g_d3d, g_dev, g_bb, g_vb, g_tex, g_vol;
+static fake_query g_q_event, g_q_occ;
 
 static struct {
     UINT adapter, usage;
@@ -238,6 +250,16 @@ static HRESULT STDMETHODCALLTYPE dev_SetTexture(IDirect3DDevice9 *This, DWORD st
     return D3D_OK;
 }
 
+static HRESULT STDMETHODCALLTYPE dev_CreateQuery(IDirect3DDevice9 *This, D3DQUERYTYPE type, IDirect3DQuery9 **out)
+{
+    fake_query *q = type == D3DQUERYTYPE_EVENT ? &g_q_event : &g_q_occ;
+    if (!out) return D3D_OK;
+    q->type = type;
+    q->refs++;
+    *out = (IDirect3DQuery9 *)q;
+    return D3D_OK;
+}
+
 static struct IDirect3DDevice9Vtbl k_dev_vt = {
     .QueryInterface = dev_QueryInterface,
     .AddRef = fake_IDirect3DDevice9_AddRef,
@@ -251,6 +273,35 @@ static struct IDirect3DDevice9Vtbl k_dev_vt = {
     .Clear = dev_Clear,
     .SetRenderState = dev_SetRenderState,
     .SetTexture = dev_SetTexture,
+    .CreateQuery = dev_CreateQuery,
+};
+
+static D3DQUERYTYPE STDMETHODCALLTYPE q_GetType(IDirect3DQuery9 *This)
+{
+    fake_query *q = (fake_query *)This;
+    q->gettype_calls++;
+    return q->type;
+}
+static HRESULT STDMETHODCALLTYPE q_Issue(IDirect3DQuery9 *This, DWORD flags)
+{
+    fake_query *q = (fake_query *)This;
+    q->issue_calls++;
+    return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE q_GetData(IDirect3DQuery9 *This, void *data, DWORD size, DWORD flags)
+{
+    fake_query *q = (fake_query *)This;
+    q->getdata_calls++;
+    q->last_flags = flags;
+    if (q->getdata_hr == D3D_OK && data && size >= sizeof(BOOL)) *(BOOL *)data = q->getdata_val;
+    return q->getdata_hr;
+}
+static struct IDirect3DQuery9Vtbl k_query_vt = {
+    .AddRef = fake_IDirect3DQuery9_AddRef,
+    .Release = fake_IDirect3DQuery9_Release,
+    .GetType = q_GetType,
+    .Issue = q_Issue,
+    .GetData = q_GetData,
 };
 
 static HRESULT STDMETHODCALLTYPE surf_GetDesc(IDirect3DSurface9 *This, D3DSURFACE_DESC *d)
@@ -406,8 +457,9 @@ static void put_pp(uint32_t pp, uint32_t hwnd)
     for (int i = 0; i < 14; i++) wr32(pp + 4u * (uint32_t)i, v[i]);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    int query_lag_mode = (argc > 1 && strcmp(argv[1], "--query-lag") == 0);
     CHECK(re5_runtime_init() == 0);
     CHECK(re5_process_init(0x00400000u) == 0);
     T = re5_thread_attach(1u << 20);
@@ -418,6 +470,65 @@ int main(void)
     g_bb.refs = 1;   /* o device guarda a sua */
     g_vb.lpVtbl = &k_vb_vt;
     g_tex.lpVtbl = &k_tex_vt;
+    g_vol.lpVtbl = &k_vol_vt;
+    g_q_event.lpVtbl = &k_query_vt;
+    g_q_occ.lpVtbl = &k_query_vt;
+    re5_d3d9_set_backend(&k_fake);
+
+    if (query_lag_mode) {
+        const uint32_t sdk = D3D_SDK_VERSION;
+        uint32_t d3d = re5_guest_call(T, re5_import_bind("d3d9.dll", "Direct3DCreate9", 0), 1, &sdk);
+        uint32_t pp = gbuf(56), pdev = gbuf(4);
+        put_pp(pp, GUEST_HWND);
+        const uint32_t cd[6] = {0, D3DDEVTYPE_HAL, GUEST_HWND, D3DCREATE_HARDWARE_VERTEXPROCESSING, pp, pdev};
+        CHECK_EQ_U32(vcall(d3d, 16, 6, cd), D3D_OK);
+        uint32_t dev = rd32(pdev);
+
+        uint32_t pqe = gbuf(4), pqo = gbuf(4), pval = gbuf(4);
+        const uint32_t cqe[2] = {D3DQUERYTYPE_EVENT, pqe};
+        const uint32_t cqo[2] = {D3DQUERYTYPE_OCCLUSION, pqo};
+        CHECK_EQ_U32(vcall(dev, 118, 2, cqe), D3D_OK);
+        CHECK_EQ_U32(vcall(dev, 118, 2, cqo), D3D_OK);
+        uint32_t qe = rd32(pqe), qo = rd32(pqo);
+
+        g_q_event.getdata_hr = S_FALSE;
+        g_q_occ.getdata_hr = S_FALSE;
+        const uint32_t iss = D3DISSUE_END;
+        CHECK_EQ_U32(vcall(qe, 6, 1, &iss), D3D_OK);
+        CHECK_EQ_U32(vcall(qo, 6, 1, &iss), D3D_OK);
+
+        const uint32_t gd[3] = {pval, 4, D3DGETDATA_FLUSH};
+        /* Present #0: ainda não venceu lag=2 -> chama GetData do host */
+        CHECK_EQ_U32(vcall(qe, 7, 3, gd), (uint32_t)S_FALSE);
+        CHECK_EQ_U32(g_q_event.getdata_calls, 1);
+        CHECK_EQ_U32(g_q_event.last_flags, D3DGETDATA_FLUSH);
+
+        /* Present #1: 1 < 2 -> ainda chama o host */
+        const uint32_t pr[4] = {0, 0, 0, 0};
+        CHECK_EQ_U32(vcall(dev, 17, 4, pr), D3D_OK);
+        CHECK_EQ_U32(vcall(qe, 7, 3, gd), (uint32_t)S_FALSE);
+        CHECK_EQ_U32(g_q_event.getdata_calls, 2);
+
+        /* Present #2: 2 >= 2 -> devolve S_OK/TRUE ANTES de chamar GetData/Flush no host! */
+        CHECK_EQ_U32(vcall(dev, 17, 4, pr), D3D_OK);
+        wr32(pval, 0);
+        CHECK_EQ_U32(vcall(qe, 7, 3, gd), D3D_OK);
+        CHECK_EQ_U32(rd32(pval), 1);
+        CHECK_EQ_U32(g_q_event.getdata_calls, 2);   /* NÃO chamou host GetData(FLUSH)! */
+        CHECK_EQ_U32(g_q_event.gettype_calls, 1);
+
+        /* Segunda sondagem continua usando q_event_cached sem chamar GetType nem GetData */
+        wr32(pval, 0);
+        CHECK_EQ_U32(vcall(qe, 7, 3, gd), D3D_OK);
+        CHECK_EQ_U32(rd32(pval), 1);
+        CHECK_EQ_U32(g_q_event.getdata_calls, 2);
+        CHECK_EQ_U32(g_q_event.gettype_calls, 1);
+
+        /* Consulta OCCLUSION (não evento) continua chamando o host mesmo após o lag */
+        CHECK_EQ_U32(vcall(qo, 7, 3, gd), (uint32_t)S_FALSE);
+        CHECK_EQ_U32(g_q_occ.getdata_calls, 1);
+        CHECK_DONE();
+    }
     g_vol.lpVtbl = &k_vol_vt;
     re5_d3d9_set_backend(&k_fake);
 
@@ -735,5 +846,22 @@ int main(void)
     CHECK_EQ_U32(rec.presents, 1);
     CHECK(rec.present_hwnd == NULL);
     CHECK_EQ_U32(re5_d3d9_present_count(), 1);
+
+    /* Query sem RE5_QUERY_LAG: repassa ao host (S_FALSE -> D3D_OK quando pronto). */
+    uint32_t pqe = gbuf(4), pval = gbuf(4);
+    const uint32_t cqe[2] = {D3DQUERYTYPE_EVENT, pqe};
+    CHECK_EQ_U32(vcall(dev, 118, 2, cqe), D3D_OK);
+    uint32_t qe = rd32(pqe);
+    g_q_event.getdata_hr = S_FALSE;
+    const uint32_t iss = D3DISSUE_END;
+    const uint32_t gd[3] = {pval, 4, D3DGETDATA_FLUSH};
+    CHECK_EQ_U32(vcall(qe, 6, 1, &iss), D3D_OK);
+    CHECK_EQ_U32(vcall(qe, 7, 3, gd), (uint32_t)S_FALSE);
+    CHECK_EQ_U32(g_q_event.getdata_calls, 1);
+    g_q_event.getdata_hr = D3D_OK;
+    g_q_event.getdata_val = TRUE;
+    CHECK_EQ_U32(vcall(qe, 7, 3, gd), D3D_OK);
+    CHECK_EQ_U32(rd32(pval), 1);
+    CHECK_EQ_U32(g_q_event.getdata_calls, 2);
     CHECK_DONE();
 }

@@ -93,11 +93,241 @@ static VkFormat srgb_pair(VkFormat f)
     }
 }
 
-static VkImageAspectFlags aspect_of(const vk_format *f, int for_view)
+int re5vk_layout_general(void)
+{
+    static int g = -1;
+    if (g < 0) {
+        const char *e = getenv("RE5VK_LAYOUT_GENERAL");
+        g = e && *e == '1';
+        if (g) RE5_INFO("re5vk", "RE5VK_LAYOUT_GENERAL=1: mantendo imagens em VK_IMAGE_LAYOUT_GENERAL");
+    }
+    return g;
+}
+
+VkImageAspectFlags re5vk_img_aspect(const vk_format *f, int for_view)
 {
     if (!f->depth) return VK_IMAGE_ASPECT_COLOR_BIT;
     if (for_view) return VK_IMAGE_ASPECT_DEPTH_BIT;
     return VK_IMAGE_ASPECT_DEPTH_BIT | (f->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+}
+
+static VkImageAspectFlags aspect_of(const vk_format *f, int for_view)
+{
+    return re5vk_img_aspect(f, for_view);
+}
+
+VkImageLayout re5vk_img_sub_layout(const vk_image *im, uint32_t layer, uint32_t level)
+{
+    if (!im || !im->sub_layouts) return VK_IMAGE_LAYOUT_UNDEFINED;
+    return im->sub_layouts[(size_t)layer * im->levels + level];
+}
+
+static void layout_stage_src(VkImageLayout l, uint32_t read_stages, VkPipelineStageFlags *stg, VkAccessFlags *acc)
+{
+    switch (l) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+    case VK_IMAGE_LAYOUT_PREINITIALIZED:
+        *stg = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        *acc = 0;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *acc = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *acc = 0;
+        break;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        *acc = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        *acc = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        *stg = read_stages ? (VkPipelineStageFlags)read_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        *acc = 0;
+        break;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        *stg = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        *acc = 0;
+        break;
+    default: /* GENERAL */
+        *stg = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        *acc = VK_ACCESS_MEMORY_WRITE_BIT;
+        break;
+    }
+}
+
+static void layout_stage_dst(VkImageLayout l, VkPipelineStageFlags shader_stages, VkPipelineStageFlags *stg, VkAccessFlags *acc)
+{
+    switch (l) {
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *acc = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *acc = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        *acc = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        *stg = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        *acc = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        *stg = shader_stages ? shader_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        *acc = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        *stg = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        *acc = 0;
+        break;
+    default: /* GENERAL */
+        *stg = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *acc = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    }
+}
+
+int re5vk_img_needs_barrier(const vk_image *im, uint32_t base_level, uint32_t level_count,
+                            uint32_t base_layer, uint32_t layer_count, VkImageLayout want_layout)
+{
+    if (!im || !im->sub_layouts) return 0;
+    for (uint32_t ly = base_layer; ly < base_layer + layer_count; ly++) {
+        for (uint32_t lv = base_level; lv < base_level + level_count; lv++) {
+            size_t i = (size_t)ly * im->levels + lv;
+            if (im->sub_layouts[i] != want_layout || im->sub_dirty[i]) return 1;
+        }
+    }
+    return 0;
+}
+
+void re5vk_img_mark_written(vk_image *im, uint32_t base_level, uint32_t level_count,
+                            uint32_t base_layer, uint32_t layer_count)
+{
+    if (!im || !im->sub_dirty) return;
+    for (uint32_t ly = base_layer; ly < base_layer + layer_count; ly++) {
+        for (uint32_t lv = base_level; lv < base_level + level_count; lv++) {
+            size_t i = (size_t)ly * im->levels + lv;
+            im->sub_dirty[i] = 1;
+            im->sub_stages[i] = 0;
+        }
+    }
+}
+
+void re5vk_img_transition(vk_device *d, VkCommandBuffer cb, vk_image *im, uint32_t base_level, uint32_t level_count,
+                          uint32_t base_layer, uint32_t layer_count, VkImageLayout new_layout,
+                          VkPipelineStageFlags shader_stages)
+{
+    (void)d;
+    if (!im || !im->sub_layouts || !level_count || !layer_count) return;
+    VkImageAspectFlags asp = aspect_of(im->fmt, 0);
+    int is_ro = (new_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+                 new_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+
+    /* Caminho rápido: verifica se todos os sub-recursos do intervalo partilham o mesmo estado. */
+    size_t i0 = (size_t)base_layer * im->levels + base_level;
+    VkImageLayout l0 = im->sub_layouts[i0];
+    uint8_t d0 = im->sub_dirty[i0];
+    uint32_t s0 = im->sub_stages[i0];
+    int uniform = 1;
+    for (uint32_t ly = base_layer; ly < base_layer + layer_count && uniform; ly++) {
+        for (uint32_t lv = base_level; lv < base_level + level_count; lv++) {
+            size_t idx = (size_t)ly * im->levels + lv;
+            if (im->sub_layouts[idx] != l0 || im->sub_dirty[idx] != d0 || im->sub_stages[idx] != s0) {
+                uniform = 0;
+                break;
+            }
+        }
+    }
+
+    if (uniform) {
+        if (l0 == new_layout && !d0) {
+            if (is_ro && shader_stages) {
+                for (uint32_t ly = base_layer; ly < base_layer + layer_count; ly++)
+                    for (uint32_t lv = base_level; lv < base_level + level_count; lv++)
+                        im->sub_stages[(size_t)ly * im->levels + lv] |= (uint32_t)shader_stages;
+            }
+            return;
+        }
+        VkPipelineStageFlags ss, ds;
+        VkAccessFlags sa, da;
+        layout_stage_src(l0, s0, &ss, &sa);
+        layout_stage_dst(new_layout, shader_stages, &ds, &da);
+        VkImageMemoryBarrier b = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = sa,
+            .dstAccessMask = da,
+            .oldLayout = l0,
+            .newLayout = new_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = im->image,
+            .subresourceRange = {asp, base_level, level_count, base_layer, layer_count},
+        };
+        vkCmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
+        for (uint32_t ly = base_layer; ly < base_layer + layer_count; ly++) {
+            for (uint32_t lv = base_level; lv < base_level + level_count; lv++) {
+                size_t idx = (size_t)ly * im->levels + lv;
+                im->sub_layouts[idx] = new_layout;
+                im->sub_dirty[idx] = 0;
+                im->sub_stages[idx] = is_ro ? (uint32_t)(shader_stages ? shader_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) : 0u;
+            }
+        }
+        return;
+    }
+
+    VkImageMemoryBarrier bars[64];
+    uint32_t nb = 0;
+    VkPipelineStageFlags ss_union = 0, ds_union = 0;
+    for (uint32_t ly = base_layer; ly < base_layer + layer_count; ly++) {
+        for (uint32_t lv = base_level; lv < base_level + level_count; lv++) {
+            size_t idx = (size_t)ly * im->levels + lv;
+            VkImageLayout old = im->sub_layouts[idx];
+            if (old == new_layout && !im->sub_dirty[idx]) {
+                if (is_ro && shader_stages) im->sub_stages[idx] |= (uint32_t)shader_stages;
+                continue;
+            }
+            VkPipelineStageFlags ss, ds;
+            VkAccessFlags sa, da;
+            layout_stage_src(old, im->sub_stages[idx], &ss, &sa);
+            layout_stage_dst(new_layout, shader_stages, &ds, &da);
+            ss_union |= ss;
+            ds_union |= ds;
+            bars[nb++] = (VkImageMemoryBarrier){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = sa,
+                .dstAccessMask = da,
+                .oldLayout = old,
+                .newLayout = new_layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = im->image,
+                .subresourceRange = {asp, lv, 1, ly, 1},
+            };
+            im->sub_layouts[idx] = new_layout;
+            im->sub_dirty[idx] = 0;
+            im->sub_stages[idx] = is_ro ? (uint32_t)(shader_stages ? shader_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) : 0u;
+            if (nb == 64) {
+                vkCmdPipelineBarrier(cb, ss_union, ds_union, 0, 0, NULL, 0, NULL, nb, bars);
+                nb = 0;
+                ss_union = ds_union = 0;
+            }
+        }
+    }
+    if (nb) vkCmdPipelineBarrier(cb, ss_union, ds_union, 0, 0, NULL, 0, NULL, nb, bars);
 }
 
 int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_format *fmt, uint32_t w, uint32_t h,
@@ -174,6 +404,15 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
     im->levels = levels;
     im->layers = layers;
     im->type = type;
+    im->id = ++d->next_img_id;
+    size_t nsub = (size_t)levels * layers;
+    im->sub_layouts = calloc(nsub, sizeof *im->sub_layouts);
+    im->sub_dirty = calloc(nsub, sizeof *im->sub_dirty);
+    im->sub_stages = calloc(nsub, sizeof *im->sub_stages);
+    im->tbdr_subs = calloc(nsub, sizeof *im->tbdr_subs);
+    if (!im->sub_layouts || !im->sub_dirty || !im->sub_stages || !im->tbdr_subs)
+        re5_fatal("re5vk", "sem memória");
+    for (size_t i = 0; i < nsub; i++) re5vk_tbdr_sub_reset(&im->tbdr_subs[i]);
     if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
         VkImageViewCreateInfo vi = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -186,40 +425,29 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
         };
         VK_CHECK(vkCreateImageView(d->dev, &vi, NULL, &im->view));
     }
-    im->rt_views = calloc((size_t)levels * layers, sizeof *im->rt_views);
-    /* tudo em GENERAL desde o começo (vk_core.h) */
-    VkImageMemoryBarrier b = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = im->image,
-        .subresourceRange = {aspect_of(fmt, 0), 0, levels, 0, layers},
-    };
-    re5vk_end_rendering(d);
-    VkCommandBuffer cb = re5vk_cmd(d);
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
-                         0, NULL, 1, &b);
-    /* Conteúdo inicial zerado, como a DXVK e os drivers D3D9 entregam. Sem isto a imagem nasce
-     * com o que havia na memória: num alvo FP16 da cadeia de luminância do HDR, um NaN de lixo
-     * entra na adaptação de exposição (que mistura o quadro anterior) e nunca mais sai - a cena
-     * 3D fica preta enquanto menus e vídeo, que desenham direto no back buffer, saem certos.
-     * Formato comprimido (BC) não aceita clear; ele sempre chega pelo upload. */
-    if (fmt->bw == 1 && fmt->bh == 1) {
-        VkImageSubresourceRange all = {aspect_of(fmt, 0), 0, levels, 0, layers};
-        if (fmt->depth) {
-            VkClearDepthStencilValue z = {0.0f, 0};
-            vkCmdClearDepthStencilImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
-        } else {
-            VkClearColorValue z = {{0.0f, 0.0f, 0.0f, 0.0f}};
-            vkCmdClearColorImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &all);
+    im->rt_views = calloc(nsub, sizeof *im->rt_views);
+    int gen = re5vk_layout_general();
+    if (gen || (fmt->bw == 1 && fmt->bh == 1)) {
+        re5vk_end_rendering(d);
+        VkCommandBuffer cb = re5vk_cmd(d);
+        VkImageLayout init_layout = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        re5vk_img_transition(d, cb, im, 0, levels, 0, layers, init_layout, 0);
+        /* Conteúdo inicial zerado, como a DXVK e os drivers D3D9 entregam. Sem isto a imagem nasce
+         * com o que havia na memória: num alvo FP16 da cadeia de luminância do HDR, um NaN de lixo
+         * entra na adaptação de exposição (que mistura o quadro anterior) e nunca mais sai - a cena
+         * 3D fica preta enquanto menus e vídeo, que desenham direto no back buffer, saem certos.
+         * Formato comprimido (BC) não aceita clear; ele sempre chega pelo upload (em UNDEFINED até o upload). */
+        if (fmt->bw == 1 && fmt->bh == 1) {
+            VkImageSubresourceRange all = {aspect_of(fmt, 0), 0, levels, 0, layers};
+            if (fmt->depth) {
+                VkClearDepthStencilValue z = {0.0f, 0};
+                vkCmdClearDepthStencilImage(cb, im->image, init_layout, &z, 1, &all);
+            } else {
+                VkClearColorValue z = {{0.0f, 0.0f, 0.0f, 0.0f}};
+                vkCmdClearColorImage(cb, im->image, init_layout, &z, 1, &all);
+            }
+            re5vk_img_mark_written(im, 0, levels, 0, layers);
         }
-        VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                              .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL,
-                             0, NULL);
     }
     return 0;
 }
@@ -266,6 +494,10 @@ void re5vk_image_destroy(vk_device *d, vk_image *im)
     if (im->view) re5vk_destroy_later(d, 3, (uint64_t)(uintptr_t)im->view, (vk_alloc){0});
     re5vk_destroy_later(d, 2, (uint64_t)(uintptr_t)im->image, im->mem);
     free(im->rt_views);
+    free(im->sub_layouts);
+    free(im->sub_dirty);
+    free(im->sub_stages);
+    free(im->tbdr_subs);
     memset(im, 0, sizeof *im);
 }
 
@@ -287,7 +519,8 @@ static void upload(vk_device *d, vk_image *im, uint32_t layer, uint32_t level, u
         for (uint32_t r = 0; r < rows; r++)
             memcpy(p + ((size_t)s * rows + r) * row, data + (size_t)s * slice + (size_t)r * pitch, row);
     VkCommandBuffer cb = re5vk_cmd(d);
-    re5vk_barrier_all(cb);
+    VkImageLayout dst_layout = re5vk_layout_general() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    re5vk_img_transition(d, cb, im, level, 1, layer, 1, dst_layout, 0);
     VkBufferImageCopy c = {
         .bufferOffset = off,
         .bufferRowLength = (w + bw - 1) / bw * bw,
@@ -296,8 +529,10 @@ static void upload(vk_device *d, vk_image *im, uint32_t layer, uint32_t level, u
         .imageOffset = {(int32_t)x, (int32_t)y, (int32_t)z},
         .imageExtent = {w, h, depth},
     };
-    vkCmdCopyBufferToImage(cb, buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    re5vk_barrier_all(cb);
+    vkCmdCopyBufferToImage(cb, buf, im->image, dst_layout, 1, &c);
+    re5vk_img_mark_written(im, level, 1, layer, 1);
+    re5vk_tbdr_mark_external_write(&im->tbdr_subs[(size_t)layer * im->levels + level],
+                                   RE5VK_TBDR_COLOR | RE5VK_TBDR_DEPTH | RE5VK_TBDR_STENCIL);
     im->last_use = d->serial;
 }
 
@@ -484,17 +719,18 @@ HRESULT STDMETHODCALLTYPE re5vk_GetRenderTargetData(IDirect3DDevice9 *self, IDir
     VkDeviceSize size = (VkDeviceSize)s->desc.Width * s->desc.Height * f->bytes;
     re5vk_lock(d);
     re5vk_end_rendering(d);
+    re5vk_tbdr_mark_read(&d->tbdr, &s->img->tbdr_subs[(size_t)s->layer * s->img->levels + s->level], RE5VK_TBDR_COLOR);
     VkBuffer buf;
     VkDeviceSize off;
     uint8_t *p = re5vk_stage(d, size, 16, &buf, &off);
     VkCommandBuffer cb = re5vk_cmd(d);
-    re5vk_barrier_all(cb);
+    VkImageLayout src_layout = re5vk_layout_general() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    re5vk_img_transition(d, cb, s->img, s->level, 1, s->layer, 1, src_layout, 0);
     VkBufferImageCopy c = {.bufferOffset = off,
                            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, s->level, s->layer, 1},
                            .imageExtent = {s->desc.Width, s->desc.Height, 1}};
-    vkCmdCopyImageToBuffer(cb, s->img->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
-    re5vk_barrier_all(cb);
-    re5vk_flush(d, 1);   /* espera a GPU: o staging do envio anterior só volta a ser usado 8 envios depois */
+    vkCmdCopyImageToBuffer(cb, s->img->image, src_layout, buf, 1, &c);
+    re5vk_flush(d, 1);   /* espera a GPU: a fence garante visibilidade ao host antes do memcpy */
     memcpy(t->lock, p, (size_t)size);
     re5vk_unlock(d);
     return D3D_OK;
@@ -1127,13 +1363,26 @@ void re5vk_init_dummies(vk_device *d)
     VkClearColorValue black = {.float32 = {0, 0, 0, 1}};
     VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
     VkCommandBuffer cb = re5vk_cmd(d);
-    re5vk_barrier_all(cb);
+    int gen = re5vk_layout_general();
+    VkImageLayout dst_layout = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkImageLayout ro_layout = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    re5vk_img_transition(d, cb, &d->dummy2d, 0, 1, 0, 1, dst_layout, 0);
+    re5vk_img_transition(d, cb, &d->dummy3d, 0, 1, 0, 1, dst_layout, 0);
+    re5vk_img_transition(d, cb, &d->dummycube, 0, 1, 0, 6, dst_layout, 0);
     all.layerCount = 1;
-    vkCmdClearColorImage(cb, d->dummy2d.image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &all);
-    vkCmdClearColorImage(cb, d->dummy3d.image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &all);
+    vkCmdClearColorImage(cb, d->dummy2d.image, dst_layout, &black, 1, &all);
+    vkCmdClearColorImage(cb, d->dummy3d.image, dst_layout, &black, 1, &all);
     all.layerCount = 6;
-    vkCmdClearColorImage(cb, d->dummycube.image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &all);
-    re5vk_barrier_all(cb);
+    vkCmdClearColorImage(cb, d->dummycube.image, dst_layout, &black, 1, &all);
+    re5vk_img_mark_written(&d->dummy2d, 0, 1, 0, 1);
+    re5vk_img_mark_written(&d->dummy3d, 0, 1, 0, 1);
+    re5vk_img_mark_written(&d->dummycube, 0, 1, 0, 6);
+    re5vk_img_transition(d, cb, &d->dummy2d, 0, 1, 0, 1, ro_layout,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    re5vk_img_transition(d, cb, &d->dummy3d, 0, 1, 0, 1, ro_layout,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    re5vk_img_transition(d, cb, &d->dummycube, 0, 1, 0, 6, ro_layout,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     VkBufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256,
                              .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT};
     VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &d->zero_vb));

@@ -515,6 +515,12 @@ static void slot_begin(vk_device *d, int i)
     d->bound_pipe = VK_NULL_HANDLE;
     d->vb_valid = 0;   /* command buffer novo: nenhum vertex/index buffer ligado */
     d->bound_ib = VK_NULL_HANDLE;
+    d->dyn_valid = 0;
+    d->bound_vs_buf = VK_NULL_HANDLE;
+    d->bound_ps_buf = VK_NULL_HANDLE;
+    d->bound_set = VK_NULL_HANDLE;
+    d->bound_vs_off = d->bound_ps_off = 0;
+    d->bound_samp_sig = 0;
     /* UBO, descritores e estado dinâmico são por envio (o pool do set anterior é zerado na volta) */
     d->set_cache_gen++;   /* os sets do cache eram do pool que acabou de zerar */
     d->set_cache_n = 0;
@@ -528,7 +534,7 @@ static void submit(vk_device *d, VkSemaphore wait, VkSemaphore signal)
 {
     vk_slot *s = &d->slots[d->cur];
     VK_CHECK(vkEndCommandBuffer(s->cmd));
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .waitSemaphoreCount = wait ? 1u : 0u,
@@ -901,6 +907,7 @@ static void swapchain_create(vk_device *d)
             .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
         };
         VK_CHECK(vkCreateImageView(d->dev, &vi, NULL, &d->image_views[i]));
+        d->swap_layouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
         if (d->done[i]) continue;
         VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(d->dev, &si, NULL, &d->done[i]));
@@ -964,7 +971,8 @@ static ULONG STDMETHODCALLTYPE v_Release(IDirect3DDevice9 *self)
         /* O processo sai logo depois (o RE5 solta o device no fim): espera a GPU e larga o resto. */
         vkDeviceWaitIdle(d->dev);
         pcache_save(d);
-        RE5_INFO("re5vk", "device liberado depois de %llu Present", (unsigned long long)d->presents);
+        RE5_INFO("re5vk", "device liberado depois de %llu Present (TBDR dont_care=%u mismatches=%u)",
+                 (unsigned long long)d->presents, d->tbdr.stat_dont_care, d->tbdr.stat_mismatches);
     }
     return (ULONG)n;
 }
@@ -1039,6 +1047,7 @@ static HRESULT STDMETHODCALLTYPE v_EndScene(IDirect3DDevice9 *self)
 }
 
 static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                          VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,
                           VkAccessFlags src_access, VkAccessFlags dst_access)
 {
     VkImageMemoryBarrier b = {
@@ -1052,8 +1061,7 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
         .image = img,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
     };
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL,
-                         1, &b);
+    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
 /* Quadros em voo antes de o Present esperar a GPU (RE5VK_LATENCY, padrão 3). */
@@ -1074,14 +1082,18 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
     vk_device *d = (vk_device *)self;
     re5vk_lock(d);
     re5vk_end_rendering(d);
+    vk_image *bb = d->backbuffer->img;
+    if (bb->tbdr_subs)
+        re5vk_tbdr_mark_read(&d->tbdr, &bb->tbdr_subs[0], RE5VK_TBDR_COLOR);
+#if !defined(__ANDROID__)
     /* A janela mudou de tamanho (tela cheia, Reset, arrastar): a swapchain acompanha, como na DXVK.
-     * Antes ela só era refeita com OUT_OF_DATE, que o driver AMD no Windows não devolve: a imagem
-     * ficava com o tamanho da janela da criação (1280x720), no canto da tela cheia ou cortada na
-     * janela menor. O blit abaixo escala o back buffer para o tamanho novo. */
+     * No Android pula a consulta por quadro (chamada Binder síncrona ao SurfaceFlinger); a recriação
+     * ocorre via VK_ERROR_OUT_OF_DATE_KHR. */
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(d->phys, d->surface, &caps) == VK_SUCCESS &&
         caps.currentExtent.width != 0xFFFFFFFFu) {
         if (!caps.currentExtent.width || !caps.currentExtent.height) {   /* minimizada: nada a apresentar */
+            re5vk_tbdr_end_frame(&d->tbdr);
             re5vk_unlock(d);
             return D3D_OK;
         }
@@ -1091,6 +1103,7 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
             swapchain_create(d);
         }
     }
+#endif
     VkCommandBuffer cb = re5vk_cmd(d);
     VkSemaphore acq = d->acquired[d->cur];
     uint32_t idx = 0;
@@ -1099,32 +1112,38 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
         re5vk_flush(d, 1);
         vkDeviceWaitIdle(d->dev);
         swapchain_create(d);
+        re5vk_tbdr_end_frame(&d->tbdr);
         re5vk_unlock(d);
         return D3D_OK;
     }
     if (r < 0 && r != VK_SUBOPTIMAL_KHR) re5_fatal("re5vk", "vkAcquireNextImageKHR -> %s", re5vk_result(r));
     VkImage img = d->images[idx];
-    re5vk_barrier_all(cb);
-    vk_image *bb = d->backbuffer->img;
+    int gen = re5vk_layout_general();
     if (d->can_blit_to_swap) {
-        image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                      VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageLayout bb_src = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        re5vk_img_transition(d, cb, bb, 0, 1, 0, 1, bb_src, 0);
+        image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      0, VK_ACCESS_TRANSFER_WRITE_BIT);
         VkImageBlit blit = {
             .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
             .srcOffsets = {{0, 0, 0}, {(int32_t)bb->w, (int32_t)bb->h, 1}},
             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
             .dstOffsets = {{0, 0, 0}, {(int32_t)d->swap_extent.width, (int32_t)d->swap_extent.height, 1}},
         };
-        vkCmdBlitImage(cb, bb->image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+        vkCmdBlitImage(cb, bb->image, bb_src, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        VK_FILTER_LINEAR);
         image_barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                       VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     } else {
         /* Render fallback para Snapdragon / Adreno e GPUs sem TRANSFER_DST no swapchain */
+        VkImageLayout bb_ro = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        re5vk_img_transition(d, cb, bb, 0, 1, 0, 1, bb_ro, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         VkDescriptorImageInfo dii = {
             .sampler = d->present_sampler,
             .imageView = bb->view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .imageLayout = bb_ro,
         };
         VkWriteDescriptorSet w = {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1134,12 +1153,14 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo = &dii,
         };
-        if (d->present_view != bb->view) {   /* o set pode estar em uso por um quadro em voo */
+        if (d->present_view != bb->view || d->present_img_layout != bb_ro) {
             vkUpdateDescriptorSets(d->dev, 1, &w, 0, NULL);
             d->present_view = bb->view;
+            d->present_img_layout = bb_ro;
         }
-        image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
-                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        image_barrier(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
         VkRenderingAttachmentInfo rai = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = d->image_views[idx],
@@ -1164,9 +1185,12 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
         vkCmdDraw(cb, 3, 1, 0, 0);
         vkCmdEndRendering(cb);
         image_barrier(cb, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0);
     }
+    d->swap_layouts[idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     bb->last_use = d->serial;
+    re5vk_tbdr_end_frame(&d->tbdr);
     int prev = d->cur;
     uint64_t this_serial = d->serial;
     submit(d, acq, d->done[idx]);
@@ -1316,7 +1340,7 @@ static void pcache_save(vk_device *d)
         }
         if (ok) {
             d->pcache_saved = d->npipes;
-            RE5_INFO("re5vk", "cache de pipelines gravado: %zu bytes, %u pipelines", n, d->npipes);
+            RE5_INFO("re5vk", "cache de pipelines gravado: %llu bytes, %u pipelines", (unsigned long long)n, d->npipes);
         } else {
             RE5_WARN("re5vk", "não consegui gravar o cache de pipelines em %s", path);
         }
@@ -1610,6 +1634,12 @@ HRESULT re5vk_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND fo
     vkGetDeviceQueue(d->dev, d->qfam, 0, &d->queue);
 
     layout_create(d);
+    {
+        const char *tbdr_e = getenv("RE5VK_TBDR");
+        int tbdr_on = !(tbdr_e && *tbdr_e == '0');
+        re5vk_tbdr_init(&d->tbdr, tbdr_on);
+        RE5_INFO("re5vk", "oráculo TBDR (STORE_OP_DONT_CARE): %s", tbdr_on ? "ligado" : "desligado (RE5VK_TBDR=0)");
+    }
     slots_create(d);
     swapchain_create(d);
     re5vk_res_vtables(d);

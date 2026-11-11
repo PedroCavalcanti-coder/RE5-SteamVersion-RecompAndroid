@@ -31,6 +31,7 @@
 #include "re5/log.h"
 #include "../../core/host_sync.h"
 #include "vk_dxso.h"
+#include "vk_tbdr.h"
 
 #ifndef FOURCC
 #define FOURCC(a, b, c, d) ((D3DFORMAT)((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24))
@@ -170,9 +171,14 @@ struct vk_image {             /* imagem de textura, alvo de render, profundidade
     VkFormat vkf;              /* o formato escolhido (fmt->vk ou o substituto que a GPU aceita) */
     uint32_t w, h, d, levels, layers;
     VkImageType type;
+    uint64_t id;               /* ID único monotônico no device (para o oráculo TBDR) */
     uint64_t last_use;
     VkFormat srgb;             /* par sRGB do formato (D3DSAMP_SRGBTEXTURE), ou UNDEFINED */
     VkImageView view_srgb;     /* criada no primeiro uso */
+    VkImageLayout *sub_layouts;/* layout corrente por sub-recurso [layer * levels + level] */
+    uint8_t *sub_dirty;        /* 1 se o sub-recurso recebeu escrita pendente de barreira */
+    uint32_t *sub_stages;      /* estágios de leitura (VERTEX|FRAGMENT) acumulados desde a última barreira */
+    re5vk_tbdr_sub *tbdr_subs; /* rastreamento TBDR por sub-recurso */
 };
 
 typedef struct {
@@ -262,6 +268,7 @@ struct vk_device {
     uint32_t nimages;
     VkImage images[VK_MAX_IMAGES];
     VkImageView image_views[VK_MAX_IMAGES];
+    VkImageLayout swap_layouts[VK_MAX_IMAGES];
     int swap_has_transfer_dst;
     int can_blit_to_swap;
     VkSampler present_sampler;
@@ -270,6 +277,7 @@ struct vk_device {
     VkDescriptorPool present_pool;
     VkDescriptorSet present_set;
     VkImageView present_view;   /* o que o present_set aponta */
+    VkImageLayout present_img_layout;
     VkPipeline present_pipe;
     VkSemaphore done[VK_MAX_IMAGES];
     VkSemaphore acquired[VK_SLOTS];
@@ -341,17 +349,40 @@ struct vk_device {
     /* passe de render aberto */
     int rendering;
     VkExtent2D render_area;
+    VkImageLayout render_rt_layouts[4];
+    VkImageLayout render_ds_layout;
     VkPipeline bound_pipe;
     int dyn_dirty, desc_dirty;
+    int dyn_valid;
+    struct {
+        VkPrimitiveTopology topo;
+        VkViewport vp;
+        VkRect2D scissor;
+        VkCullModeFlags cull;
+        VkBool32 depth_test, depth_write;
+        VkCompareOp depth_op;
+        VkBool32 stencil_test;
+        DWORD stencil_two_sided;
+        VkStencilOp sf_fail, sf_pass, sf_zfail, sb_fail, sb_pass, sb_zfail;
+        VkCompareOp sf_func, sb_func;
+        uint32_t stencil_cmp_mask, stencil_write_mask, stencil_ref;
+        VkBool32 bias_on;
+        float depth_bias, depth_slope;
+        float blend_const[4];
+    } bound_dyn;
+    VkBuffer bound_vs_buf, bound_ps_buf;
+    VkDescriptorSet bound_set;
+    uint32_t bound_vs_off, bound_ps_off;
+    uint64_t bound_samp_sig;
     int has_eds1, has_eds2;
     VkDescriptorSet set;
     /* VkSampler do slot (sem e com comparação), válido até o próximo SetSamplerState nele:
      * sampler_get é busca linear com memcmp em toda a lista. */
     VkSampler smp_cache[VK_MAX_SAMPLERS][2];
     /* Sets já escritos neste envio (o pool zera a cada slot_begin): o mesmo conjunto de UBOs,
-     * views e samplers volta muito num quadro (material A, B, A...). Chave = os handles. */
+     * views e samplers volta muito num quadro (material A, B, A...). Chave = os handles + layouts. */
     struct vk_set_cache_entry {
-        uint64_t key[2 + 2 * RE5VK_NBINDINGS];
+        uint64_t key[2 + 3 * RE5VK_NBINDINGS];
         uint32_t nkey;
         uint64_t hash, gen;    /* gen != set_cache_gen: vaga */
         VkDescriptorSet set;
@@ -360,6 +391,9 @@ struct vk_device {
     uint64_t set_cache_gen;   /* sobe a cada slot_begin (re5vk.c) */
     uint32_t pipe_hash_cap;
     struct { int on; float color[4][4]; float z; uint32_t stencil; DWORD flags; } pending_clear;
+
+    uint64_t next_img_id;
+    re5vk_tbdr tbdr;
 
     uint64_t presents;
     int warned_gamma, warned_clip;
@@ -395,6 +429,16 @@ VkDescriptorSet re5vk_alloc_set(vk_device *d);
 void re5vk_barrier_all(VkCommandBuffer cb);
 
 /* vk_res.c */
+int re5vk_layout_general(void);
+VkImageAspectFlags re5vk_img_aspect(const vk_format *f, int for_view);
+VkImageLayout re5vk_img_sub_layout(const vk_image *im, uint32_t layer, uint32_t level);
+int re5vk_img_needs_barrier(const vk_image *im, uint32_t base_level, uint32_t level_count,
+                            uint32_t base_layer, uint32_t layer_count, VkImageLayout want_layout);
+void re5vk_img_transition(vk_device *d, VkCommandBuffer cb, vk_image *im, uint32_t base_level, uint32_t level_count,
+                          uint32_t base_layer, uint32_t layer_count, VkImageLayout new_layout,
+                          VkPipelineStageFlags shader_stages);
+void re5vk_img_mark_written(vk_image *im, uint32_t base_level, uint32_t level_count,
+                            uint32_t base_layer, uint32_t layer_count);
 const vk_format *re5vk_format(D3DFORMAT f);
 int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_format *fmt, uint32_t w, uint32_t h,
                        uint32_t depth, uint32_t levels, uint32_t layers, int cube, int rt, int ds);

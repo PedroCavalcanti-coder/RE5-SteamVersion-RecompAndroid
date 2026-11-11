@@ -113,43 +113,88 @@ void re5vk_state_reset(vk_device *d)
 
 /* ---- passes de render ---- */
 
-static void begin_rendering(vk_device *d)
+static void begin_rendering_with_layouts(vk_device *d, const VkImageLayout rt_layouts[4], VkImageLayout ds_layout)
 {
     if (d->rendering) return;
+    int gen = re5vk_layout_general();
     VkRenderingAttachmentInfo col[4];
     uint32_t ncol = 0;
     VkExtent2D area = {0xFFFFFFFFu, 0xFFFFFFFFu};
+
+    re5vk_tbdr_pass_in ti;
+    memset(&ti, 0, sizeof ti);
+    int clr_col = d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_TARGET);
+    int clr_z   = d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_ZBUFFER);
+    int clr_st  = d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_STENCIL);
+
+    for (uint32_t i = 0; i < 4; i++) {
+        vk_surface *s = d->rt[i];
+        d->render_rt_layouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!s) continue;
+        ti.color_img[i] = s->img->id;
+        ti.color_sub[i] = s->layer * s->img->levels + s->level;
+        ti.color_subs[i] = &s->img->tbdr_subs[ti.color_sub[i]];
+        if (clr_col) ti.color_cleared |= (uint8_t)(1u << i);
+        else ti.color_loaded |= (uint8_t)(1u << i);
+    }
+    vk_surface *ds = d->ds;
+    d->render_ds_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (ds) {
+        ti.ds_img = ds->img->id;
+        ti.ds_sub = ds->layer * ds->img->levels + ds->level;
+        ti.ds_sub_state = &ds->img->tbdr_subs[ti.ds_sub];
+        ti.has_depth = 1;
+        ti.has_stencil = ds->img->fmt->stencil ? 1u : 0u;
+        ti.depth_cleared = clr_z ? 1u : 0u;
+        ti.depth_loaded = clr_z ? 0u : 1u;
+        ti.stencil_cleared = clr_st ? 1u : 0u;
+        ti.stencil_loaded = (ti.has_stencil && !clr_st) ? 1u : 0u;
+    }
+    re5vk_tbdr_pass_out to;
+    re5vk_tbdr_begin_pass(&d->tbdr, &ti, &to);
+
+    VkCommandBuffer cb = re5vk_cmd(d);
     for (uint32_t i = 0; i < 4; i++) {
         memset(&col[i], 0, sizeof col[i]);
         col[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        col[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        col[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         col[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         col[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         vk_surface *s = d->rt[i];
         if (!s) continue;
+        VkImageLayout l = gen ? VK_IMAGE_LAYOUT_GENERAL : rt_layouts[i];
+        re5vk_img_transition(d, cb, s->img, s->level, 1, s->layer, 1, l, 0);
+        re5vk_img_mark_written(s->img, s->level, 1, s->layer, 1);
+        d->render_rt_layouts[i] = l;
         col[i].imageView = re5vk_image_rt_view(d, s->img, s->layer, s->level);
-        if (d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_TARGET)) {
+        col[i].imageLayout = l;
+        if (clr_col) {
             col[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             memcpy(col[i].clearValue.color.float32, d->pending_clear.color[0], 16);
         }
+        if (to.color_store_dont_care & (1u << i)) col[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         if (s->desc.Width < area.width) area.width = s->desc.Width;
         if (s->desc.Height < area.height) area.height = s->desc.Height;
         s->img->last_use = d->serial;
         ncol = i + 1;
     }
     VkRenderingAttachmentInfo dep = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sten = dep;
-    vk_surface *ds = d->ds;
     if (ds) {
+        VkImageLayout l = gen ? VK_IMAGE_LAYOUT_GENERAL : ds_layout;
+        re5vk_img_transition(d, cb, ds->img, ds->level, 1, ds->layer, 1, l, 0);
+        re5vk_img_mark_written(ds->img, ds->level, 1, ds->layer, 1);
+        d->render_ds_layout = l;
         dep.imageView = re5vk_image_rt_view(d, ds->img, ds->layer, ds->level);
-        dep.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        dep.imageLayout = l;
         dep.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dep.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        dep.storeOp = to.depth_store_dont_care ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         sten = dep;
-        if (d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_ZBUFFER)) {
+        sten.storeOp = to.stencil_store_dont_care ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        if (clr_z) {
             dep.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             dep.clearValue.depthStencil.depth = d->pending_clear.z;
         }
-        if (d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_STENCIL)) {
+        if (clr_st) {
             sten.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             sten.clearValue.depthStencil.stencil = d->pending_clear.stencil;
         }
@@ -168,19 +213,24 @@ static void begin_rendering(vk_device *d)
         .pDepthAttachment = ds ? &dep : NULL,
         .pStencilAttachment = ds && ds->img->fmt->stencil ? &sten : NULL,
     };
-    vkCmdBeginRendering(re5vk_cmd(d), &ri);
+    vkCmdBeginRendering(cb, &ri);
     d->rendering = 1;
     d->render_area = area;
-    d->dyn_dirty = 1;
 }
 
-/* Barreira de fim de passe (2026-11-07). Antes era ALL_COMMANDS -> ALL_COMMANDS: em GPU por tiles
- * (Mali) isso segura o vértice do passe seguinte até o fragmento deste acabar, a bolha que a Arm
- * manda evitar (docs/PESQUISA_VULKAN_ANDROID.md). Aqui: escritas de anexo (cor, profundidade) ->
- * quem pode ler o alvo depois: o fragmento (amostrar), os anexos do passe seguinte (LOAD) e as
- * cópias (StretchRect e leituras do alvo, que ainda põem a barreira total delas). O VS não entra:
- * textura de vértice amostrando um alvo recém-desenhado pede RE5VK_BARRIER=all, que volta à
- * barreira total. As imagens ficam em GENERAL, então uma barreira de memória basta. */
+static void begin_rendering(vk_device *d)
+{
+    int gen = re5vk_layout_general();
+    VkImageLayout rt_l[4];
+    for (int i = 0; i < 4; i++)
+        rt_l[i] = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkImageLayout ds_l = gen ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    begin_rendering_with_layouts(d, rt_l, ds_l);
+}
+
+/* Barreira de fim de passe: com layouts ótimos por sub-recurso (padrão), cada transição ou reuso
+ * emite apenas a barreira exata naquela imagem, permitindo sobreposição entre passes independentes.
+ * Com RE5VK_LAYOUT_GENERAL=1 ou RE5VK_BARRIER=all, mantém a barreira global de fim de passe. */
 static void pass_end_barrier(VkCommandBuffer cb)
 {
     static int all = -1;
@@ -193,6 +243,7 @@ static void pass_end_barrier(VkCommandBuffer cb)
         re5vk_barrier_all(cb);
         return;
     }
+    if (!re5vk_layout_general()) return;
     VkMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -215,7 +266,7 @@ void re5vk_end_rendering(vk_device *d)
     if (!d->rendering && d->pending_clear.on) begin_rendering(d);   /* um Clear sem draw: aplica */
     if (!d->rendering) return;
     vkCmdEndRendering(re5vk_cmd(d));
-    pass_end_barrier(re5vk_cmd(d));   /* o que o passe escreveu fica visível para amostrar e copiar */
+    pass_end_barrier(re5vk_cmd(d));   /* no-op no modo de layouts ótimos */
     d->rendering = 0;
 }
 
@@ -260,6 +311,7 @@ static HRESULT STDMETHODCALLTYPE v_SetDepthStencilSurface(IDirect3DDevice9 *self
     if (d->ds != s) {
         re5vk_end_rendering(d);
         set_obj((vk_obj **)&d->ds, s ? &s->o : NULL);
+        d->dyn_dirty = 1;
         d->pipe_gen++;
     }
     re5vk_unlock(d);
@@ -1040,12 +1092,21 @@ static int tex_is_depth(vk_obj *t)
 static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
 {
     VkCommandBuffer cb = re5vk_cmd(d);
-    vkCmdSetPrimitiveTopology(cb, topology(pt));
-    if (!d->dyn_dirty) return;
-    d->dyn_dirty = 0;
-    VkViewport v = {(float)d->vp.X + 0.5f, (float)(d->vp.Y + d->vp.Height) + 0.5f, (float)d->vp.Width,
-                    -(float)d->vp.Height, d->vp.MinZ, d->vp.MaxZ};
-    vkCmdSetViewport(cb, 0, 1, &v);
+    VkPrimitiveTopology t = topology(pt);
+    int force = !d->dyn_valid;
+
+    if (force || d->bound_dyn.topo != t) {
+        vkCmdSetPrimitiveTopology(cb, t);
+        d->bound_dyn.topo = t;
+    }
+    if (force) {
+        vkCmdSetFrontFace(cb, VK_FRONT_FACE_CLOCKWISE);
+        vkCmdSetDepthBoundsTestEnable(cb, VK_FALSE);
+        vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
+        vkCmdSetRasterizerDiscardEnable(cb, VK_FALSE);
+    }
+
+    /* Sempre confere o scissor contra d->render_area mesmo se !dyn_dirty (novo passe pode ter área diferente) */
     VkRect2D sc = {{0, 0}, d->render_area};
     if (RS(d, D3DRS_SCISSORTESTENABLE)) {
         sc = (VkRect2D){{d->scissor.left, d->scissor.top},
@@ -1053,45 +1114,126 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
                          (uint32_t)(d->scissor.bottom > d->scissor.top ? d->scissor.bottom - d->scissor.top : 0)}};
         clamp_rect(&sc, d->render_area);
     }
-    vkCmdSetScissor(cb, 0, 1, &sc);
+    if (force || memcmp(&d->bound_dyn.scissor, &sc, sizeof sc) != 0) {
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        d->bound_dyn.scissor = sc;
+    }
+
+    if (!force && !d->dyn_dirty) return;
+    d->dyn_dirty = 0;
+    d->dyn_valid = 1;
+
+    VkViewport v = {(float)d->vp.X + 0.5f, (float)(d->vp.Y + d->vp.Height) + 0.5f, (float)d->vp.Width,
+                    -(float)d->vp.Height, d->vp.MinZ, d->vp.MaxZ};
+    if (force || memcmp(&d->bound_dyn.vp, &v, sizeof v) != 0) {
+        vkCmdSetViewport(cb, 0, 1, &v);
+        d->bound_dyn.vp = v;
+    }
     /* cull: na tela (y para baixo nos dois) a ordem é a do D3D9 */
     DWORD cull = RS(d, D3DRS_CULLMODE);
-    vkCmdSetFrontFace(cb, VK_FRONT_FACE_CLOCKWISE);
-    vkCmdSetCullMode(cb, cull == D3DCULL_CCW ? VK_CULL_MODE_BACK_BIT : cull == D3DCULL_CW ? VK_CULL_MODE_FRONT_BIT
-                                                                                         : VK_CULL_MODE_NONE);
+    VkCullModeFlags cm = cull == D3DCULL_CCW ? VK_CULL_MODE_BACK_BIT : cull == D3DCULL_CW ? VK_CULL_MODE_FRONT_BIT
+                                                                                          : VK_CULL_MODE_NONE;
+    if (force || d->bound_dyn.cull != cm) {
+        vkCmdSetCullMode(cb, cm);
+        d->bound_dyn.cull = cm;
+    }
+
     int has_depth = d->ds != NULL;
-    vkCmdSetDepthTestEnable(cb, has_depth && RS(d, D3DRS_ZENABLE) != D3DZB_FALSE);
-    vkCmdSetDepthWriteEnable(cb, has_depth && RS(d, D3DRS_ZENABLE) != D3DZB_FALSE && RS(d, D3DRS_ZWRITEENABLE));
-    vkCmdSetDepthCompareOp(cb, cmp_op(RS(d, D3DRS_ZFUNC)));
-    vkCmdSetDepthBoundsTestEnable(cb, VK_FALSE);
-    int stencil = has_depth && d->ds->img->fmt->stencil && RS(d, D3DRS_STENCILENABLE);
-    vkCmdSetStencilTestEnable(cb, stencil);
-    VkStencilFaceFlags both = VK_STENCIL_FACE_FRONT_AND_BACK;
-    vkCmdSetStencilOp(cb, RS(d, D3DRS_TWOSIDEDSTENCILMODE) ? VK_STENCIL_FACE_FRONT_BIT : both,
-                      stencil_op(RS(d, D3DRS_STENCILFAIL)), stencil_op(RS(d, D3DRS_STENCILPASS)),
-                      stencil_op(RS(d, D3DRS_STENCILZFAIL)), cmp_op(RS(d, D3DRS_STENCILFUNC)));
-    if (RS(d, D3DRS_TWOSIDEDSTENCILMODE))
-        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, stencil_op(RS(d, D3DRS_CCW_STENCILFAIL)),
-                          stencil_op(RS(d, D3DRS_CCW_STENCILPASS)), stencil_op(RS(d, D3DRS_CCW_STENCILZFAIL)),
-                          cmp_op(RS(d, D3DRS_CCW_STENCILFUNC)));
-    vkCmdSetStencilCompareMask(cb, both, RS(d, D3DRS_STENCILMASK));
-    vkCmdSetStencilWriteMask(cb, both, RS(d, D3DRS_STENCILWRITEMASK));
-    vkCmdSetStencilReference(cb, both, RS(d, D3DRS_STENCILREF));
+    VkBool32 ztest = (has_depth && RS(d, D3DRS_ZENABLE) != D3DZB_FALSE) ? VK_TRUE : VK_FALSE;
+    VkBool32 zwrite = (ztest && RS(d, D3DRS_ZWRITEENABLE)) ? VK_TRUE : VK_FALSE;
+    VkCompareOp zop = cmp_op(RS(d, D3DRS_ZFUNC));
+    if (force || d->bound_dyn.depth_test != ztest) {
+        vkCmdSetDepthTestEnable(cb, ztest);
+        d->bound_dyn.depth_test = ztest;
+    }
+    if (force || d->bound_dyn.depth_write != zwrite) {
+        vkCmdSetDepthWriteEnable(cb, zwrite);
+        d->bound_dyn.depth_write = zwrite;
+    }
+    if (force || d->bound_dyn.depth_op != zop) {
+        vkCmdSetDepthCompareOp(cb, zop);
+        d->bound_dyn.depth_op = zop;
+    }
+
+    VkBool32 stencil = (has_depth && d->ds->img->fmt->stencil && RS(d, D3DRS_STENCILENABLE)) ? VK_TRUE : VK_FALSE;
+    if (force || d->bound_dyn.stencil_test != stencil) {
+        vkCmdSetStencilTestEnable(cb, stencil);
+        d->bound_dyn.stencil_test = stencil;
+    }
+    if (force || stencil) {
+        VkStencilFaceFlags both = VK_STENCIL_FACE_FRONT_AND_BACK;
+        DWORD two = RS(d, D3DRS_TWOSIDEDSTENCILMODE) ? 1u : 0u;
+        VkStencilOp sf_f = stencil_op(RS(d, D3DRS_STENCILFAIL));
+        VkStencilOp sf_p = stencil_op(RS(d, D3DRS_STENCILPASS));
+        VkStencilOp sf_z = stencil_op(RS(d, D3DRS_STENCILZFAIL));
+        VkCompareOp sf_c = cmp_op(RS(d, D3DRS_STENCILFUNC));
+        if (force || d->bound_dyn.stencil_two_sided != two || d->bound_dyn.sf_fail != sf_f ||
+            d->bound_dyn.sf_pass != sf_p || d->bound_dyn.sf_zfail != sf_z || d->bound_dyn.sf_func != sf_c) {
+            vkCmdSetStencilOp(cb, two ? VK_STENCIL_FACE_FRONT_BIT : both, sf_f, sf_p, sf_z, sf_c);
+            d->bound_dyn.sf_fail = sf_f;
+            d->bound_dyn.sf_pass = sf_p;
+            d->bound_dyn.sf_zfail = sf_z;
+            d->bound_dyn.sf_func = sf_c;
+        }
+        if (two) {
+            VkStencilOp sb_f = stencil_op(RS(d, D3DRS_CCW_STENCILFAIL));
+            VkStencilOp sb_p = stencil_op(RS(d, D3DRS_CCW_STENCILPASS));
+            VkStencilOp sb_z = stencil_op(RS(d, D3DRS_CCW_STENCILZFAIL));
+            VkCompareOp sb_c = cmp_op(RS(d, D3DRS_CCW_STENCILFUNC));
+            if (force || !d->bound_dyn.stencil_two_sided || d->bound_dyn.sb_fail != sb_f ||
+                d->bound_dyn.sb_pass != sb_p || d->bound_dyn.sb_zfail != sb_z || d->bound_dyn.sb_func != sb_c) {
+                vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, sb_f, sb_p, sb_z, sb_c);
+                d->bound_dyn.sb_fail = sb_f;
+                d->bound_dyn.sb_pass = sb_p;
+                d->bound_dyn.sb_zfail = sb_z;
+                d->bound_dyn.sb_func = sb_c;
+            }
+        }
+        d->bound_dyn.stencil_two_sided = two;
+        uint32_t cmask = RS(d, D3DRS_STENCILMASK), wmask = RS(d, D3DRS_STENCILWRITEMASK), ref = RS(d, D3DRS_STENCILREF);
+        if (force || d->bound_dyn.stencil_cmp_mask != cmask) {
+            vkCmdSetStencilCompareMask(cb, both, cmask);
+            d->bound_dyn.stencil_cmp_mask = cmask;
+        }
+        if (force || d->bound_dyn.stencil_write_mask != wmask) {
+            vkCmdSetStencilWriteMask(cb, both, wmask);
+            d->bound_dyn.stencil_write_mask = wmask;
+        }
+        if (force || d->bound_dyn.stencil_ref != ref) {
+            vkCmdSetStencilReference(cb, both, ref);
+            d->bound_dyn.stencil_ref = ref;
+        }
+    }
+
     /* depth bias: o do D3D9 é em unidades de profundidade; o do Vulkan, no menor degrau do formato */
     float bias = f_of(RS(d, D3DRS_DEPTHBIAS)), slope = f_of(RS(d, D3DRS_SLOPESCALEDEPTHBIAS));
-    int bias_on = has_depth && (bias != 0.0f || slope != 0.0f);
-    vkCmdSetDepthBiasEnable(cb, bias_on);
+    VkBool32 bias_on = (has_depth && (bias != 0.0f || slope != 0.0f)) ? VK_TRUE : VK_FALSE;
+    if (force || d->bound_dyn.bias_on != bias_on) {
+        vkCmdSetDepthBiasEnable(cb, bias_on);
+        d->bound_dyn.bias_on = bias_on;
+    }
     if (bias_on) {
         VkFormat df = d->ds->img->vkf;
         float r = df == VK_FORMAT_D16_UNORM ? 65535.0f : (df == VK_FORMAT_D24_UNORM_S8_UINT ? 16777215.0f : 8388608.0f);
-        vkCmdSetDepthBias(cb, bias * r, 0.0f, slope);
+        float vb = bias * r;
+        if (force || d->bound_dyn.depth_bias != vb || d->bound_dyn.depth_slope != slope) {
+            vkCmdSetDepthBias(cb, vb, 0.0f, slope);
+            d->bound_dyn.depth_bias = vb;
+            d->bound_dyn.depth_slope = slope;
+        }
+    } else if (force) {
+        vkCmdSetDepthBias(cb, 0.0f, 0.0f, 0.0f);
+        d->bound_dyn.depth_bias = 0.0f;
+        d->bound_dyn.depth_slope = 0.0f;
     }
+
     DWORD bf = RS(d, D3DRS_BLENDFACTOR);
     float bc[4] = {(float)((bf >> 16) & 0xFF) / 255.0f, (float)((bf >> 8) & 0xFF) / 255.0f, (float)(bf & 0xFF) / 255.0f,
                    (float)(bf >> 24) / 255.0f};
-    vkCmdSetBlendConstants(cb, bc);
-    vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
-    vkCmdSetRasterizerDiscardEnable(cb, VK_FALSE);
+    if (force || memcmp(d->bound_dyn.blend_const, bc, sizeof bc) != 0) {
+        vkCmdSetBlendConstants(cb, bc);
+        memcpy(d->bound_dyn.blend_const, bc, sizeof bc);
+    }
 }
 
 static vk_image *bound_image(vk_device *d, int slot, int want_type, int *is_depth)
@@ -1108,6 +1250,49 @@ static vk_image *bound_image(vk_device *d, int slot, int want_type, int *is_dept
     return want_type == RE5VK_TEX_CUBE ? &d->dummycube : want_type == RE5VK_TEX_3D ? &d->dummy3d : &d->dummy2d;
 }
 
+static int img_is_attached(const vk_device *d, const vk_image *im)
+{
+    for (int i = 0; i < 4; i++)
+        if (d->rt[i] && d->rt[i]->img == im) return 1;
+    if (d->ds && d->ds->img == im) return 1;
+    return 0;
+}
+
+static void upload_ubos(vk_device *d, const re5vk_shader *vsi, const re5vk_shader *psi, uint8_t vs_ib, uint8_t ps_ib)
+{
+    if (d->vs_dirty || vsi->const_f > d->vs_ubo_f || (vs_ib & ~d->vs_ubo_ib)) {
+        uint8_t *u = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
+        memcpy(u, d->vsf, (size_t)vsi->const_f * 16u);
+        if (vsi->uses_i) memcpy(u + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
+        if (vsi->uses_b) memcpy(u + RE5VK_VS_UBO_B, &d->vsb, 4);
+        d->vs_ubo_f = vsi->const_f;
+        d->vs_ubo_ib = vs_ib;
+        d->vs_dirty = 0;
+    }
+    if (d->ps_dirty || psi->const_f > d->ps_ubo_f || (ps_ib & ~d->ps_ubo_ib)) {
+        uint64_t ser = d->serial;
+        uint8_t *u = re5vk_ubo(d, RE5VK_PS_UBO_SIZE, &d->ps_ubo_buf, &d->ps_ubo_off);
+        memcpy(u, d->psf, (size_t)psi->const_f * 16u);
+        if (psi->uses_i) memcpy(u + RE5VK_PS_UBO_I, d->psi, sizeof d->psi);
+        if (psi->uses_b) memcpy(u + RE5VK_PS_UBO_B, &d->psb, 4);
+        float aref = (float)(RS(d, D3DRS_ALPHAREF) & 0xFF) / 255.0f;
+        memcpy(u + RE5VK_PS_UBO_AREF, &aref, 4);
+        d->ps_ubo_f = psi->const_f;
+        d->ps_ubo_ib = ps_ib;
+        d->ps_dirty = 0;
+        if (d->serial != ser && d->vs_dirty) {
+            /* PS UBO encheu o anel e disparou flush: reenvia VS UBO no novo slot. */
+            uint8_t *vu = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
+            memcpy(vu, d->vsf, (size_t)vsi->const_f * 16u);
+            if (vsi->uses_i) memcpy(vu + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
+            if (vsi->uses_b) memcpy(vu + RE5VK_VS_UBO_B, &d->vsb, 4);
+            d->vs_ubo_f = vsi->const_f;
+            d->vs_ubo_ib = vs_ib;
+            d->vs_dirty = 0;
+        }
+    }
+}
+
 static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
 {
     if (!d->vs || !d->ps) re5_fatal("re5vk", "draw sem vertex/pixel shader (fixed function sem implementação)");
@@ -1117,9 +1302,9 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         d->warned_clip = 1;
     }
     if (RS(d, D3DRS_SRGBWRITEENABLE)) re5_fatal("re5vk", "D3DRS_SRGBWRITEENABLE sem implementação");
-    begin_rendering(d);
-    /* Mesmo estado de pipeline do draw anterior (pipe_gen e topologia): sem variantes, chave
-     * nem busca (eram ~90 mil por segundo na thread de render). */
+
+    /* Variantes e pipeline ANTES de begin_rendering para saber quais texturas entram no draw e
+     * preparar as transições de layout fora de vkCmdBeginRendering (exigido pelo Vulkan). */
     re5vk_dxso_variant psv;
     const re5vk_shader *vsi, *psi;
     VkPipeline pipe;
@@ -1194,71 +1379,95 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         d->last_psi = psi;
         d->last_psv = psv;
     }
-    VkCommandBuffer cb = re5vk_cmd(d);
-    if (pipe != d->bound_pipe) {
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        d->bound_pipe = pipe;
-    }
-    set_dynamic(d, pt);
 
-    /* constantes */
-    /* Só o que o shader lê (vsi/psi->const_f, uses_i, uses_b): antes eram os bancos inteiros,
-     * ~8 KB por draw com ~1000 draws por quadro, na thread de render que é o caminho crítico
-     * (RE5_PROFILE, 2026-11-03). A região nova é refeita também quando o shader atual lê mais do
-     * que a região corrente recebeu (troca de shader sem constante nova). */
+    /* Coleta samplers ativos neste draw e resolve layouts (ótimo ou GENERAL em conflito anexo+sampler). */
+    int gen = re5vk_layout_general();
+    vk_image *samp_im[20];
+    int samp_dep[20], samp_slot[20], samp_is_vs[20], samp_conflict[20];
+    VkImageLayout samp_layout[20];
+    uint32_t nsamp = 0;
+    for (int s = 0; s < 16; s++) {
+        if (!(psi->samplers >> s & 1)) continue;
+        int dep;
+        vk_image *im = bound_image(d, s, psi->sampler_type[s], &dep);
+        int conf = img_is_attached(d, im);
+        samp_im[nsamp] = im;
+        samp_dep[nsamp] = dep;
+        samp_slot[nsamp] = s;
+        samp_is_vs[nsamp] = 0;
+        samp_conflict[nsamp] = conf;
+        samp_layout[nsamp] = (gen || conf) ? VK_IMAGE_LAYOUT_GENERAL
+                           : dep           ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        nsamp++;
+    }
+    for (int s = 0; s < 4; s++) {
+        if (!(vsi->samplers >> s & 1)) continue;
+        int dep;
+        vk_image *im = bound_image(d, 16 + s, vsi->sampler_type[s], &dep);
+        int conf = img_is_attached(d, im);
+        samp_im[nsamp] = im;
+        samp_dep[nsamp] = dep;
+        samp_slot[nsamp] = 16 + s;
+        samp_is_vs[nsamp] = 1;
+        samp_conflict[nsamp] = conf;
+        samp_layout[nsamp] = (gen || conf) ? VK_IMAGE_LAYOUT_GENERAL
+                           : dep           ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        nsamp++;
+    }
+
+    VkImageLayout want_rt_l[4];
+    for (int i = 0; i < 4; i++) {
+        int conf = 0;
+        if (d->rt[i])
+            for (uint32_t j = 0; j < nsamp; j++)
+                if (samp_im[j] == d->rt[i]->img) { conf = 1; break; }
+        want_rt_l[i] = (gen || conf) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    VkImageLayout want_ds_l = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    {
+        int conf = 0;
+        if (d->ds)
+            for (uint32_t j = 0; j < nsamp; j++)
+                if (samp_im[j] == d->ds->img) { conf = 1; break; }
+        if (gen || conf) want_ds_l = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
+    /* Constantes e descritores ANTES de abrir/dividir o passe: um anel de UBO ou pool cheio
+     * chama re5vk_flush() e invalida o VkCommandBuffer e o passe aberto. */
     uint8_t vs_ib = (uint8_t)(vsi->uses_i | vsi->uses_b << 1), ps_ib = (uint8_t)(psi->uses_i | psi->uses_b << 1);
-    if (d->vs_dirty || vsi->const_f > d->vs_ubo_f || (vs_ib & ~d->vs_ubo_ib)) {
-        uint8_t *u = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
-        memcpy(u, d->vsf, (size_t)vsi->const_f * 16u);
-        if (vsi->uses_i) memcpy(u + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
-        if (vsi->uses_b) memcpy(u + RE5VK_VS_UBO_B, &d->vsb, 4);
-        d->vs_ubo_f = vsi->const_f;
-        d->vs_ubo_ib = vs_ib;
-        d->vs_dirty = 0;
+    upload_ubos(d, vsi, psi, vs_ib, ps_ib);
+
+    uint64_t samp_sig = 0xcbf29ce484222325ull;
+    for (uint32_t j = 0; j < nsamp; j++) {
+        uint64_t b = (uint64_t)(samp_is_vs[j] ? (RE5VK_BIND_VS_SAMP + samp_slot[j] - 16)
+                                              : (RE5VK_BIND_PS_SAMP + samp_slot[j]));
+        samp_sig = (samp_sig ^ (b | ((uint64_t)samp_layout[j] << 16))) * 0x100000001b3ull;
     }
-    if (d->ps_dirty || psi->const_f > d->ps_ubo_f || (ps_ib & ~d->ps_ubo_ib)) {
-        uint8_t *u = re5vk_ubo(d, RE5VK_PS_UBO_SIZE, &d->ps_ubo_buf, &d->ps_ubo_off);
-        memcpy(u, d->psf, (size_t)psi->const_f * 16u);
-        if (psi->uses_i) memcpy(u + RE5VK_PS_UBO_I, d->psi, sizeof d->psi);
-        if (psi->uses_b) memcpy(u + RE5VK_PS_UBO_B, &d->psb, 4);
-        float aref = (float)(RS(d, D3DRS_ALPHAREF) & 0xFF) / 255.0f;
-        memcpy(u + RE5VK_PS_UBO_AREF, &aref, 4);
-        d->ps_ubo_f = psi->const_f;
-        d->ps_ubo_ib = ps_ib;
-        d->ps_dirty = 0;
-    }
-    /* descritores: reaproveitados enquanto texturas, samplers e shaders não mudam */
-    static VkBuffer last_vs_buf, last_ps_buf;
-    if (d->desc_dirty || !d->set || last_vs_buf != d->vs_ubo_buf || last_ps_buf != d->ps_ubo_buf) {
+    if (d->desc_dirty || !d->set || d->bound_vs_buf != d->vs_ubo_buf || d->bound_ps_buf != d->ps_ubo_buf ||
+        d->bound_samp_sig != samp_sig) {
         VkDescriptorImageInfo ii[20];
         uint32_t bind[20];
         uint32_t ni = 0;
-        for (int s = 0; s < 16; s++) {
-            if (!(psi->samplers >> s & 1)) continue;
-            int dep;
-            vk_image *im = bound_image(d, s, psi->sampler_type[s], &dep);
-            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, s, dep && (psv.depth_samplers >> s & 1)),
-                                             re5vk_image_sampled_view(d, im, d->ss[s][D3DSAMP_SRGBTEXTURE] != 0),
-                                             VK_IMAGE_LAYOUT_GENERAL};
-            bind[ni++] = RE5VK_BIND_PS_SAMP + (uint32_t)s;
+        for (uint32_t j = 0; j < nsamp; j++) {
+            int s = samp_slot[j];
+            int cmp = !samp_is_vs[j] && samp_dep[j] && (psv.depth_samplers >> s & 1);
+            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, s, cmp),
+                                             re5vk_image_sampled_view(d, samp_im[j], d->ss[s][D3DSAMP_SRGBTEXTURE] != 0),
+                                             samp_layout[j]};
+            bind[ni++] = (samp_is_vs[j] ? RE5VK_BIND_VS_SAMP : RE5VK_BIND_PS_SAMP) +
+                         (uint32_t)(samp_is_vs[j] ? (s - 16) : s);
         }
-        for (int s = 0; s < 4; s++) {
-            if (!(vsi->samplers >> s & 1)) continue;
-            int dep;
-            vk_image *im = bound_image(d, 16 + s, vsi->sampler_type[s], &dep);
-            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, 16 + s, 0),
-                                             re5vk_image_sampled_view(d, im, d->ss[16 + s][D3DSAMP_SRGBTEXTURE] != 0),
-                                             VK_IMAGE_LAYOUT_GENERAL};
-            bind[ni++] = RE5VK_BIND_VS_SAMP + (uint32_t)s;
-        }
-        /* Mesmo conjunto (UBOs, bindings, views, samplers) já escrito neste envio: reusa o set. */
-        uint64_t key[2 + 2 * RE5VK_NBINDINGS];
+        /* Mesmo conjunto (UBOs, bindings, layouts, views, samplers) já escrito neste envio: reusa o set. */
+        uint64_t key[2 + 3 * RE5VK_NBINDINGS];
         uint32_t nk = 0;
         key[nk++] = (uint64_t)(uintptr_t)d->vs_ubo_buf;
         key[nk++] = (uint64_t)(uintptr_t)d->ps_ubo_buf;
         for (uint32_t i = 0; i < ni; i++) {
-            key[nk++] = (uint64_t)(uintptr_t)ii[i].imageView ^ ((uint64_t)bind[i] << 56);
+            key[nk++] = (uint64_t)(uintptr_t)ii[i].imageView;
             key[nk++] = (uint64_t)(uintptr_t)ii[i].sampler;
+            key[nk++] = (uint64_t)bind[i] | ((uint64_t)ii[i].imageLayout << 16);
         }
         uint64_t h = set_key_hash(key, nk);
         int found;
@@ -1266,7 +1475,14 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         if (found) {
             d->set = e->set;
         } else {
+            uint64_t ser = d->serial;
             d->set = re5vk_alloc_set(d);   /* pode mandar o envio e zerar o cache (gen novo) */
+            if (d->serial != ser) {
+                upload_ubos(d, vsi, psi, vs_ib, ps_ib);
+                key[0] = (uint64_t)(uintptr_t)d->vs_ubo_buf;
+                key[1] = (uint64_t)(uintptr_t)d->ps_ubo_buf;
+                h = set_key_hash(key, nk);
+            }
             VkWriteDescriptorSet w[RE5VK_NBINDINGS];
             VkDescriptorBufferInfo bi[2] = {{d->vs_ubo_buf, 0, RE5VK_VS_UBO_SIZE},
                                             {d->ps_ubo_buf, 0, RE5VK_PS_UBO_SIZE}};
@@ -1282,7 +1498,6 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
                                                  .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                                  .pImageInfo = &ii[i]};
             vkUpdateDescriptorSets(d->dev, nw, w, 0, NULL);
-            /* Guarda (refaz a busca: o alloc pode ter trocado o envio e esvaziado a tabela). */
             if (d->set_cache_n < d->set_cache_cap / 2u || !d->set_cache) {
                 e = set_cache_slot(d, key, nk, h, &found);
                 if (e && !found && d->set_cache_n < d->set_cache_cap / 2u) {
@@ -1295,16 +1510,63 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
                 }
             }
         }
-        last_vs_buf = d->vs_ubo_buf;
-        last_ps_buf = d->ps_ubo_buf;
+        d->bound_vs_buf = d->vs_ubo_buf;
+        d->bound_ps_buf = d->ps_ubo_buf;
+        d->bound_samp_sig = samp_sig;
         d->desc_dirty = 0;
-    } else {
-        /* os mesmos buffers e texturas: só os offsets mudam; as texturas continuam em uso */
-        for (int s = 0; s < 16; s++)
-            if (d->tex[s] && d->tex[s]->kind != VKO_SURFACE) ((vk_texture *)d->tex[s])->img.last_use = d->serial;
     }
+
+    /* Se o passe já estiver aberto, só fecha se algum anexo mudar para GENERAL ou alguma textura
+     * precisar de barreira/transição (proibidas dentro de vkCmdBeginRendering). */
+    if (d->rendering) {
+        int need_split = 0;
+        for (int i = 0; i < 4 && !need_split; i++)
+            if (d->rt[i] && d->render_rt_layouts[i] != want_rt_l[i]) need_split = 1;
+        if (!need_split && d->ds && d->render_ds_layout != want_ds_l) need_split = 1;
+        for (uint32_t j = 0; j < nsamp && !need_split; j++) {
+            if (samp_conflict[j]) continue;
+            vk_image *im = samp_im[j];
+            if (re5vk_img_needs_barrier(im, 0, im->levels, 0, im->layers, samp_layout[j])) need_split = 1;
+        }
+        if (need_split) re5vk_end_rendering(d);
+    }
+
+    /* Marca leitura TBDR das texturas amostradas e aplica transições pendentes fora do passe. */
+    for (uint32_t j = 0; j < nsamp; j++) {
+        vk_image *im = samp_im[j];
+        im->last_use = d->serial;
+        if (!samp_conflict[j] && im->tbdr_subs) {
+            uint8_t amask = im->fmt->depth ? RE5VK_TBDR_DEPTH : RE5VK_TBDR_COLOR;
+            size_t nsub = (size_t)im->levels * im->layers;
+            for (size_t k = 0; k < nsub; k++) re5vk_tbdr_mark_read(&d->tbdr, &im->tbdr_subs[k], amask);
+        }
+        if (!d->rendering && !samp_conflict[j]) {
+            VkPipelineStageFlags stg = samp_is_vs[j] ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                                                     : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            /* Se a mesma imagem aparece no VS e no PS neste draw, acumula os dois estágios. */
+            for (uint32_t m = 0; m < nsamp; m++)
+                if (samp_im[m] == im)
+                    stg |= samp_is_vs[m] ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            re5vk_img_transition(d, re5vk_cmd(d), im, 0, im->levels, 0, im->layers, samp_layout[j], stg);
+        }
+    }
+
+    begin_rendering_with_layouts(d, want_rt_l, want_ds_l);
+
+    VkCommandBuffer cb = re5vk_cmd(d);
+    if (pipe != d->bound_pipe) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        d->bound_pipe = pipe;
+    }
+    set_dynamic(d, pt);
+
     uint32_t offs[2] = {(uint32_t)d->vs_ubo_off, (uint32_t)d->ps_ubo_off};
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, 0, 1, &d->set, 2, offs);
+    if (d->bound_set != d->set || d->bound_vs_off != offs[0] || d->bound_ps_off != offs[1]) {
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, 0, 1, &d->set, 2, offs);
+        d->bound_set = d->set;
+        d->bound_vs_off = offs[0];
+        d->bound_ps_off = offs[1];
+    }
 
     /* vértices */
     VkBuffer bufs[16];
@@ -1384,10 +1646,19 @@ static HRESULT STDMETHODCALLTYPE v_StretchRect(IDirect3DDevice9 *self, IDirect3D
     if (!s || !t) return D3DERR_INVALIDCALL;
     re5vk_lock(d);
     re5vk_end_rendering(d);
+    uint8_t s_amask = s->img->fmt->depth
+                          ? (uint8_t)(RE5VK_TBDR_DEPTH | (s->img->fmt->stencil ? RE5VK_TBDR_STENCIL : 0u))
+                          : RE5VK_TBDR_COLOR;
+    re5vk_tbdr_mark_read(&d->tbdr, &s->img->tbdr_subs[(size_t)s->layer * s->img->levels + s->level], s_amask);
     RECT a = sr ? *sr : (RECT){0, 0, (LONG)s->desc.Width, (LONG)s->desc.Height};
     RECT b = dr ? *dr : (RECT){0, 0, (LONG)t->desc.Width, (LONG)t->desc.Height};
     VkCommandBuffer cb = re5vk_cmd(d);
-    re5vk_barrier_all(cb);
+    int gen = re5vk_layout_general();
+    int same_sub = s->img == t->img && s->level == t->level && s->layer == t->layer;
+    VkImageLayout sl = (gen || same_sub) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkImageLayout tl = (gen || same_sub) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    re5vk_img_transition(d, cb, s->img, s->level, 1, s->layer, 1, sl, 0);
+    if (!same_sub) re5vk_img_transition(d, cb, t->img, t->level, 1, t->layer, 1, tl, 0);
     VkImageAspectFlags asp = s->img->fmt->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     if (s->img->fmt->stencil && t->img->fmt->stencil) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
     int same = a.right - a.left == b.right - b.left && a.bottom - a.top == b.bottom - b.top &&
@@ -1395,15 +1666,17 @@ static HRESULT STDMETHODCALLTYPE v_StretchRect(IDirect3DDevice9 *self, IDirect3D
     if (same) {
         VkImageCopy c = {{asp, s->level, s->layer, 1}, {a.left, a.top, 0}, {asp, t->level, t->layer, 1},
                          {b.left, b.top, 0}, {(uint32_t)(a.right - a.left), (uint32_t)(a.bottom - a.top), 1}};
-        vkCmdCopyImage(cb, s->img->image, VK_IMAGE_LAYOUT_GENERAL, t->img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        vkCmdCopyImage(cb, s->img->image, sl, t->img->image, tl, 1, &c);
     } else {
         if (s->img->fmt->depth) re5_fatal("re5vk", "StretchRect de profundidade com escala sem implementação");
         VkImageBlit bl = {{asp, s->level, s->layer, 1}, {{a.left, a.top, 0}, {a.right, a.bottom, 1}},
                           {asp, t->level, t->layer, 1}, {{b.left, b.top, 0}, {b.right, b.bottom, 1}}};
-        vkCmdBlitImage(cb, s->img->image, VK_IMAGE_LAYOUT_GENERAL, t->img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+        vkCmdBlitImage(cb, s->img->image, sl, t->img->image, tl, 1, &bl,
                        filter == D3DTEXF_POINT || filter == D3DTEXF_NONE ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     }
-    re5vk_barrier_all(cb);
+    re5vk_img_mark_written(t->img, t->level, 1, t->layer, 1);
+    re5vk_tbdr_mark_external_write(&t->img->tbdr_subs[(size_t)t->layer * t->img->levels + t->level],
+                                   RE5VK_TBDR_COLOR | RE5VK_TBDR_DEPTH | RE5VK_TBDR_STENCIL);
     s->img->last_use = t->img->last_use = d->serial;
     re5vk_unlock(d);
     return D3D_OK;
