@@ -366,19 +366,21 @@ static inline void cs_pause(void)
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
 #elif defined(__aarch64__)
-    __asm__ __volatile__("yield");
+    /* Em ARMv8/v9 sem SMT, 'yield' isolado age como NOP de 1 ciclo; 'isb' freia o
+     * front-end especulativo (~10-20 ns) evitando inundar o barramento em Oryon/Cortex-X. */
+    __asm__ __volatile__("yield\n\tisb" ::: "memory");
 #endif
 }
 
 static int cs_hle_try(uint32_t cs, uint32_t tid)
 {
     volatile uint32_t *own = (volatile uint32_t *)re5_g2h(cs + CS_OWNER);
-    uint32_t o = __atomic_load_n(own, __ATOMIC_SEQ_CST);
+    uint32_t o = __atomic_load_n(own, __ATOMIC_RELAXED);
     if (o == tid) {   /* recursão: só a dona escreve RecursionCount */
         k32_w32(cs + CS_RECURSION, k32_r32(cs + CS_RECURSION) + 1);
     } else {
         uint32_t z = 0;
-        if (o || !__atomic_compare_exchange_n(own, &z, tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 0;
+        if (o || !__atomic_compare_exchange_n(own, &z, tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) return 0;
         k32_w32(cs + CS_RECURSION, 1);
     }
     __atomic_add_fetch((volatile uint32_t *)re5_g2h(cs + CS_LOCKCOUNT), 1u, __ATOMIC_RELAXED);

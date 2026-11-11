@@ -48,6 +48,17 @@ int main(void)
     fake_cpus("perf_sys_sd", sd, 8);
     CHECK(re5_perf_big_mask("perf_sys_sd") == 0xF0u);
 
+    /* Dimensity 7030 (6x A55 2.0 GHz + 2x A78 2.5 GHz): isola apenas os 2 núcleos A78. */
+    const unsigned long d7030[8] = {2000000, 2000000, 2000000, 2000000, 2000000, 2000000, 2500000, 2500000};
+    fake_cpus("perf_sys_d7030", d7030, 8);
+    CHECK(re5_perf_big_mask("perf_sys_d7030") == 0xC0u);
+
+    /* Snapdragon 8 Gen 4 / 8 Elite (6x Oryon Perf 3.53 GHz + 2x Oryon Prime 4.32 GHz):
+     * sem núcleos LITTLE -> não deve confinar o jogo em apenas 2 Prime (retorna 0). */
+    const unsigned long sd8g4[8] = {3530000, 3530000, 3530000, 3530000, 3530000, 3530000, 4320000, 4320000};
+    fake_cpus("perf_sys_sd8g4", sd8g4, 8);
+    CHECK(re5_perf_big_mask("perf_sys_sd8g4") == 0);
+
     /* Todos iguais (PC, emulador): nada a separar. */
     const unsigned long eq[4] = {3000000, 3000000, 3000000, 3000000};
     fake_cpus("perf_sys_eq", eq, 4);

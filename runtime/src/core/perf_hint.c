@@ -11,6 +11,90 @@
 #include "re5/log.h"
 #include "re5/perf_hint.h"
 
+static int read_ulong_file(const char *path, unsigned long *out)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long v = 0;
+    int ok = (fscanf(f, "%lu", &v) == 1 && v > 0);
+    fclose(f);
+    if (ok) *out = v;
+    return ok;
+}
+
+static uint64_t mask_from_freqs(const unsigned long *freq, int n)
+{
+    if (n <= 0) return 0;
+    unsigned long hi = 0, lo = (unsigned long)-1;
+    for (int i = 0; i < n; i++) {
+        if (freq[i] > hi) hi = freq[i];
+        if (freq[i] < lo) lo = freq[i];
+    }
+    if (!hi || hi == lo) return 0;   /* todos iguais: nada a separar */
+    /* Se o menor cluster já roda >= 2.6 GHz (ex.: Snapdragon 8 Gen 4 / 8 Elite com 6x Oryon
+     * Performance a 3.53 GHz + 2x Prime a 4.32 GHz, sem núcleos LITTLE), prender o jogo só
+     * acima de 'lo' confina main + render em apenas 2 núcleos e provoca throttling térmico. */
+    if (lo >= 2600000ul) return 0;
+    /* Todos acima do cluster mais lento: num Snapdragon 1+3+4 o Prime sozinho poria a thread
+     * principal e a de render no mesmo núcleo; Prime + médios dão espaço às duas. */
+    uint64_t m = 0;
+    for (int i = 0; i < n; i++)
+        if (freq[i] > lo) m |= 1ull << i;
+    return m;
+}
+
+static int is_little_arm_part(unsigned long part)
+{
+    switch (part) {
+    case 0xd03: /* Cortex-A53 */
+    case 0xd05: /* Cortex-A55 */
+    case 0xd46: /* Cortex-A510 */
+    case 0xd80: /* Cortex-A520 */
+    case 0x803: /* Kryo 385 Silver */
+    case 0x805: /* Kryo 485/585/680 Silver */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t mask_from_proc_cpuinfo(void)
+{
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (!f) return 0;
+    char line[256];
+    int cur_cpu = -1;
+    int little[64];
+    int known[64];
+    memset(little, 0, sizeof little);
+    memset(known, 0, sizeof known);
+    int max_cpu = -1;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long val = 0;
+        if (sscanf(line, "processor : %lu", &val) == 1) {
+            cur_cpu = (val < 64) ? (int)val : -1;
+            if (cur_cpu > max_cpu) max_cpu = cur_cpu;
+        } else if (cur_cpu >= 0 && strncmp(line, "CPU part", 8) == 0) {
+            const char *colon = strchr(line, ':');
+            if (colon && sscanf(colon + 1, " %lx", &val) == 1) {
+                known[cur_cpu] = 1;
+                little[cur_cpu] = is_little_arm_part(val);
+            }
+        }
+    }
+    fclose(f);
+    int n_known = 0, n_little = 0;
+    uint64_t big_mask = 0;
+    for (int i = 0; i <= max_cpu; i++) {
+        if (!known[i]) continue;
+        n_known++;
+        if (little[i]) n_little++;
+        else big_mask |= 1ull << i;
+    }
+    if (n_known == 0 || n_little == 0 || n_little == n_known) return 0;
+    return big_mask;
+}
+
 uint64_t re5_perf_big_mask(const char *sysroot)
 {
     unsigned long freq[64];
@@ -18,26 +102,47 @@ uint64_t re5_perf_big_mask(const char *sysroot)
     for (; n < 64; n++) {
         char path[512];
         snprintf(path, sizeof path, "%s/cpu%d/cpufreq/cpuinfo_max_freq", sysroot, n);
-        FILE *f = fopen(path, "r");
-        if (!f) break;
-        unsigned long v = 0;
-        if (fscanf(f, "%lu", &v) != 1) v = 0;
-        fclose(f);
-        freq[n] = v;
+        if (!read_ulong_file(path, &freq[n])) break;
     }
-    if (n == 0) return 0;
-    unsigned long hi = 0, lo = (unsigned long)-1;
-    for (int i = 0; i < n; i++) {
-        if (freq[i] > hi) hi = freq[i];
-        if (freq[i] < lo) lo = freq[i];
+    if (n > 0) return mask_from_freqs(freq, n);
+
+    /* Fallback para sysfs real (/sys/...) em Android 14/15 quando cpuinfo_max_freq sofre EACCES */
+    if (strncmp(sysroot, "/sys", 4) != 0) return 0;
+
+    n = 0;
+    for (; n < 64; n++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/cpu%d/cpufreq/scaling_max_freq", sysroot, n);
+        if (!read_ulong_file(path, &freq[n])) break;
     }
-    if (!hi || hi == lo) return 0;   /* todos iguais: nada a separar */
-    /* Todos acima do cluster mais lento: num Snapdragon 1+3+4 o Prime sozinho poria a thread
-     * principal e a de render no mesmo núcleo; Prime + médios dão espaço às duas. */
-    uint64_t m = 0;
-    for (int i = 0; i < n; i++)
-        if (freq[i] > lo) m |= 1ull << i;
-    return m;
+    if (n > 0) return mask_from_freqs(freq, n);
+
+    uint64_t pm = mask_from_proc_cpuinfo();
+    if (pm) return pm;
+
+    unsigned long cap[64];
+    n = 0;
+    for (; n < 64; n++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/cpu%d/cpu_capacity", sysroot, n);
+        if (!read_ulong_file(path, &cap[n])) break;
+    }
+    if (n > 0) {
+        unsigned long hi = 0, lo = (unsigned long)-1;
+        for (int i = 0; i < n; i++) {
+            if (cap[i] > hi) hi = cap[i];
+            if (cap[i] < lo) lo = cap[i];
+        }
+        /* Só separa quando existe cluster realmente pequeno (< 65% da capacidade máxima) */
+        if (hi > 0 && lo < (hi * 65ul) / 100ul) {
+            uint64_t m = 0;
+            unsigned long thresh = (hi * 65ul) / 100ul;
+            for (int i = 0; i < n; i++)
+                if (cap[i] >= thresh) m |= 1ull << i;
+            return m;
+        }
+    }
+    return 0;
 }
 
 int64_t re5_perf_target_ns(const char *fps_cap)
