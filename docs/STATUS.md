@@ -1042,3 +1042,12 @@ Faltando (270/270): nenhum. `re5 --census --missing` em 2026-10-21: `imports: 27
   de 07/11) empatam (pico 31, média ~25), então fica a que tem o conserto da janela ao voltar do segundo plano; `RE5_DXVK=ref`
   escolhe a antiga. APK `work/android/app-lean3.apk` (NDK r27, clang 18.0.3; não instalado). Ferramentas de medição salvas em
   `scripts/android_bench/`; prompts das próximas frentes em `docs/prompts/`.
+- **Limpeza para o novo padrão (2026-11-23).** Estado anterior preservado no commit `5a0cfcdd`, tag `base-lean-2026-11-23`.
+  Removidos da árvore: backends Vulkan nativos vkmali/vkadreno (`runtime/src/gfx/vk/`, `vkn/`, `re5vk.h`, `renderer.h`,
+  `third_party/vk-bootstrap`, `third_party/VulkanMemoryAllocator`) e seus testes; a DXVK 2.6.2 portada (`android/dxvk_262`) e as
+  DXVK `ref`/`old`; as telas/chaves do Vulkan nativo no app (renderizador, sincronia vertical, quadros em voo). `RE5_GFX` agora
+  aceita só `dxvk` (padrão) e `gl` (externo); `vkmali`/`vkadreno`/`re5vk` abortam. Ficou `vk_loader.c` (driver Vulkan customizado
+  da DXVK, em `runtime/src/gfx/`). **Padrão do Android:** DXVK 1.9.2b como `libdxvk_d3d9.so`, NDK r27 (clang 18), FFmpeg r27 em
+  `build/ffmpeg-android`, `RE5_LEAN=1`. Docs do Vulkan nativo em `docs/arquivo/`. Build do PC e `ctest` verdes (33 de 34; `kernel32`
+  é a intermitência de tempo que já existia: 15 de 15 execuções diretas passam, falha ~1 em 3 dentro do `ctest`); Android compila
+  (`libre5.so` 76,9 MB) e empacota (`work/android/app-padrao.apk`); **não testado no aparelho**.

@@ -67,7 +67,6 @@ public final class SettingsActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         prefs = getSharedPreferences(ControlsOptions.PREFS, MODE_PRIVATE);
-        GpuInfo.migrateRendererPref(prefs);
         ini = new GameConfigIni(GameStorage.gameDir(this));
         tab = getIntent().getIntExtra(EXTRA_TAB, TAB_GRAPHICS);
 
@@ -144,32 +143,12 @@ public final class SettingsActivity extends Activity {
 
     private void buildGraphics() {
         section(L.t("Renderização"));
-        String nativeVk = GpuInfo.nativeRenderer();
-        if (nativeVk != null) {
-            choicePref(L.t("Renderizador"), L.t("Quem traduz o Direct3D 9 do jogo para o Vulkan do aparelho."),
-                    new String[]{L.t("DXVK (padrão, mais testado)"),
-                            "vkadreno".equals(nativeVk) ? L.t("Vulkan nativo Adreno (experimental)")
-                                    : L.t("Vulkan nativo Mali (experimental)")},
-                    new String[]{"", nativeVk}, GpuInfo.PREF_RENDERER);
-        } else {
-            choicePref(L.t("Renderizador"), L.t("Quem traduz o Direct3D 9 do jogo para o Vulkan do aparelho."),
-                    new String[]{L.t("DXVK (padrão, mais testado)")}, new String[]{""}, GpuInfo.PREF_RENDERER);
-            disabledRow(L.t("Vulkan nativo"), L.t("Os renderizadores nativos são para GPU Adreno ou Mali. Este aparelho usa ")
-                    + gpuFamily() + L.t(": fica a DXVK."));
-        }
         String res = ini.get("DISPLAY", "Resolution", "1280x720");
         String[] resVals = {"640x360", "854x480", "960x540", "1280x720", "1600x900", "1920x1080"};
         choiceIni(L.t("Resolução interna"), L.t("Resolução em que o jogo desenha; a tela estica para caber. Menor = mais FPS."),
                 resVals, resVals, "DISPLAY", "Resolution", res);
         choicePref(L.t("Limite de FPS"), L.t("Segura o jogo num ritmo fixo: menos calor e bateria, quadro mais estável."),
                 new String[]{L.t("Sem limite"), L.t("30 FPS"), L.t("45 FPS"), L.t("60 FPS")}, new String[]{"", "30", "45", "60"}, "gfx_fps_cap");
-        choicePref(L.t("Sincronia vertical (Vulkan nativo)"), L.t("Só vale para o Vulkan nativo (a DXVK ignora). Padrão no Android: ligada, 3 imagens."),
-                new String[]{L.t("Padrão (FIFO)"), L.t("Ligada (FIFO)"), L.t("Desligada (mailbox)"), L.t("Desligada (imediato)")},
-                new String[]{"", "fifo", "mailbox", "immediate"}, "gfx_present");
-        choicePref(L.t("Quadros em voo (Vulkan nativo)"), L.t("Só vale para o Vulkan nativo. Mais quadros = CPU e GPU mais sobrepostas e mais atraso de entrada."),
-                new String[]{L.t("Padrão (2)"), L.t("1 (menor atraso)"), "2", "3"}, new String[]{"", "1", "2", "3"}, "gfx_latency");
-        disabledRow(L.t("FSR 1.0 (AMD FidelityFX)"), L.t("Ampliação com nitidez da resolução interna para a tela. Chega na próxima ")
-                + L.t("versão, no Vulkan próprio."));
         disabledRow(L.t("OpenGL ES 3.x (RE5_GFX=gl)"),
                 L.t("Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt."));
         if (isAdreno()) {

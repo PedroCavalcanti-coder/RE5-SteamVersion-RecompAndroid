@@ -39,7 +39,7 @@ trabalham em sequência (~19 ms de CPU por quadro na principal, medido no A54 e 
    quentes, e `-O2` só nas unidades quentes do código gerado. Cada uma só entra com ganho medido.
 6. **Carregamento** (inflate da zlib 1.2.1 do jogo em `0x006CC2C0..0x006CF940`, quente ao carregar): troque pelo `inflate`
    nativo com `difftest_override`. Meça com cache de texturas limpo.
-7. **Custos de medição**: `RE5_FPS_LOG` liga `clock_gettime` por chamada no re5vk (23% da thread de render). Faça o log
+7. **Custos de medição**: `RE5_FPS_LOG` ligava `clock_gettime` por chamada no re5vk (23% da thread de render; o re5vk saiu da árvore, o custo de medição continua valendo para qualquer log novo). Faça o log
    leve (contadores por quadro) para que medir não distorça; o perfil de CPU sempre sem ele.
 
 ## Como medir

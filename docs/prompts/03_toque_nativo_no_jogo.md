@@ -44,7 +44,7 @@ camadas e a redesenhar pela GPU (HWUI) a cada toque, e custa 4–6 fps. Controle
 3. **Menus por toque**: se o jogo tem teste de acerto em itens de menu (cursor do mouse), converta o toque em posição do cursor
    do jogo; se não tem, mapeie o toque para a navegação do analógico/botões com a zona certa.
 4. **Desenho**: pelo `IDirect3DDevice9` no `Present` (como `runtime/src/win32/lan_menu.c` faz com o imgui em `re5_lan_menu_draw`,
-   hoje ligado só no PC; ligue no Android), **independente do renderizador** (DXVK ou vkmali), com texturas/formas simples, alfa e
+   hoje ligado só no PC; ligue no Android), **independente do renderizador** (hoje só a DXVK), com texturas/formas simples, alfa e
    escala da resolução real da tela (não do back buffer de 360p: os botões têm de ficar nítidos). Zero alocação por quadro.
 5. **Configuração e editor**: o layout e as opções passam do app para o runtime por arquivo (ex.: `files/game/touch_layout.json`) ou
    variáveis; o **editor de layout** pode ficar no app Java (fora do jogo, na tela do launcher) desde que **o jogo em si não

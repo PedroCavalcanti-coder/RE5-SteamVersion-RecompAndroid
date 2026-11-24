@@ -148,12 +148,7 @@ public class GameActivity extends SDLActivity {
         // vale direto; repassá-lo como RE5_CPUS só reduziria os núcleos vistos (o padrão é 2). Sem o
         // modo paralelo o jogo vê 2 de propósito: as threads se revezam num lock só.
         // Vídeo (launcher, aba Gráficos): renderizador, limite de FPS, apresentação e quadros em voo.
-        GpuInfo.migrateRendererPref(prefs);   // "re5vk" antigo -> vkadreno/vkmali (ou DXVK)
-        String gfx = prefs.getString(GpuInfo.PREF_RENDERER, "");
-        if (gfx == null || gfx.isEmpty()) gfx = "dxvk";
-        try {
-            nativeSetenv("RE5_GFX", gfx);
-        } catch (Throwable ignored) {}
+        // Renderizador: a DXVK 1.9.2b (libdxvk_d3d9.so) é o único; RE5_GFX=gl só com tradutor externo (re5_env.txt).
         /* Limitador padrao de 60 FPS quando o usuario nunca escolheu (bateria/calor; o menu rodava a ~80
          * sem necessidade). "Sem limite" nas configuracoes grava "" e continua sem limite. */
         if (!prefs.contains("gfx_fps_cap")) {
@@ -162,16 +157,6 @@ public class GameActivity extends SDLActivity {
             setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");
         }
         applyCacheDirs();
-        setenvPref(prefs, "gfx_present", "RE5VK_PRESENT");
-        setenvPref(prefs, "gfx_latency", "RE5VK_LATENCY");
-        // O re5vk limita os quadros em voo a RE5_QUERY_LAG - 1 (padrão 3 -> 2), para o atalho das
-        // consultas de evento continuar seguro: escolher 3 aqui era reduzido a 2 sem aviso.
-        String lat = prefs.getString("gfx_latency", "");
-        if (lat != null && !lat.isEmpty()) {
-            try {
-                nativeSetenv("RE5_QUERY_LAG", Integer.toString(Math.max(3, Integer.parseInt(lat) + 1)));
-            } catch (Throwable ignored) {}
-        }
         applyVulkanDriverEnv(prefs);
         java.util.Set<String> flags = envFlags();
         boolean lean = flags.contains("RE5_LEAN=1");
@@ -231,15 +216,11 @@ public class GameActivity extends SDLActivity {
      *  é apagado uma vez. O re5_env.txt ainda pode apontar outro lugar (lido depois). */
     private void applyCacheDirs() {
         File cache = getCacheDir();
-        File dxvk = new File(cache, "dxvk"), tex = new File(cache, "texcache");
+        File dxvk = new File(cache, "dxvk");
         //noinspection ResultOfMethodCallIgnored
         dxvk.mkdirs();
-        //noinspection ResultOfMethodCallIgnored
-        tex.mkdirs();
         try {
             nativeSetenv("DXVK_STATE_CACHE_PATH", dxvk.getAbsolutePath());
-            nativeSetenv("RE5VK_TEX_CACHE_DIR", tex.getAbsolutePath());
-            nativeSetenv("RE5VK_PCACHE", new File(cache, "re5vk.pcache").getAbsolutePath());
             nativeSetenv("MESA_SHADER_CACHE_DIR", new File(cache, "mesa").getAbsolutePath());   // drivers Turnip
         } catch (Throwable t) {
             Log.w(TAG, "caches: " + t);

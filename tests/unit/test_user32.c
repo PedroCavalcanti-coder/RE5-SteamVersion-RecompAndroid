@@ -306,11 +306,9 @@ int main(void)
     CHECK_EQ_U32(call("ClipCursor", 1, clip_rc), 1);
     CHECK_EQ_U32(call("ClipCursor", 1, 0u), 1);
 
-    /* Flags de janela no Android por backend (DXVK/re5vk = Vulkan, gl = OpenGL ES). */
+    /* Flags de janela no Android por backend (DXVK = Vulkan, gl = OpenGL ES). */
     Uint32 f_vk = re5_user32_android_window_flags(SDL_WINDOW_SHOWN, RE5_GFX_DXVK, 1);
     CHECK((f_vk & SDL_WINDOW_VULKAN) != 0 && (f_vk & SDL_WINDOW_OPENGL) == 0);
-    Uint32 f_re5vk = re5_user32_android_window_flags(SDL_WINDOW_SHOWN, RE5_GFX_RE5VK, 1);
-    CHECK((f_re5vk & SDL_WINDOW_VULKAN) != 0 && (f_re5vk & SDL_WINDOW_OPENGL) == 0);
     Uint32 f_gl = re5_user32_android_window_flags(SDL_WINDOW_SHOWN, RE5_GFX_GL, 1);
     CHECK((f_gl & SDL_WINDOW_OPENGL) != 0 && (f_gl & SDL_WINDOW_VULKAN) == 0);
     Uint32 f_desk = re5_user32_android_window_flags(SDL_WINDOW_SHOWN, RE5_GFX_GL, 0);

@@ -117,19 +117,7 @@ add_library(re5_runtime STATIC
     src/core/trace.c
     src/core/vfs.c
     src/gfx/d3d9_host.c
-    src/gfx/vk/re5vk.c
-    src/gfx/vk/vk_draw.c
-    src/gfx/vk/vk_dxso.c
-    src/gfx/vk/vk_etc2_pool.c
-    src/gfx/vk/vk_layout.c
-    src/gfx/vk/vk_loader.c
-    src/gfx/vk/vk_res.c
-    src/gfx/vk/vk_tbdr.c
-    src/gfx/vkn/IRenderer.cpp
-    src/gfx/vkn/VulkanContext.cpp
-    src/gfx/vkn/VulkanMemory.cpp
-    src/gfx/vkn/renderer.cpp
-    "${CMAKE_SOURCE_DIR}/third_party/vk-bootstrap/src/VkBootstrap.cpp"
+    src/gfx/vk_loader.c
     src/win32/advapi32.c
     src/win32/avifil32.c
     src/win32/coldebug.c
@@ -170,28 +158,6 @@ if(NOT WIN32)
     target_link_libraries(re5_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(re5_runtime PRIVATE re5_d3d9_headers)
-# re5vk (RE5_GFX=re5vk): só os headers do Vulkan (os da DXVK 2.6.2, com Win32 e Android);
-# o carregador é aberto em tempo de execução, nada a linkar.
-set_source_files_properties(src/gfx/vk/re5vk.c src/gfx/vk/vk_draw.c src/gfx/vk/vk_res.c src/gfx/vk/vk_layout.c PROPERTIES
-    INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")
-# Renderizadores nativos vkadreno/vkmali (src/gfx/vkn, C++17): vk-bootstrap v1.4.363 casa com os
-# headers Vulkan 1.4.363 de third_party/dxvk; VMA v3.5.0 (só header). O libvulkan continua aberto
-# em tempo de execução (re5_vk_get_instance_proc_addr), nada a linkar.
-set(RE5_VKN_INCLUDES
-    "${CMAKE_SOURCE_DIR}/third_party/dxvk/include/vulkan/include"
-    "${CMAKE_SOURCE_DIR}/third_party/VulkanMemoryAllocator/include"
-    "${CMAKE_SOURCE_DIR}/third_party/vk-bootstrap/src")
-set(RE5_VKN_SOURCES src/gfx/vkn/IRenderer.cpp src/gfx/vkn/VulkanContext.cpp src/gfx/vkn/VulkanMemory.cpp
-    src/gfx/vkn/renderer.cpp)
-set_source_files_properties(${RE5_VKN_SOURCES} PROPERTIES INCLUDE_DIRECTORIES "${RE5_VKN_INCLUDES}")
-set_source_files_properties("${CMAKE_SOURCE_DIR}/third_party/vk-bootstrap/src/VkBootstrap.cpp" PROPERTIES
-    INCLUDE_DIRECTORIES "${RE5_VKN_INCLUDES}" COMPILE_OPTIONS "-w")
-if(NOT MSVC)
-    # O VMA é código de terceiros num .cpp nosso: sem os avisos dele.
-    set_source_files_properties(src/gfx/vkn/VulkanMemory.cpp PROPERTIES COMPILE_OPTIONS "-Wno-nullability-completeness;-Wno-unused-variable")
-endif()
-set_target_properties(re5_runtime PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-set(RE5_VKN_INCLUDES "${RE5_VKN_INCLUDES}" PARENT_SCOPE)
 if(WIN32)
     target_link_libraries(re5_runtime PUBLIC ws2_32 winmm)   # sockets do Winsock; timeBeginPeriod do host
 endif()

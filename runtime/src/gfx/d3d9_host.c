@@ -23,8 +23,6 @@
 
 #include "re5/runtime.h"
 #include "re5/d3d9_bridge.h"
-#include "re5/re5vk.h"
-#include "re5/renderer.h"
 #include "re5/vk_loader.h"
 #include "re5/user32.h"
 
@@ -145,7 +143,7 @@ static void load(void)
     if (gfx == RE5_GFX_GL && (!path || !*path)) {
         re5_fatal("d3d9",
                   "RE5_GFX=gl requer um tradutor D3D9->OpenGL externo em RE5_D3D9_DLL. "
-                  "O runtime embutido suporta dxvk, vkadreno e vkmali.");
+                  "O runtime embutido suporta a DXVK.");
     }
     char dxvk[MAX_PATH];
     if (!path || !*path) {
@@ -195,28 +193,6 @@ static void load(void)
         return;
     }
     void *lib = NULL;
-#if defined(__ANDROID__)
-    /* Padrão no Android: a DXVK 1.9.2b (libdxvk_d3d9_192b.so), a que desenha certo no Mali. A 2.6.2
-     * portada (libdxvk_d3d9.so) ainda mostra texto quebrado e tela preta no A54 (20/11/2026);
-     * RE5_DXVK=2.6.2 a escolhe, RE5_D3D9_LIB escolhe qualquer arquivo. */
-    if (!path || !*path) {
-        const char *want = getenv("RE5_DXVK");
-        if (!(want && !strcmp(want, "2.6.2"))) {
-            /* DXVK 1.9.2b (libdxvk_d3d9_192b.so) é o padrão: tem o patch da janela nova ao voltar do
-             * segundo plano (re5_dxvk_set_window_fn). Medida em 23/11 no A54, 360p, mesma parte do
-             * benchmark: empata em fps (pico 31, média ~25) com a "ref" (a do APK de 07/11,
-             * libdxvk_d3d9_ref.so, escolhida por RE5_DXVK=ref), que pode cair ao voltar do segundo plano. */
-            if (want && !strcmp(want, "ref")) {
-                lib = dlopen("libdxvk_d3d9_ref.so", RTLD_NOW | RTLD_LOCAL);
-                if (lib) path = "libdxvk_d3d9_ref.so";
-            }
-            if (!lib) {
-                lib = dlopen("libdxvk_d3d9_192b.so", RTLD_NOW | RTLD_LOCAL);
-                if (lib) path = "libdxvk_d3d9_192b.so";
-            }
-        }
-    }
-#endif
     if (!path || !*path) path = "libdxvk_d3d9.so";
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* a janela que a ponte entrega é um SDL_Window* */
 #if defined(__ANDROID__)
@@ -268,45 +244,44 @@ static void load(void)
 #endif
 }
 
-static re5_gfx_backend backend_of(re5_renderer_kind k)
-{
-    if (k == RE5_RENDERER_GL) return RE5_GFX_GL;
-    return re5_renderer_is_native_vk(k) ? RE5_GFX_RE5VK : RE5_GFX_DXVK;
-}
-
-/* O nome de RE5_GFX é do seletor (re5/renderer.h); aqui só a família do backend. */
+/* RE5_GFX: "" ou "dxvk" = DXVK (padrão); "gl" = tradutor D3D9->GL externo (RE5_D3D9_LIB / RE5_D3D9_DLL).
+ * Os backends Vulkan nativos (vkmali, vkadreno, re5vk) saíram em 23/11/2026: o código está na tag
+ * base-lean-2026-11-23. Valor desconhecido aborta (D8: falhar alto). */
 int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out)
 {
-    re5_renderer_kind k;
-    if (re5_renderer_parse(env, &k) != 0) return -1;
-    if (out) *out = backend_of(k);
-    return 0;
+    if (!env || !*env || strcmp(env, "dxvk") == 0) {
+        if (out) *out = RE5_GFX_DXVK;
+        return 0;
+    }
+    if (strcmp(env, "gl") == 0) {
+        if (out) *out = RE5_GFX_GL;
+        return 0;
+    }
+    return -1;
 }
 
 re5_gfx_backend re5_gfx_mode(void)
 {
     static int mode = -1;
-    if (mode < 0) mode = (int)backend_of(re5_renderer_selected()); /* aborta com a mensagem certa */
+    if (mode < 0) {
+        const char *e = getenv("RE5_GFX");
+        re5_gfx_backend m;
+        if (re5_parse_gfx_mode(e, &m) != 0)
+            re5_fatal("d3d9", "RE5_GFX=%s: use dxvk ou gl (vkmali, vkadreno e re5vk foram removidos)", e);
+        mode = (int)m;
+    }
     return (re5_gfx_backend)mode;
 }
 
-int re5vk_enabled(void)
-{
-    return re5_gfx_mode() == RE5_GFX_RE5VK;
-}
-
-/* vkadreno/vkmali: o seletor (re5/renderer.h) recebe o Direct3DCreate9 da DXVK, que segue
- * respondendo as consultas do adaptador; o device é o Vulkan nativo. */
 static void *host_create9(uint32_t sdk)
 {
     load();
-    if (re5vk_enabled()) return re5_renderer_create_d3d9(sdk, g_create9);
     return g_create9(sdk);
 }
 
 /* ---- janela do Android em segundo plano ----
  * Ao sair do primeiro plano o Android destrói a superfície (SDLSurface.surfaceDestroyed) e o SDL
- * solta o ANativeWindow; ao voltar dá OUTRO ANativeWindow. A DXVK e o re5vk guardavam o da criação
+ * solta o ANativeWindow; ao voltar dá OUTRO ANativeWindow. A DXVK guardava o da criação
  * do device e o processo caía na volta (uso de janela liberada / swapchain sem superfície). Agora:
  *  - o Java fecha o portão antes de a superfície morrer (espera o Present em curso acabar) e o abre
  *    quando a nova existe (SDLActivity.nativeSurfaceGate);

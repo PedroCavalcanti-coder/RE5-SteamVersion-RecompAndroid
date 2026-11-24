@@ -17,11 +17,11 @@ cmake -S . -B "$B" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
   -DANDROID_NDK="$NDK" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRE5_BUILD_TESTS=OFF -DRE5_GENERATED_OPT=-O1 \
   -DRE5_GENERATED_DIR="$M/generated/src" \
-  -DRE5_FFMPEG_DIR=C:/Users/Dev_RV01/Documents/Github/re5-ref49/build/ffmpeg-ndk27 -DRE5_DXVK_DIR="$M/build/dxvk" "$@" >> "$log" 2>&1 || { echo "cmake falhou" >> "$log"; exit 1; }
+  -DRE5_FFMPEG_DIR="$M/build/ffmpeg-android" -DRE5_DXVK_DIR="$M/build/dxvk" "$@" >> "$log" 2>&1 || { echo "cmake falhou" >> "$log"; exit 1; }
 cmake --build "$B" >> "$log" 2>&1 || { echo "build falhou" >> "$log"; exit 1; }
-[ -f work/android/libre5.lean_base_ndk27.so ] || cp "$J/libre5.so" work/android/libre5.lean_base_ndk27.so
+[ -f work/android/libre5.padrao.so ] || cp "$J/libre5.so" work/android/libre5.padrao.so
 "$NB/llvm-strip.exe" --strip-unneeded -o "$J/libre5.so" "$B/libre5.so"
 (cd android && JAVA_HOME="C:/Program Files/Android/Android Studio/jbr" ./gradlew.bat assembleDebug -q >> "../$log" 2>&1) || echo "gradle falhou" >> "$log"
 cp android/app/build/outputs/apk/debug/app-debug.apk "work/android/app-$name.apk"
-cp work/android/libre5.lean_base_ndk27.so "$J/libre5.so"
+cp work/android/libre5.padrao.so "$J/libre5.so"
 echo "FEITO $name: $(stat -c %s work/android/app-$name.apk) bytes" >> "$log"

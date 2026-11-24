@@ -7,20 +7,25 @@ Cole o texto abaixo numa sessão nova de IA aberta na raiz do repositório. Base
 Você vai criar um **backend Vulkan 1.1 nativo novo** para o RE5 recompilado, a partir de código limpo, e fazê-lo **passar a DXVK**
 no Galaxy A54 (Mali-G68). Na base lean a DXVK 1.9.2b faz **35 de pico / 24,8 de média** e o backend atual (vkmali) **29 / 21,8**:
 a meta é superar 35 / 24,8, no mesmo trecho, em 360p. Leia primeiro `docs/prompts/00_BASE_LEAN_2026-11-23.md`, depois `CLAUDE.md`,
-`docs/STATUS.md`, `docs/ARQUITETURA.md` (D10), `docs/PROJETO_VULKAN_NATIVO.md`, `docs/PESQUISA_VULKAN_ANDROID.md` e
+`docs/STATUS.md`, `docs/ARQUITETURA.md` (D10), `docs/arquivo/PROJETO_VULKAN_NATIVO.md`, `docs/arquivo/PESQUISA_VULKAN_ANDROID.md` e
 `docs/RELATORIO_GPU_CPU_ENGASGOS_2026-11-20.md`. Em português.
 
 ## Escopo
 
-- Novo módulo ao lado do atual (`runtime/src/gfx/vk2/` ou nome que o código pedir), escolhido por `RE5_GFX=vkmali2`. O `re5vk`
-  atual **fica intacto como fallback**; não o refatore no lugar. Mesmo contrato: um `IDirect3DDevice9` do host
-  (`runtime/include/re5/d3d9_bridge.h`), mesma ponte `vkn` (`runtime/src/gfx/vkn/`) para instância/dispositivo.
+- **O código do vkmali/vkadreno antigo foi removido da árvore** (limpeza de 23/11) e vive só no Git: tag `base-lean-2026-11-23`
+  (`git show base-lean-2026-11-23:runtime/src/gfx/vk/vk_draw.c`). Faça o **módulo novo do zero**, em `runtime/src/gfx/` (ou onde o
+  código pedir), com um valor novo de `RE5_GFX` (hoje `re5_parse_gfx_mode` em `runtime/src/gfx/d3d9_host.c` só conhece `dxvk` e `gl`;
+  estenda-o e o `tests/unit/test_d3d9.c`). O padrão continua sendo a DXVK até a meta ser batida.
+- Mesmo contrato do antigo: um `IDirect3DDevice9` do host (`runtime/include/re5/d3d9_bridge.h`) que o `d3d9.c` do runtime chama; o
+  antigo usava uma ponte C++ (`vkn/`: vk-bootstrap + VMA, v. tag) para instância, dispositivo e memória: use-a como referência, ou
+  escreva a sua em C com `volk`/carregador próprio (`runtime/src/gfx/vk_loader.c` já abre o libvulkan e o driver customizado).
 - **Vulkan 1.1 puro**: sem extended dynamic state, sem robustness2/nullDescriptor, sem `VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE`
   (quebrado no Mali r38; stride no pipeline), no máximo **4 conjuntos de descritores** (limite de Mali Valhall).
-- **Reaproveite o que está provado**, não reescreva: o tradutor SM3→SPIR-V (`runtime/src/gfx/vk/vk_dxso.c`, com testes e
-  `spirv-val`), a conversão DXT→ETC2 paralela (`vk_etc2_pool.c`, `re5_dxt_to_etc2.h`), o cache de texturas e de pipelines, a
-  thread de present, a troca de janela ao voltar do segundo plano (`re5vk` `surface_follow`, portão em `d3d9_host.c`).
-  Reescreva o **núcleo de desenho**: estado, passes, descritores, envio.
+- **Recupere do Git o que está provado**, em vez de reescrever: o tradutor SM3→SPIR-V (`runtime/src/gfx/vk/vk_dxso.c` e
+  `tests/unit/test_vk_dxso.c`, com `spirv-val`), a conversão DXT→ETC2 paralela (`vk_etc2_pool.c`, `re5_dxt_to_etc2.h`,
+  `test_etc2_pool.c`), o cache de texturas (`re5_tex_cache.h`) e de pipelines, a thread de present e a troca de janela ao voltar do
+  segundo plano (`surface_follow` em `re5vk.c`; o portão da superfície continua em `d3d9_host.c`). Reescreva o **núcleo de
+  desenho**: estado, passes, descritores, envio.
 
 ## O que a medição diz sobre onde o vkmali perde
 
@@ -69,11 +74,11 @@ a meta é superar 35 / 24,8, no mesmo trecho, em 360p. Leia primeiro `docs/promp
 - Visual: cabeças sem faixas, texto, sombras, tela de título e cenas de corte, comparando com a DXVK (`RE5_GFX=dxvk`) por captura
   no mesmo ponto. Shaders: `spirv-val` no despejo `work/shaders/`.
 - `ctest` verde; novos testes para o que for lógica pura (agrupamento de passes, anel de UBO, cache).
-- Desempenho no A54, 360p, `RE5_LEAN=1`: pico e média, 3 rodadas, contra DXVK e contra o vkmali. Perfil de CPU
+- Desempenho no A54, 360p, `RE5_LEAN=1`: pico e média, 3 rodadas, contra a DXVK (e contra o vkmali antigo, se você o reconstruir da tag). Perfil de CPU
   (`prof_run.py`, sem `FPS_LOG`) e contagem de passes/envios por quadro **antes e depois de cada princípio**.
 
 ## Entrega
 
-APK `work/android/app-vk2-<n>.apk` (vkmali2 selecionável nas configurações, DXVK continua o padrão até a meta ser batida), plano
+APK `work/android/app-vk2-<n>.apk` (o novo backend selecionável nas configurações, DXVK continua o padrão até a meta ser batida), plano
 de teste curto com chaves `RE5VK2_*` para ligar/desligar cada princípio, e um relatório no `docs/STATUS.md` com a tabela
 "mudança → passes/quadro, envios/quadro, fps pico/média".

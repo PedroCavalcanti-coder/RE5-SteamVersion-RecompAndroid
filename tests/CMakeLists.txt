@@ -25,33 +25,6 @@ add_test(NAME d3d9 COMMAND test_d3d9)
 add_test(NAME d3d9_query_lag COMMAND test_d3d9 --query-lag)
 set_tests_properties(d3d9_query_lag PROPERTIES ENVIRONMENT "RE5_QUERY_LAG=2")
 
-# Oráculo TBDR do re5vk (STORE_OP_DONT_CARE, sticky_live, invalidacao).
-add_executable(test_vk_tbdr unit/test_vk_tbdr.c "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk/vk_tbdr.c")
-add_test(NAME vk_tbdr COMMAND test_vk_tbdr)
-
-# Layout por sub-recurso do re5vk: imagem amostrada e presa como anexo (mips/faces fora do anexo).
-add_executable(test_vk_layout unit/test_vk_layout.c "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk/vk_layout.c")
-target_include_directories(test_vk_layout PRIVATE "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")
-add_test(NAME vk_layout COMMAND test_vk_layout)
-
-# Renderizadores nativos vkadreno/vkmali (runtime/src/gfx/vkn): política TBDR e seletor (sem GPU) e
-# o ciclo inteiro numa GPU de verdade sem janela (pula com 77 sem Vulkan).
-foreach(t vkn_policy vkn_gpu)
-    add_executable(test_${t} unit/test_${t}.cpp unit/lifted_stub.c)
-    target_link_libraries(test_${t} PRIVATE re5_runtime)
-    target_include_directories(test_${t} PRIVATE ${RE5_VKN_INCLUDES} "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vkn")
-    set_target_properties(test_${t} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    add_test(NAME ${t} COMMAND test_${t})
-endforeach()
-set_tests_properties(vkn_gpu PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "RE5VK_TBDR=1")
-# A ponte C do device D3D9 (vkn_bridge.h) compilada como C11 e exercitada numa GPU de verdade.
-add_executable(test_vkn_bridge unit/test_vkn_bridge.c unit/lifted_stub.c)
-target_link_libraries(test_vkn_bridge PRIVATE re5_runtime)
-target_include_directories(test_vkn_bridge PRIVATE "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include"
-                           "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vkn")
-add_test(NAME vkn_bridge COMMAND test_vkn_bridge)
-set_tests_properties(vkn_bridge PROPERTIES SKIP_RETURN_CODE 77)
-
 # Carregador compartilhado de driver Vulkan customizado (AdrenoTools / sistema).
 add_executable(test_vk_loader unit/test_vk_loader.c)
 target_link_libraries(test_vk_loader PRIVATE re5_runtime)
@@ -59,26 +32,6 @@ add_test(NAME vk_loader COMMAND test_vk_loader)
 
 add_executable(test_dxt_decode unit/test_dxt_decode.c)
 add_test(NAME dxt_decode COMMAND test_dxt_decode)
-
-# Recodificação ETC2 em paralelo (re5vk): igual byte a byte à versão em uma thread.
-add_executable(test_etc2_pool unit/test_etc2_pool.c)
-target_link_libraries(test_etc2_pool PRIVATE re5_runtime)
-add_test(NAME etc2_pool COMMAND test_etc2_pool)
-set_tests_properties(etc2_pool PROPERTIES ENVIRONMENT "RE5VK_ETC2_THREADS=3")
-
-add_executable(test_dxt_to_etc2 unit/test_dxt_to_etc2.c)
-add_test(NAME dxt_to_etc2 COMMAND test_dxt_to_etc2)
-set_tests_properties(dxt_to_etc2 PROPERTIES ENVIRONMENT "RE5VK_TEX_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/texcache")
-
-# Tradutor SM3 -> SPIR-V do backend re5vk (RE5_GFX=re5vk). Com o spirv-val do NDK
-# (shader-tools/<host>/spirv-val) em RE5_SPIRV_VAL, cada SPIR-V passa pelo validador da Khronos.
-add_executable(test_vk_dxso unit/test_vk_dxso.c "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk/vk_dxso.c")
-add_test(NAME vk_dxso COMMAND test_vk_dxso)
-# guarda de NaN/Inf do Android (padrão lá; no PC só com a variável)
-add_test(NAME vk_dxso_nanguard COMMAND test_vk_dxso)
-set_tests_properties(vk_dxso_nanguard PROPERTIES ENVIRONMENT "RE5VK_NANGUARD=1")
-add_test(NAME vk_dxso_floatemu COMMAND test_vk_dxso)
-set_tests_properties(vk_dxso_floatemu PROPERTIES ENVIRONMENT "RE5VK_FLOATEMU=1")
 
 # Estouro da pilha do host com relatório (filtro com pilha de reserva).
 if(WIN32)
