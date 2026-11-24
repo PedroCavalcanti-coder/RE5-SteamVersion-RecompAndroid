@@ -69,6 +69,8 @@ typedef struct re5_thread {
 
 /* Diagnóstico de seções críticas: relatório de bloqueios por CS */
 void     re5_k32_cs_contend_report(void);
+/* RE5_FPS_LOG: esperas que dormiram (CS e WaitFor*) por ponto de chamada, médias de `secs` s; zera. */
+void     re5_k32_wait_report(double secs);
 uint32_t re5_k32_cs_contend_count(uint32_t cs);
 
 /* Nome da thread do host que chama (SetThreadDescription / pthread_setname_np), visto pelo

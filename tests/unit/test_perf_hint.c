@@ -52,6 +52,12 @@ int main(void)
     const unsigned long d7030[8] = {2000000, 2000000, 2000000, 2000000, 2000000, 2000000, 2500000, 2500000};
     fake_cpus("perf_sys_d7030", d7030, 8);
     CHECK(re5_perf_big_mask("perf_sys_d7030") == 0xC0u);
+    /* render presa só com 3+ núcleos grandes, salvo RE5_PIN_RENDER */
+    CHECK(re5_perf_pin_render(0xF0u, NULL) == 1);   /* A54: 4 A78 */
+    CHECK(re5_perf_pin_render(0xC0u, NULL) == 0);   /* 7030: 2 A78, ficam para a principal */
+    CHECK(re5_perf_pin_render(0xC0u, "1") == 1);
+    CHECK(re5_perf_pin_render(0xF0u, "0") == 0);
+    CHECK(re5_perf_pin_render(0, "1") == 0);
 
     /* Snapdragon 8 Gen 4 / 8 Elite (6x Oryon Perf 3.53 GHz + 2x Oryon Prime 4.32 GHz):
      * sem núcleos LITTLE -> não deve confinar o jogo em apenas 2 Prime (retorna 0). */
@@ -79,8 +85,21 @@ int main(void)
     CHECK(re5_perf_work_ns(20000000, 0) == 20000000);
     CHECK(re5_perf_work_ns(10, 50) == 1);
 
+    /* ADPF com GPU (Android 15+): a espera no Present é a GPU; a CPU é o resto do quadro. */
+    {
+        int64_t t, c, g;
+        re5_perf_split(70000000, 0, 45000000, &t, &c, &g);   /* quadro de 70 ms, 45 ms no Present */
+        CHECK(t == 70000000 && g == 45000000 && c == 25000000);
+        re5_perf_split(33333333, 13333333, 5000000, &t, &c, &g);   /* limitador fora do total */
+        CHECK(t == 20000000 && g == 5000000 && c == 15000000);
+        re5_perf_split(20000000, 0, 30000000, &t, &c, &g);   /* Present maior que o quadro: GPU = total */
+        CHECK(t == 20000000 && g == 20000000 && c == 1);
+        re5_perf_split(10, 50, 0, &t, &c, &g);   /* tudo limitador: nunca 0 (o ADPF exige > 0) */
+        CHECK(t == 1 && g == 0 && c == 1);
+    }
+
     /* Fora do Android os ganchos não fazem nada (nem falham). */
     re5_perf_note_render();
-    re5_perf_note_present(0);
+    re5_perf_note_present(0, 0);
     CHECK_DONE();
 }

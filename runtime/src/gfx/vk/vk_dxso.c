@@ -65,7 +65,7 @@ enum {
     SOpImageSampleImplicitLod = 87, SOpImageSampleExplicitLod = 88, SOpImageSampleDrefImplicitLod = 89,
     SOpImageSampleDrefExplicitLod = 90, SOpImageSampleProjImplicitLod = 91, SOpImageSampleProjDrefImplicitLod = 93,
     SOpConvertFToS = 110, SOpConvertSToF = 111, SOpConvertUToF = 112, SOpFNegate = 127, SOpIAdd = 128, SOpFAdd = 129, SOpFSub = 131,
-    SOpFMul = 133, SOpFDiv = 136, SOpVectorTimesScalar = 142, SOpDot = 148, SOpAny = 154, SOpLogicalOr = 166,
+    SOpFMul = 133, SOpFDiv = 136, SOpVectorTimesScalar = 142, SOpDot = 148, SOpAny = 154, SOpIsNan = 156, SOpIsInf = 157, SOpLogicalOr = 166,
     SOpLogicalAnd = 167, SOpLogicalNot = 168, SOpSelect = 169, SOpINotEqual = 171, SOpSLessThan = 177,
     SOpFOrdEqual = 180, SOpFOrdNotEqual = 182, SOpFOrdLessThan = 184, SOpFOrdGreaterThan = 186,
     SOpFOrdLessThanEqual = 188, SOpFOrdGreaterThanEqual = 190, SOpShiftRightLogical = 194, SOpBitwiseAnd = 199,
@@ -74,9 +74,10 @@ enum {
 };
 /* GLSL.std.450 */
 enum { GFloor = 8, GFract = 10, GSin = 13, GCos = 14, GPow = 26, GExp2 = 29, GLog2 = 30, GInverseSqrt = 32,
-       GFAbs = 4, GFSign = 6, GFMin = 37, GFMax = 40, GFClamp = 43, GCross = 68, GNormalize = 69 };
+       GFAbs = 4, GFSign = 6, GFMin = 37, GFMax = 40, GFClamp = 43, GCross = 68, GNormalize = 69,
+       GNClamp = 81 };
 enum { SC_UniformConstant = 0, SC_Input = 1, SC_Uniform = 2, SC_Output = 3, SC_Function = 7 };
-enum { D_SpecId = 1, D_Block = 2, D_ArrayStride = 6, D_BuiltIn = 11, D_Centroid = 16, D_Location = 30,
+enum { D_SpecId = 1, D_Block = 2, D_ArrayStride = 6, D_BuiltIn = 11, D_Invariant = 18, D_Centroid = 16, D_Location = 30,
        D_Binding = 33, D_DescriptorSet = 34, D_Offset = 35 };
 enum { B_Position = 0, B_PointSize = 1, B_FragCoord = 15, B_FrontFacing = 17, B_FragDepth = 22 };
 
@@ -130,6 +131,8 @@ typedef struct {
     uint32_t o[MAX_OUT];         /* VS: saídas (variáveis da função) */
     uint8_t o_usage[MAX_OUT], o_index[MAX_OUT], o_used[MAX_OUT];
     uint32_t oc[4], odepth;      /* PS */
+    uint32_t killed;             /* PS: bool da função, texkill adiado (late_kill) */
+    uint8_t kill_depth;          /* PS: grava FragDepth = FragCoord.z (contorno do discard, kill_depth_fix) */
     uint32_t vpos, vface;
     uint32_t ubo, ubo_ptr_v4, ubo_ptr_i4, ubo_ptr_u;
     uint32_t samp[16], samp_type[16];
@@ -256,6 +259,13 @@ static uint32_t e3(cx *c, uint32_t op, uint32_t type, uint32_t a, uint32_t b, ui
     ensure_open(c);
     uint32_t r = id(c);
     OP(&c->body, op, type, r, a, b, d);
+    return r;
+}
+static uint32_t e4(cx *c, uint32_t op, uint32_t type, uint32_t a, uint32_t b, uint32_t d, uint32_t f)
+{
+    ensure_open(c);
+    uint32_t r = id(c);
+    OP(&c->body, op, type, r, a, b, d, f);
     return r;
 }
 static uint32_t gl1(cx *c, uint32_t type, uint32_t f, uint32_t a)
@@ -397,6 +407,26 @@ static uint32_t rel_index(cx *c, uint32_t base, uint32_t reltok)
     return e2(c, SOpIAdd, c->t_i32, iv, ki(c, (int32_t)base));
 }
 
+/* RE5VK_REL_CLAMP: c[índice relativo] fora de 0..banco-1 lê (0,0,0,0), como a DXVK. Sem isso o
+ * acesso fora do array é indefinido no SPIR-V (a Intel devolve algo inofensivo, o Mali qualquer
+ * coisa de dentro do buffer). Ativado por padrão (permite RE5VK_REL_CLAMP=0 para desligar). */
+static int rel_clamp(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_REL_CLAMP");
+        on = !e || *e != '0';
+    }
+    return on;
+}
+
+/* RE5VK_REL_CLAMP=2: fora da faixa devolve (0,0,0,0), como a DXVK e o D3D9 (padrão 1 = preso no limite). */
+static int rel_zero(void)
+{
+    const char *e = getenv("RE5VK_REL_CLAMP");
+    return e && *e == '2';
+}
+
 static uint32_t read_const(cx *c, uint32_t n, uint32_t idx_id)
 {
     if (!idx_id && n < 256 && c->def_f_on[n]) return kv4(c, c->def_f[n][0], c->def_f[n][1], c->def_f[n][2], c->def_f[n][3]);
@@ -405,6 +435,29 @@ static uint32_t read_const(cx *c, uint32_t n, uint32_t idx_id)
     uint32_t ix = idx_id ? idx_id : ki(c, (int32_t)n);
     uint32_t need = idx_id ? nf : n + 1u;   /* relativo: qualquer um do banco */
     if (need > c->out->const_f) c->out->const_f = (uint16_t)need;
+    if (idx_id) c->out->uses_rel = 1;
+    if (idx_id && rel_clamp()) {
+        /* Clamp seguro do índice no intervalo [0, nf - 1]. Não devolve (0,0,0,0) para não colapsar
+         * matrizes de skinning de ossos no espaço de mundo (spikes de vértices no Chris). */
+        uint32_t lo = e2(c, SOpSLessThan, c->t_bool, ix, ki(c, 0));
+        uint32_t safe = e3(c, SOpSelect, c->t_i32, lo, ki(c, 0), ix);
+        uint32_t hi = e2(c, SOpSLessThan, c->t_bool, safe, ki(c, (int32_t)nf));
+        safe = e3(c, SOpSelect, c->t_i32, hi, safe, ki(c, (int32_t)(nf - 1)));
+        ensure_open(c);
+        uint32_t p = id(c);
+        OP(&c->body, SOpAccessChain, c->ubo_ptr_v4, p, c->ubo, ki(c, 0), safe);
+        if (rel_zero()) {
+            uint32_t v = load(c, c->t_v4f, p);
+            uint32_t in_lo = e1(c, SOpLogicalNot, c->t_bool, lo);
+            uint32_t in_hi = e2(c, SOpSLessThan, c->t_bool, ix, ki(c, (int32_t)nf));
+            uint32_t ok = e2(c, SOpLogicalAnd, c->t_bool, in_lo, in_hi);
+            ensure_open(c);
+            uint32_t ok4 = id(c);
+            OP(&c->body, SOpCompositeConstruct, c->t_v4b, ok4, ok, ok, ok, ok);
+            return e3(c, SOpSelect, c->t_v4f, ok4, v, kv4(c, 0, 0, 0, 0));
+        }
+        return load(c, c->t_v4f, p);
+    }
     ensure_open(c);
     uint32_t p = id(c);
     OP(&c->body, SOpAccessChain, c->ubo_ptr_v4, p, c->ubo, ki(c, 0), ix);
@@ -450,6 +503,19 @@ static uint32_t read_reg(cx *c, uint32_t type, uint32_t n, uint32_t idx_id)
     case R_INPUT:
         if (n >= 16 || !c->vin[n]) { fail(c, "v%u sem dcl", n); return kv4(c, 0, 0, 0, 0); }
         if (idx_id) { fail(c, "v[] relativo"); return kv4(c, 0, 0, 0, 0); }
+        if (!c->pixel && (c->var.in_udec3 >> n & 1)) {
+            /* Desempacota uint32 (bits 0-9: X, 10-19: Y, 20-29: Z, 30-31: 1.0f) para float4 */
+            uint32_t vraw = load(c, c->t_v4u, c->vin[n]);
+            uint32_t raw = extract(c, c->t_u32, vraw, 0);
+            uint32_t m10 = ku(c, 0x3FFu);
+            uint32_t x_u = e2(c, SOpBitwiseAnd, c->t_u32, raw, m10);
+            uint32_t y_u = e2(c, SOpBitwiseAnd, c->t_u32, e2(c, SOpShiftRightLogical, c->t_u32, raw, ku(c, 10u)), m10);
+            uint32_t z_u = e2(c, SOpBitwiseAnd, c->t_u32, e2(c, SOpShiftRightLogical, c->t_u32, raw, ku(c, 20u)), m10);
+            uint32_t x_f = e1(c, SOpConvertUToF, c->t_f32, x_u);
+            uint32_t y_f = e1(c, SOpConvertUToF, c->t_f32, y_u);
+            uint32_t z_f = e1(c, SOpConvertUToF, c->t_f32, z_u);
+            return e4(c, SOpCompositeConstruct, c->t_v4f, x_f, y_f, z_f, kf(c, 1.0f));
+        }
         if (!c->pixel && (c->var.in_uint >> n & 1)) return e1(c, SOpConvertUToF, c->t_v4f, load(c, c->t_v4u, c->vin[n]));
         if (!c->pixel && (c->var.in_sint >> n & 1)) return e1(c, SOpConvertSToF, c->t_v4f, load(c, c->t_v4i, c->vin[n]));
         return load(c, c->t_v4f, c->vin[n]);
@@ -561,12 +627,15 @@ static uint32_t pred_mask(cx *c, uint32_t ptok)   /* bvec4 do predicado, com swi
     return p;
 }
 
+static int nan_guard(void);
+
 static void write_dst(cx *c, uint32_t tok, uint32_t v, uint32_t pred)
 {
     uint32_t ptr = dst_ptr(c, tok);
     if (!ptr) return;
     uint32_t mod = (tok >> 20) & 0xF;
-    if (mod & 1) v = gl3(c, c->t_v4f, GFClamp, v, kv4(c, 0, 0, 0, 0), kv4(c, 1, 1, 1, 1));
+    /* _sat: FClamp(NaN) é indefinido no SPIR-V (a AMD dá 0, o Mali propaga). NClamp dá 0. */
+    if (mod & 1) v = gl3(c, c->t_v4f, nan_guard() ? GNClamp : GFClamp, v, kv4(c, 0, 0, 0, 0), kv4(c, 1, 1, 1, 1));
     if (mod & ~7u) fail(c, "modificador de destino %u", mod);
     uint32_t mask = (tok >> 16) & 0xF;
     if (mask != 0xF || pred) {
@@ -590,8 +659,22 @@ static uint32_t compare(cx *c, uint32_t type, uint32_t ctl, uint32_t a, uint32_t
 
 /* ---- textura ---- */
 
+/* RE5VK_VTX_ZERO=1 (DIAGNOSTICO): textura lida no VS devolve (0,0,0,0). Isola o defeito da cabeca
+ * (cabelo/rosto com lixo, so nos 6 VS de skinning com texldl): se some com isto, o culpado e a
+ * leitura/conteudo da textura de vertice; se nao, e outra coisa. */
+static int vtx_zero(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_VTX_ZERO");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
 static uint32_t sample(cx *c, uint32_t s, uint32_t coord, int proj, int bias, int lod, uint32_t dx, uint32_t dy)
 {
+    if (!c->pixel && vtx_zero()) return kv4(c, 0, 0, 0, 0);
     if (s >= 16 || !c->samp[s]) { fail(c, "s%u sem dcl", s); return kv4(c, 0, 0, 0, 0); }
     int ttype = c->out->sampler_type[s];
     int depth = c->pixel && (c->var.depth_samplers >> s & 1) && ttype == RE5VK_TEX_2D;
@@ -680,7 +763,7 @@ static void do_dcl(cx *c, uint32_t dcl, uint32_t reg)
     }
     if (type == R_INPUT) {
         if (n >= 16) { fail(c, "v%u", n); return; }
-        uint32_t vt = !c->pixel && (c->var.in_uint >> n & 1) ? c->t_v4u
+        uint32_t vt = !c->pixel && ((c->var.in_uint >> n & 1) || (c->var.in_udec3 >> n & 1)) ? c->t_v4u
                     : !c->pixel && (c->var.in_sint >> n & 1) ? c->t_v4i : c->t_v4f;
         c->vin[n] = gvar(c, SC_Input, vt);
         uint32_t loc = c->pixel ? re5vk_dxso_location(usage, index) : n;
@@ -706,6 +789,71 @@ static void do_dcl(cx *c, uint32_t dcl, uint32_t reg)
 
 /* ---- fim do shader: saídas do Vulkan ---- */
 
+/* texkill adiado (RE5VK_LATE_KILL, padrão 1; =0 volta ao OpKill na hora). No Vulkan o OpKill
+ * encerra a invocação: os vizinhos do quad 2x2 ficam com derivadas indefinidas, e todo texld
+ * depois do texkill lê o mip errado. O Intel/AMD do PC esconde (mantém a lane como helper); o Mali
+ * não, e as bordas recortadas (folhas, cerca de arame, cabelo) saíam pretas e pintadas. O D3D9 não
+ * tem efeito colateral no PS, então marcar e descartar no fim dá o mesmo resultado (é o que a DXVK
+ * faz com demote-to-helper). */
+/* RE5VK_POS_INVARIANT=0 tira a decoração Invariant da posição (comparação). */
+static int pos_invariant(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_POS_INVARIANT");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* RE5VK_KILL_DEPTH=0 desliga. Mali com driver < r40 e Adreno 5xx ignoram o discard em certas
+ * combinações de profundidade/stencil (lista de bugs de driver Vulkan do PPSSPP); a profundidade do
+ * quad inteiro fica gravada (folhas, cerca e cabelo com retângulo preto, no A54 e no Adreno). O
+ * contorno do PPSSPP: o PS que descarta também grava FragDepth = FragCoord.z (DepthUnchanged), o
+ * que obriga o teste de profundidade a esperar o shader. */
+static int kill_depth_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_KILL_DEPTH");
+        on = (e && *e == '1'); /* DESLIGADO por padrão: suspeito de GPU hang (device lost com FragDepth + teste NEVER) */
+    }
+    return on;
+}
+
+/* RE5VK_NAN_CULL=0 desliga. Posição com NaN só em uma componente (o w, por exemplo) some no PC, mas
+ * no Mali vira triângulo de lixo (PPSSPP: é preciso pôr xyzw em NaN). Se qualquer componente for
+ * NaN, a posição inteira vira NaN e o triângulo é descartado em toda GPU. */
+static int nan_cull(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_NAN_CULL");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static float pos_huge(void)
+{
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char *e = getenv("RE5VK_POS_HUGE");
+        v = e ? (float)atof(e) : 0.0f;
+    }
+    return v;
+}
+
+static int late_kill(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_LATE_KILL");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
 static void finish_outputs(cx *c)
 {
     if (!c->pixel) {
@@ -715,6 +863,30 @@ static void finish_outputs(cx *c)
             if (c->o_usage[n] == USAGE_POSITION && c->o_index[n] == 0) {
                 uint32_t pos = gvar(c, SC_Output, c->t_v4f);
                 OP(&c->decor, SOpDecorate, pos, D_BuiltIn, B_Position);
+                /* Invariant (como a DXVK): o RE5 faz uma passada só de profundidade e depois a de cor
+                 * com ZFUNC EQUAL/LESSEQUAL, com VS diferentes. Sem isto o compilador do Mali funde
+                 * mul+add (FMA) de jeito diferente em cada um, a profundidade não bate, e o teste falha
+                 * em retalhos (folhas, cerca, cabelo pretos). O Intel calculava igual nos dois. */
+                if (pos_invariant()) OP(&c->decor, SOpDecorate, pos, D_Invariant);
+                if (nan_cull()) {
+                    /* NaN OU Inf (rcp(0), explosão de vértice no skinning) em qualquer componente: o
+                     * triângulo some. RE5VK_POS_HUGE=<n> (diagnóstico): também componente com módulo > n. */
+                    uint32_t bad = e2(c, SOpLogicalOr, c->t_v4b, e1(c, SOpIsNan, c->t_v4b, v),
+                                      e1(c, SOpIsInf, c->t_v4b, v));
+                    float huge = pos_huge();
+                    if (huge > 0.0f) {
+                        uint32_t sq = e2(c, SOpFMul, c->t_v4f, v, v);
+                        float h2 = huge * huge;
+                        uint32_t big = e2(c, SOpFOrdGreaterThan, c->t_v4b, sq, kv4(c, h2, h2, h2, h2));
+                        bad = e2(c, SOpLogicalOr, c->t_v4b, bad, big);
+                    }
+                    uint32_t any = e1(c, SOpAny, c->t_bool, bad);
+                    ensure_open(c);
+                    uint32_t any4 = id(c);
+                    OP(&c->body, SOpCompositeConstruct, c->t_v4b, any4, any, any, any, any);
+                    float qn = __builtin_nanf("");
+                    v = e3(c, SOpSelect, c->t_v4f, any4, kv4(c, qn, qn, qn, qn), v);
+                }
                 store(c, pos, v);
             } else if (c->o_usage[n] == USAGE_PSIZE) {
                 uint32_t ps = gvar(c, SC_Output, c->t_f32);
@@ -728,8 +900,19 @@ static void finish_outputs(cx *c)
         }
         return;
     }
+    if (c->killed) {   /* texkill adiado */
+        uint32_t k = load(c, c->t_bool, c->killed);
+        uint32_t kill = id(c), keep = id(c);
+        OP(&c->body, SOpSelectionMerge, keep, 0);
+        OP(&c->body, SOpBranchConditional, k, kill, keep);
+        OP(&c->body, SOpLabel, kill);
+        OP0(&c->body, SOpKill);
+        OP(&c->body, SOpLabel, keep);
+        c->open = 1;
+    }
     /* alpha test do D3D9 (D3DRS_ALPHAFUNC na variante, referência no UBO) */
     if (c->var.alpha_func && c->var.alpha_func != 8 && c->oc[0]) {
+        c->out->uses_kill = 1;
         uint32_t a = extract(c, c->t_f32, load(c, c->t_v4f, c->oc[0]), 3);
         uint32_t p = id(c);
         ensure_open(c);
@@ -758,6 +941,16 @@ static void finish_outputs(cx *c)
         OP(&c->body, SOpLabel, keep);
         if (!pass) { /* NEVER: o bloco keep não é alcançado, mas precisa terminar */ }
         c->open = 1;
+    }
+    if (c->out->uses_kill && !c->odepth && kill_depth_fix()) {
+        if (!c->vpos) {
+            c->vpos = gvar(c, SC_Input, c->t_v4f);
+            OP(&c->decor, SOpDecorate, c->vpos, D_BuiltIn, B_FragCoord);
+        }
+        uint32_t od = gvar(c, SC_Output, c->t_f32);
+        OP(&c->decor, SOpDecorate, od, D_BuiltIn, B_FragDepth);
+        store(c, od, extract(c, c->t_f32, load(c, c->t_v4f, c->vpos), 2));
+        c->kill_depth = 1;
     }
     for (int n = 0; n < 4; n++) {
         if (!c->oc[n]) continue;
@@ -886,19 +1079,47 @@ static int float_emu(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RE5VK_FLOATEMU");
-        /* Ligada por padrão, como o comentário acima sempre disse (a condição só ligava com =1).
-         * No Mali (A54, 2026-11-06) a cena 3D saía escura, com manchas pretas e moiré: NaN de 0*inf
-         * e de rsq(0). A AMD do PC escondia (saturate(NaN) = 0); o Mali propaga. */
-        on = !(e && *e == '0');
+        /* Desligada por padrão desde 20/11/2026, como na DXVK 1.9.2b (FloatEmulationByDefault = false),
+         * que desenha certo no A54 sem ela. Custo medido nos 164 shaders do jogo: 82,5 mil instruções
+         * de ALU com a emulação e a guarda de NaN, 29 mil sem (RE5_DXSO_STATS=1 test_vk_dxso). Em
+         * 06/11 ela foi ligada contra manchas escuras no Mali (NaN de 0*inf e de rsq(0)); a trava de
+         * rcp/rsq/log em +-FLT_MAX (finite_f) continua sempre ligada. RE5VK_FLOATEMU=1 liga. */
+        on = e && *e == '1';
     }
     return on;
 }
 
 /* rcp/rsq/nrm/log do D3D9 não dão infinito: o resultado fica em +-FLT_MAX (como a DXVK com a
  * emulação de float). Sem isso rsq(0) = inf e o próximo mul vira NaN. */
+/* Guarda de NaN/Inf (RE5VK_NANGUARD=1; desligada por padrão). No Mali (A54) a cena 3D seguia escura com faixas mesmo com a emulação de
+ * float: FClamp(NaN) é indefinido no SPIR-V e o Mali devolve NaN, que se espalha pela cadeia HDR; e
+ * exp/pow/lit podiam dar +Inf. Com a guarda: _sat e finite_f usam NClamp com NaN -> 0, e exp, pow e
+ * lit passam por finite_f. */
+static int nan_guard(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_NANGUARD");
+        /* Desligada por padrão desde 20/11/2026 em toda plataforma: as "faixas" de 12/11 eram o
+         * stride dinâmico do Mali (RE5VK_CORE); a DXVK 1.9.2b não tem guarda e desenha certo.
+         * RE5VK_NANGUARD=1 liga (se a cena escura voltar). */
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+/* Valor finito: NaN -> 0, +-Inf -> +-FLT_MAX (só com a guarda ligada). */
+static uint32_t guard_f(cx *c, uint32_t x)
+{
+    if (!nan_guard()) return x;
+    uint32_t cl = gl3(c, c->t_f32, GNClamp, x, kf(c, -3.402823466e+38f), kf(c, 3.402823466e+38f));
+    return e3(c, SOpSelect, c->t_f32, e1(c, SOpIsNan, c->t_bool, x), kf(c, 0), cl);
+}
+
 static uint32_t finite_f(cx *c, uint32_t x)
 {
-    if (!float_emu()) return x;
+    if (nan_guard()) return guard_f(c, x);
+    /* sempre: uma instrução, e rcp/rsq/log nunca saem infinitos (como no D3D9) */
     return gl3(c, c->t_f32, GFClamp, x, kf(c, -3.402823466e+38f), kf(c, 3.402823466e+38f));
 }
 
@@ -1024,7 +1245,7 @@ static int translate(cx *c)
             r = e3(c, SOpSelect, c->t_v4f, b, kv4(c, 1, 1, 1, 1), kv4(c, 0, 0, 0, 0));
             break;
         }
-        case 14: case 78: r = splat(c, gl1(c, c->t_f32, GExp2, x_of(c, S(0)))); break;   /* exp, expp */
+        case 14: case 78: r = splat(c, guard_f(c, gl1(c, c->t_f32, GExp2, x_of(c, S(0))))); break;   /* exp, expp */
         case 15: case 79: r = splat(c, finite_f(c, gl1(c, c->t_f32, GLog2, gl1(c, c->t_f32, GFAbs, x_of(c, S(0)))))); break;
         case 16: {   /* lit */
             v0 = S(0);
@@ -1034,6 +1255,8 @@ static int translate(cx *c)
             uint32_t pz = gl2(c, c->t_f32, GPow, gl2(c, c->t_f32, GFMax, y, kf(c, 0)), w2);
             uint32_t xp = e2(c, SOpFOrdGreaterThan, c->t_bool, x, kf(c, 0));
             uint32_t yp = e2(c, SOpFOrdGreaterThan, c->t_bool, y, kf(c, 0));
+            if (nan_guard())   /* pow(y, 0) = 1 e sem +Inf com expoente negativo */
+                pz = guard_f(c, e3(c, SOpSelect, c->t_f32, e2(c, SOpFOrdEqual, c->t_bool, w2, kf(c, 0)), kf(c, 1), pz));
             uint32_t z = e3(c, SOpSelect, c->t_f32, e2(c, SOpLogicalAnd, c->t_bool, xp, yp), pz, kf(c, 0));
             ensure_open(c);
             r = id(c);
@@ -1070,9 +1293,9 @@ static int translate(cx *c)
             v0 = S(0); v1 = S(1);
             uint32_t py = x_of(c, v1);
             uint32_t pw = gl2(c, c->t_f32, GPow, gl1(c, c->t_f32, GFAbs, x_of(c, v0)), py);
-            if (float_emu())   /* pow(x, 0) = 1 também para x = 0 (no GLSL é indefinido) */
+            if (float_emu() || nan_guard())   /* pow(x, 0) = 1 também para x = 0 (no GLSL é indefinido) */
                 pw = e3(c, SOpSelect, c->t_f32, e2(c, SOpFOrdEqual, c->t_bool, py, kf(c, 0)), kf(c, 1), pw);
-            r = splat(c, pw);
+            r = splat(c, guard_f(c, pw));   /* pow(0, <0) = +Inf */
             break;
         }
         case 33: {   /* crs */
@@ -1154,6 +1377,16 @@ static int translate(cx *c)
                 any = any ? e2(c, SOpLogicalOr, c->t_bool, any, b) : b;
             }
             if (!any) continue;
+            c->out->uses_kill = 1;
+            if (late_kill()) {
+                if (!c->killed) {
+                    uint32_t f = id(c);
+                    OP(&c->globals, SOpConstantFalse, c->t_bool, f);
+                    c->killed = fvar(c, c->t_bool, f);
+                }
+                store(c, c->killed, e2(c, SOpLogicalOr, c->t_bool, load(c, c->t_bool, c->killed), any));
+                continue;
+            }
             uint32_t kill = id(c), keep = id(c);
             OP(&c->body, SOpSelectionMerge, keep, 0);
             OP(&c->body, SOpBranchConditional, any, kill, keep);
@@ -1277,7 +1510,8 @@ int re5vk_dxso_compile(const uint32_t *code, size_t ndw, const re5vk_dxso_varian
     }
     if (pixel) {
         OP(&m, SOpExecutionMode, mainf, 7 /* OriginUpperLeft */);
-        if (out->writes_depth) OP(&m, SOpExecutionMode, mainf, 12 /* DepthReplacing */);
+        if (out->writes_depth || c->kill_depth) OP(&m, SOpExecutionMode, mainf, 12 /* DepthReplacing */);
+        if (c->kill_depth) OP(&m, SOpExecutionMode, mainf, 16 /* DepthUnchanged */);
     }
     for (size_t i = 0; i < c->decor.n; i++) put(&m, c->decor.w[i]);
     for (size_t i = 0; i < c->globals.n; i++) put(&m, c->globals.w[i]);

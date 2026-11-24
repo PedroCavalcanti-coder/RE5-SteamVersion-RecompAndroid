@@ -58,6 +58,21 @@ class AndroidPerf(unittest.TestCase):
         old = "fps 30.0 (Present 10) thunks 1 d3d9 2 draws 3 heap 4 dispatch 5 lock_ms 1.0"
         self.assertEqual(android_perf.FPS_RE.search(old).groups(), ("30.0", "1.0", None, None))
 
+    def test_re5vk_line(self):
+        # mesmo texto do timing_tick (runtime/src/gfx/vk/re5vk.c)
+        line = ("I/RE5Native( 123): [INFO ] re5vk     por s: quadros 31.0 envios 42.5 gpu_ms 512.3 "
+                "(42 envios medidos) acquire_ms 1.0 fence_ms 2.5 em_voo_ms 300.5 submit_ms 3.0 "
+                "queue_present_ms 4.0 mutex_ms 5.5")
+        m = android_perf.VK_RE.search(line)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.groups(), ("31.0", "42.5", "512.3", "42", "1.0", "2.5", "300.5", "3.0", "4.0", "5.5"))
+        # com a thread de present (RE5VK_PRESENT_THREAD) a linha traz thread_present_ms
+        m = android_perf.VK_RE.search(line.replace("mutex_ms", "thread_present_ms 400.0 mutex_ms"))
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(10), "5.5")
+        # a linha do d3d9 não é confundida com a do re5vk
+        self.assertIsNone(android_perf.VK_RE.search("fps 30.0 (Present 10) thunks 1 lock_ms 1.0"))
+
 
 if __name__ == "__main__":
     unittest.main()

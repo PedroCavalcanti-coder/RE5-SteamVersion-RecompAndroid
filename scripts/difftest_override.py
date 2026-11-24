@@ -243,6 +243,11 @@ def main():
     base = pe.OPTIONAL_HEADER.ImageBase
     img = pe.get_memory_mapped_image()
     work = tempfile.mkdtemp(prefix="difftest_override_")
+    # A pasta tem ~800 MB (img.bin + harness): sem isto cada ctest deixava uma em %TEMP% e encheu o disco.
+    if not os.environ.get("RE5_KEEP_WORK"):
+        import atexit
+        import shutil
+        atexit.register(shutil.rmtree, work, ignore_errors=True)
     imgf = os.path.join(work, "img.bin")
     open(imgf, "wb").write(bytes(img))
     cfile = os.path.join(work, "h.c")

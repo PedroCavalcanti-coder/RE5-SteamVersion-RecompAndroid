@@ -113,11 +113,59 @@ void re5vk_state_reset(vk_device *d)
 
 /* ---- passes de render ---- */
 
+static int tex_is_depth(vk_obj *t);
+
+/* RE5VK_LAZY_RT (padrão 1; =0 volta ao antigo): SetRenderTarget/SetDepthStencilSurface não fecham o
+ * passe na hora; fecha no próximo draw/Clear só se o conjunto de alvos mudou de fato. O RE5 troca o
+ * RT0 para outro alvo e volta sem desenhar no meio (A54, 20/11: ~54 passes por quadro reabertos no
+ * mesmo alvo); cada reabertura num tiler grava e recarrega a tela inteira. */
+static int lazy_rt(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_LAZY_RT");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* RE5VK_PASS_TRACE=<n> (DIAGNOSTICO): loga cada abertura/fechamento de passe e troca de alvo de um
+ * quadro a cada n (contado em Present), para ver a sequência que o jogo faz. */
+static int pass_trace_on(const vk_device *d)
+{
+    static long want = -2;
+    if (want == -2) {
+        const char *e = getenv("RE5VK_PASS_TRACE");
+        want = e ? atol(e) : -1;
+    }
+    return want > 0 && d->presents && d->presents % (uint64_t)want == 0;
+}
+#define PTRACE(d, ...) do { if (pass_trace_on(d)) RE5_INFO("re5vk", "PASS_TRACE " __VA_ARGS__); } while (0)
+
+static int pass_matches(const vk_device *d)
+{
+    for (int i = 0; i < 4; i++)
+        if (d->pass_rt[i] != d->rt[i]) return 0;
+    return d->pass_ds == d->ds;
+}
+
+/* Passe aberto com alvos diferentes dos atuais: fecha agora (com o motivo da troca adiada). */
+static void pass_sync(vk_device *d)
+{
+    if (!d->rendering || pass_matches(d)) return;
+    re5vk_end_rendering_why(d, d->deferred_why ? d->deferred_why : "troca_de_alvo");
+}
+
 static void begin_rendering_with_layouts(vk_device *d, const VkImageLayout rt_layouts[4], VkImageLayout ds_layout)
 {
+    pass_sync(d);
     if (d->rendering) return;
     int gen = re5vk_layout_general();
-    VkRenderingAttachmentInfo col[4];
+    re5_vkn_pass pass;
+    memset(&pass, 0, sizeof pass);
+    VkImageView views[5];
+    VkClearValue clears[5];
+    uint32_t nviews = 0;
     uint32_t ncol = 0;
     VkExtent2D area = {0xFFFFFFFFu, 0xFFFFFFFFu};
 
@@ -127,6 +175,9 @@ static void begin_rendering_with_layouts(vk_device *d, const VkImageLayout rt_la
     int clr_z   = d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_ZBUFFER);
     int clr_st  = d->pending_clear.on && (d->pending_clear.flags & D3DCLEAR_STENCIL);
 
+    ti.is_split = d->pass_was_split ? 1u : 0u;
+    d->pass_was_split = 0;
+
     for (uint32_t i = 0; i < 4; i++) {
         vk_surface *s = d->rt[i];
         d->render_rt_layouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -134,6 +185,8 @@ static void begin_rendering_with_layouts(vk_device *d, const VkImageLayout rt_la
         ti.color_img[i] = s->img->id;
         ti.color_sub[i] = s->layer * s->img->levels + s->level;
         ti.color_subs[i] = &s->img->tbdr_subs[ti.color_sub[i]];
+        ti.color_is_backbuffer[i] = (s == d->backbuffer) ? 1u : 0u;
+        ti.color_is_texture[i] = (s->container != NULL || (s->img && (s->img->view != VK_NULL_HANDLE))) ? 1u : 0u;
         if (clr_col) ti.color_cleared |= (uint8_t)(1u << i);
         else ti.color_loaded |= (uint8_t)(1u << i);
     }
@@ -149,71 +202,99 @@ static void begin_rendering_with_layouts(vk_device *d, const VkImageLayout rt_la
         ti.depth_loaded = clr_z ? 0u : 1u;
         ti.stencil_cleared = clr_st ? 1u : 0u;
         ti.stencil_loaded = (ti.has_stencil && !clr_st) ? 1u : 0u;
+        ti.ds_is_auto = (ds == d->auto_depth) ? 1u : 0u;
+        ti.ds_is_texture = (ds->container != NULL || tex_is_depth(ds->container) ||
+                            (ds->img && ds->img->view != VK_NULL_HANDLE && ds != d->auto_depth)) ? 1u : 0u;
+        ti.stencil_enabled = (RS(d, D3DRS_STENCILENABLE) || clr_st) ? 1u : 0u;
+        ti.depth_write_enabled = (RS(d, D3DRS_ZWRITEENABLE) || clr_z) ? 1u : 0u;
     }
+    ti.width = ds ? ds->desc.Width : (d->rt[0] ? d->rt[0]->desc.Width : 0);
+    ti.height = ds ? ds->desc.Height : (d->rt[0] ? d->rt[0]->desc.Height : 0);
     re5vk_tbdr_pass_out to;
     re5vk_tbdr_begin_pass(&d->tbdr, &ti, &to);
 
+    /* VkRenderPass: o layout do anexo é o inicial e o final (as transições já foram feitas acima,
+     * por sub-recurso); load/store por anexo como antes (CLEAR do Clear pendente, DONT_CARE só com
+     * o oráculo TBDR ligado). Posições vazias (RT1 sem RT0) ficam VK_ATTACHMENT_UNUSED. */
     VkCommandBuffer cb = re5vk_cmd(d);
     for (uint32_t i = 0; i < 4; i++) {
-        memset(&col[i], 0, sizeof col[i]);
-        col[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        col[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        col[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        col[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         vk_surface *s = d->rt[i];
         if (!s) continue;
         VkImageLayout l = gen ? VK_IMAGE_LAYOUT_GENERAL : rt_layouts[i];
         re5vk_img_transition(d, cb, s->img, s->level, 1, s->layer, 1, l, 0);
         re5vk_img_mark_written(s->img, s->level, 1, s->layer, 1);
         d->render_rt_layouts[i] = l;
-        col[i].imageView = re5vk_image_rt_view(d, s->img, s->layer, s->level);
-        col[i].imageLayout = l;
-        if (clr_col) {
-            col[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            memcpy(col[i].clearValue.color.float32, d->pending_clear.color[0], 16);
-        }
-        if (to.color_store_dont_care & (1u << i)) col[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        re5_vkn_att *a = &pass.color[i];
+        a->format = s->img->vkf;
+        a->layout = l;
+        a->load = clr_col ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        a->store = (to.color_store_dont_care & (1u << i)) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        a->stencil_load = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a->stencil_store = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        memset(&clears[nviews], 0, sizeof clears[nviews]);
+        if (clr_col) memcpy(clears[nviews].color.float32, d->pending_clear.color[0], 16);
+        views[nviews++] = re5vk_image_rt_view(d, s->img, s->layer, s->level);
         if (s->desc.Width < area.width) area.width = s->desc.Width;
         if (s->desc.Height < area.height) area.height = s->desc.Height;
         s->img->last_use = d->serial;
         ncol = i + 1;
     }
-    VkRenderingAttachmentInfo dep = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sten = dep;
+    pass.ncolor = ncol;
     if (ds) {
         VkImageLayout l = gen ? VK_IMAGE_LAYOUT_GENERAL : ds_layout;
         re5vk_img_transition(d, cb, ds->img, ds->level, 1, ds->layer, 1, l, 0);
         re5vk_img_mark_written(ds->img, ds->level, 1, ds->layer, 1);
         d->render_ds_layout = l;
-        dep.imageView = re5vk_image_rt_view(d, ds->img, ds->layer, ds->level);
-        dep.imageLayout = l;
-        dep.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dep.storeOp = to.depth_store_dont_care ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
-        sten = dep;
-        sten.storeOp = to.stencil_store_dont_care ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
-        if (clr_z) {
-            dep.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            dep.clearValue.depthStencil.depth = d->pending_clear.z;
-        }
-        if (clr_st) {
-            sten.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            sten.clearValue.depthStencil.stencil = d->pending_clear.stencil;
-        }
+        int st = ds->img->fmt->stencil != 0;
+        pass.has_ds = 1;
+        pass.ds.format = ds->img->vkf;
+        pass.ds.layout = l;
+        pass.ds.load = clr_z ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        pass.ds.store = to.depth_store_dont_care ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        pass.ds.stencil_load = (!st || !ti.stencil_enabled) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                               : clr_st ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        pass.ds.stencil_store = (!st || to.stencil_store_dont_care) ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                                                    : VK_ATTACHMENT_STORE_OP_STORE;
+        memset(&clears[nviews], 0, sizeof clears[nviews]);
+        clears[nviews].depthStencil.depth = d->pending_clear.z;
+        clears[nviews].depthStencil.stencil = d->pending_clear.stencil;
+        views[nviews++] = re5vk_image_rt_view(d, ds->img, ds->layer, ds->level);
         if (ds->desc.Width < area.width) area.width = ds->desc.Width;
         if (ds->desc.Height < area.height) area.height = ds->desc.Height;
         ds->img->last_use = d->serial;
     }
     if (area.width == 0xFFFFFFFFu) re5_fatal("re5vk", "draw sem render target nem profundidade");
     d->pending_clear.on = 0;
-    VkRenderingInfo ri = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+    VkRenderPass rp = re5_vkn_render_pass(&pass);
+    VkRenderPassBeginInfo rbi = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = rp,
+        .framebuffer = re5_vkn_framebuffer(&pass, rp, views, nviews, area),
         .renderArea = {{0, 0}, area},
-        .layerCount = 1,
-        .colorAttachmentCount = ncol,
-        .pColorAttachments = col,
-        .pDepthAttachment = ds ? &dep : NULL,
-        .pStencilAttachment = ds && ds->img->fmt->stencil ? &sten : NULL,
+        .clearValueCount = nviews,
+        .pClearValues = clears,
     };
-    vkCmdBeginRendering(cb, &ri);
+    re5vk_pt_begin(d, cb, area.width, area.height);
+    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    d->tm.passes++;
+    PTRACE(d, "abre rt0 %p nivel %u (%ux%u) rt1 %p ds %p", d->rt[0] ? (void *)d->rt[0]->img : NULL,
+           d->rt[0] ? d->rt[0]->level : 0u, area.width, area.height,
+           d->rt[1] ? (void *)d->rt[1]->img : NULL, d->ds ? (void *)d->ds->img : NULL);
+    for (int i = 0; i < 4; i++) set_obj((vk_obj **)&d->pass_rt[i], d->rt[i] ? &d->rt[i]->o : NULL);
+    set_obj((vk_obj **)&d->pass_ds, d->ds ? &d->ds->o : NULL);
+    d->deferred_why = NULL;
+    {
+        /* mesmo sub-recurso (imagem + nível + camada): cadeias de mip desenhadas nível a nível não contam */
+        const void *rt0 = d->rt[0] ? (const void *)d->rt[0]->img : NULL, *ds = d->ds ? (const void *)d->ds->img : NULL;
+        uint32_t sub0 = d->rt[0] ? d->rt[0]->layer << 16 | d->rt[0]->level : 0;
+        if (rt0 == d->last_pass_rt0 && sub0 == d->last_pass_sub0 && ds == d->last_pass_ds) {
+            d->tm.reopen++;
+            uint32_t m = 0;
+            for (int i = 1; i < 4; i++) m |= (d->rt[i] ? 1u : 0u) << i;
+            if (m != d->last_pass_mrt) d->tm.reopen_mrt++;
+        }
+    }
+    d->pass_draws = 0;
     d->rendering = 1;
     d->render_area = area;
 }
@@ -231,7 +312,7 @@ static void begin_rendering(vk_device *d)
 /* Barreira de fim de passe: com layouts ótimos por sub-recurso (padrão), cada transição ou reuso
  * emite apenas a barreira exata naquela imagem, permitindo sobreposição entre passes independentes.
  * Com RE5VK_LAYOUT_GENERAL=1 ou RE5VK_BARRIER=all, mantém a barreira global de fim de passe. */
-static void pass_end_barrier(VkCommandBuffer cb)
+static int pass_end_barrier(VkCommandBuffer cb)
 {
     static int all = -1;
     if (all < 0) {
@@ -241,9 +322,9 @@ static void pass_end_barrier(VkCommandBuffer cb)
     }
     if (all) {
         re5vk_barrier_all(cb);
-        return;
+        return 1;
     }
-    if (!re5vk_layout_general()) return;
+    if (!re5vk_layout_general()) return 0;
     VkMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -257,17 +338,74 @@ static void pass_end_barrier(VkCommandBuffer cb)
                              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT
+#if defined(__ANDROID__)
+                             /* textura escrita num passe e lida no vertex shader (vsi->samplers) */
+                             | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+#endif
+                             ,
                          0, 1, &b, 0, NULL, 0, NULL);
+    return 1;
 }
 
-void re5vk_end_rendering(vk_device *d)
+static void sub_clean(vk_image *im, uint32_t layer, uint32_t level)
+{
+    if (!im || !im->sub_dirty) return;
+    size_t i = (size_t)layer * im->levels + level;
+    im->sub_dirty[i] = 0;
+    im->sub_stages[i] = 0;
+}
+
+/* 1 se algum sub-recurso tem escrita pendente (alvo desenhado e ainda não protegido por barreira) */
+static int img_any_dirty(const vk_image *im)
+{
+    if (!im->sub_dirty) return 0;
+    for (uint32_t i = 0; i < im->layers * im->levels; i++)
+        if (im->sub_dirty[i]) return 1;
+    return 0;
+}
+
+static void pass_why_count(vk_device *d, const char *why)
+{
+    if (d->split_why) why = d->split_why;
+    d->split_why = NULL;
+    uint32_t i = 0;
+    while (i < d->tm.pw_used && strcmp(d->tm.pw_name[i], why)) i++;
+    if (i == d->tm.pw_used) {
+        if (i == RE5VK_PW_MAX) i = RE5VK_PW_MAX - 1, why = "outros";   /* tabela cheia: junta no último */
+        else d->tm.pw_name[d->tm.pw_used++] = why;
+    }
+    d->tm.pw_n[i]++;
+    uint32_t n = d->pass_draws;
+    d->tm.pd_hist[n == 0 ? 0 : n == 1 ? 1 : n < 5 ? 2 : n < 20 ? 3 : 4]++;
+    d->last_pass_rt0 = d->pass_rt[0] ? (const void *)d->pass_rt[0]->img : NULL;
+    d->last_pass_sub0 = d->pass_rt[0] ? d->pass_rt[0]->layer << 16 | d->pass_rt[0]->level : 0;
+    d->last_pass_ds = d->pass_ds ? (const void *)d->pass_ds->img : NULL;
+    d->last_pass_mrt = 0;
+    for (int i = 1; i < 4; i++) d->last_pass_mrt |= (d->pass_rt[i] ? 1u : 0u) << i;
+}
+
+void re5vk_end_rendering_why(vk_device *d, const char *why)
 {
     if (!d->rendering && d->pending_clear.on) begin_rendering(d);   /* um Clear sem draw: aplica */
-    if (!d->rendering) return;
-    vkCmdEndRendering(re5vk_cmd(d));
-    pass_end_barrier(re5vk_cmd(d));   /* no-op no modo de layouts ótimos */
+    if (!d->rendering) { d->split_why = NULL; return; }
+    PTRACE(d, "fecha (%u draws) por %s", d->pass_draws, d->split_why ? d->split_why : why);
+    pass_why_count(d, why);
+    vkCmdEndRenderPass(re5vk_cmd(d));
+    re5vk_pt_end(d, re5vk_cmd(d), d->pass_draws);
+    /* Com a barreira global (modo GENERAL), o que o passe escreveu já está visível para amostrar,
+     * para o passe seguinte e para cópias: os anexos deixam de ter "escrita pendente". Sem isto, o
+     * primeiro draw que amostrasse um alvo recém-desenhado dividia o passe aberto à toa (no celular,
+     * cada divisão grava e recarrega os tiles inteiros), o que o re5vk até 10/11 não fazia. */
+    if (pass_end_barrier(re5vk_cmd(d))) {
+        for (int i = 0; i < 4; i++)
+            if (d->pass_rt[i]) sub_clean(d->pass_rt[i]->img, d->pass_rt[i]->layer, d->pass_rt[i]->level);
+        if (d->pass_ds) sub_clean(d->pass_ds->img, d->pass_ds->layer, d->pass_ds->level);
+    }
     d->rendering = 0;
+    d->deferred_why = NULL;
+    for (int i = 0; i < 4; i++) set_obj((vk_obj **)&d->pass_rt[i], NULL);
+    set_obj((vk_obj **)&d->pass_ds, NULL);
 }
 
 /* ---- render targets ---- */
@@ -280,8 +418,22 @@ static HRESULT STDMETHODCALLTYPE v_SetRenderTarget(IDirect3DDevice9 *self, DWORD
     if (s && !(s->desc.Usage & D3DUSAGE_RENDERTARGET)) return D3DERR_INVALIDCALL;
     re5vk_lock(d);
     if (d->rt[i] != s) {
-        re5vk_end_rendering(d);
-        set_obj((vk_obj **)&d->rt[i], &s->o);
+        static const char *const why[4][3] = {
+            {"SetRT:rt0->nulo", "SetRT:rt0->outro", "SetRT:rt0->de_nulo"},
+            {"SetRT:rt1->nulo", "SetRT:rt1->outro", "SetRT:rt1->de_nulo"},
+            {"SetRT:rt2->nulo", "SetRT:rt2->outro", "SetRT:rt2->de_nulo"},
+            {"SetRT:rt3->nulo", "SetRT:rt3->outro", "SetRT:rt3->de_nulo"}};
+        const char *w = why[i][!s ? 0 : !d->rt[i] ? 2 : 1];
+        PTRACE(d, "SetRT %lu surf %p img %p (aberto %d)", (unsigned long)i, (void *)s, s ? (void *)s->img : NULL, d->rendering);
+        if (lazy_rt() && !d->pending_clear.on) {
+            /* adiado: o passe aberto segue até o próximo draw/Clear; se a troca for desfeita antes, fica */
+            if (d->rendering && !d->deferred_why) d->deferred_why = w;
+        } else {
+            if (d->rendering) d->split_why = w;
+            re5vk_end_rendering(d);
+        }
+        set_obj((vk_obj **)&d->rt[i], s ? &s->o : NULL);
+        if (d->rendering && pass_matches(d)) { d->deferred_why = NULL; d->tm.lazy_kept++; }
         d->pipe_gen++;
     }
     if (i == 0) {   /* D3D9: o viewport e o scissor voltam ao alvo inteiro */
@@ -309,8 +461,16 @@ static HRESULT STDMETHODCALLTYPE v_SetDepthStencilSurface(IDirect3DDevice9 *self
     vk_surface *s = (vk_surface *)surf;
     re5vk_lock(d);
     if (d->ds != s) {
-        re5vk_end_rendering(d);
+        const char *w = !s ? "SetDS:nulo" : !d->ds ? "SetDS:de_nulo" : "SetDS:outro";
+        PTRACE(d, "SetDS surf %p img %p (aberto %d)", (void *)s, s ? (void *)s->img : NULL, d->rendering);
+        if (lazy_rt() && !d->pending_clear.on) {
+            if (d->rendering && !d->deferred_why) d->deferred_why = w;
+        } else {
+            if (d->rendering) d->split_why = w;
+            re5vk_end_rendering(d);
+        }
         set_obj((vk_obj **)&d->ds, s ? &s->o : NULL);
+        if (d->rendering && pass_matches(d)) { d->deferred_why = NULL; d->tm.lazy_kept++; }
         d->dyn_dirty = 1;
         d->pipe_gen++;
     }
@@ -377,14 +537,34 @@ static VkExtent2D target_size(vk_device *d)
     return (VkExtent2D){0, 0};
 }
 
+/* RE5VK_SKIP_SMALL_PASSES (DIAGNÓSTICO, imagem errada): não desenha nem limpa alvos pequenos (cadeias
+ * de bloom/mip, ~80 dos ~100 passes por quadro no A54), então esses passes nem abrem. =1: alvos com
+ * até 1/16 dos pixels do back buffer; =<n> > 1: até n pixels. Mede o teto de fps sem esses passes. */
+static int small_target(const vk_device *d)
+{
+    static long lim = -1;
+    if (lim < 0) {
+        const char *e = getenv("RE5VK_SKIP_SMALL_PASSES");
+        lim = e ? atol(e) : 0;
+        if (lim < 0) lim = 0;
+        if (lim) RE5_WARN("re5vk", "RE5VK_SKIP_SMALL_PASSES=%ld: alvos pequenos não são desenhados (diagnóstico)", lim);
+    }
+    if (!lim || !d->rt[0]) return 0;
+    uint64_t px = (uint64_t)d->rt[0]->desc.Width * d->rt[0]->desc.Height;
+    uint64_t max = lim == 1 ? (uint64_t)d->pp.BackBufferWidth * d->pp.BackBufferHeight / 16u : (uint64_t)lim;
+    return px <= max;
+}
+
 static HRESULT STDMETHODCALLTYPE v_Clear(IDirect3DDevice9 *self, DWORD count, const D3DRECT *rects, DWORD flags,
                                          D3DCOLOR color, float z, DWORD stencil)
 {
     vk_device *d = (vk_device *)self;
+    if (small_target(d)) return D3D_OK;
     if (!d->ds) flags &= ~(DWORD)(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
     if (d->ds && !d->ds->img->fmt->stencil) flags &= ~(DWORD)D3DCLEAR_STENCIL;
     if (!flags) return D3D_OK;
     re5vk_lock(d);
+    pass_sync(d);   /* troca de alvo adiada: o Clear é do conjunto atual */
     float c[4] = {(float)((color >> 16) & 0xFF) / 255.0f, (float)((color >> 8) & 0xFF) / 255.0f,
                   (float)(color & 0xFF) / 255.0f, (float)(color >> 24) / 255.0f};
     VkExtent2D full = target_size(d);
@@ -408,6 +588,20 @@ static HRESULT STDMETHODCALLTYPE v_Clear(IDirect3DDevice9 *self, DWORD count, co
     for (int i = 0; i < 4 && whole; i++)
         if (d->rt[i] && (d->rt[i]->desc.Width != full.width || d->rt[i]->desc.Height != full.height)) whole = 0;
     if (whole && d->ds && (d->ds->desc.Width != full.width || d->ds->desc.Height != full.height)) whole = 0;
+#if defined(__ANDROID__)
+    /* Clear(TARGET) seguido de Clear(ZBUFFER) antes do draw: junta os dois no mesmo loadOp CLEAR
+     * (sem isso o segundo abria o passe e virava vkCmdClearAttachments). O Clear mais novo vence
+     * nos aspectos que ele limpa, como no D3D9. */
+    if (whole && !d->rendering && d->pending_clear.on && d->pending_clear.flags != flags) {
+        if (flags & D3DCLEAR_TARGET)
+            for (int i = 0; i < 4; i++) memcpy(d->pending_clear.color[i], c, sizeof c);
+        if (flags & D3DCLEAR_ZBUFFER) d->pending_clear.z = z;
+        if (flags & D3DCLEAR_STENCIL) d->pending_clear.stencil = stencil;
+        d->pending_clear.flags |= flags;
+        re5vk_unlock(d);
+        return D3D_OK;
+    }
+#endif
     if (whole && !d->rendering && (!d->pending_clear.on || d->pending_clear.flags == flags)) {
         /* começo do passe: loadOp CLEAR, sem carregar os tiles (o que o Mali gosta) */
         d->pending_clear.on = 1;
@@ -453,10 +647,70 @@ static HRESULT STDMETHODCALLTYPE v_Clear(IDirect3DDevice9 *self, DWORD count, co
 
 /* ---- estados ---- */
 
+/* RE5VK_RS_LOG=1 (diagnóstico): a primeira vez de cada valor dos estados de recorte/transparência
+ * (alpha test, blend, e POINTSIZE/ADAPTIVETESS_Y, onde ficam os truques A2M1/ATOC de alpha to
+ * coverage). Para comparar o que o jogo faz no PC e no Mali. */
+static int rs_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_RS_LOG");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+/* Com RE5VK_RS_LOG=1: no primeiro draw com alpha test de cada PS, as constantes c0..c7 que o jogo
+ * mandou (calculadas pela CPU do guest: no ARM vêm do código recompilado com sse2neon). */
+static void ps_const_log(const vk_device *d, uint32_t ps_hash, int func)
+{
+    static uint32_t seen[128];
+    static int nseen;
+    if (!rs_log_on()) return;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == ps_hash) return;
+    if (nseen >= 128) return;
+    seen[nseen++] = ps_hash;
+    char buf[640];
+    int n = snprintf(buf, sizeof buf, "RS_LOG PS %08X alpha func %d ref %u:", (unsigned)ps_hash, func,
+                     (unsigned)(d->rs[D3DRS_ALPHAREF] & 0xFF));
+    for (int r = 0; r < 8 && n < (int)sizeof buf - 64; r++)
+        n += snprintf(buf + n, sizeof buf - (size_t)n, " c%d(%g %g %g %g)", r, d->psf[r][0], d->psf[r][1],
+                      d->psf[r][2], d->psf[r][3]);
+    RE5_INFO("re5vk", "%s", buf);
+}
+
+static void rs_log(D3DRENDERSTATETYPE s, DWORD v)
+{
+    static uint32_t seen[512][2];
+    static int nseen;
+    if (!rs_log_on()) return;
+    switch ((uint32_t)s) {
+    case D3DRS_ALPHATESTENABLE: case D3DRS_ALPHAREF: case D3DRS_ALPHAFUNC: case D3DRS_ALPHABLENDENABLE:
+    case D3DRS_SRCBLEND: case D3DRS_DESTBLEND: case D3DRS_POINTSIZE: case D3DRS_ADAPTIVETESS_X:
+    case D3DRS_ADAPTIVETESS_Y: case D3DRS_MULTISAMPLEANTIALIAS: case D3DRS_SRGBWRITEENABLE:
+    case D3DRS_SEPARATEALPHABLENDENABLE: case D3DRS_COLORWRITEENABLE:
+        break;
+    default:
+        return;
+    }
+    for (int i = 0; i < nseen; i++)
+        if (seen[i][0] == (uint32_t)s && seen[i][1] == v) return;
+    if (nseen < 512) {
+        seen[nseen][0] = (uint32_t)s;
+        seen[nseen][1] = v;
+        nseen++;
+    }
+    RE5_INFO("re5vk", "RS_LOG estado %u = 0x%08X ('%c%c%c%c')", (unsigned)s, (unsigned)v, (int)(v & 0x7F) >= 32 ? (int)(v & 0xFF) : '.',
+             (int)((v >> 8) & 0x7F) >= 32 ? (int)((v >> 8) & 0xFF) : '.', (int)((v >> 16) & 0x7F) >= 32 ? (int)((v >> 16) & 0xFF) : '.',
+             (int)((v >> 24) & 0x7F) >= 32 ? (int)((v >> 24) & 0xFF) : '.');
+}
+
 static HRESULT STDMETHODCALLTYPE v_SetRenderState(IDirect3DDevice9 *self, D3DRENDERSTATETYPE s, DWORD v)
 {
     vk_device *d = (vk_device *)self;
     if ((uint32_t)s >= 256) return D3DERR_INVALIDCALL;
+    rs_log(s, v);
     if (d->rs[s] == v) return D3D_OK;
     d->rs[s] = v;
     /* Só os estados que entram na chave do pipeline ou na variante do PS (prepare) refazem a
@@ -464,7 +718,11 @@ static HRESULT STDMETHODCALLTYPE v_SetRenderState(IDirect3DDevice9 *self, D3DREN
      * ALPHAREF vai no UBO. Antes todo SetRenderState com valor novo subia pipe_gen, e o draw
      * seguinte recalculava variantes, chave e hash da declaração. */
     switch (s) {
-    case D3DRS_ALPHATESTENABLE: case D3DRS_ALPHAFUNC: case D3DRS_FILLMODE: case D3DRS_ALPHABLENDENABLE:
+    case D3DRS_ALPHATESTENABLE: case D3DRS_ALPHAFUNC:
+        d->pipe_gen++;
+        d->ps_dirty = 1;
+        break;
+    case D3DRS_FILLMODE: case D3DRS_ALPHABLENDENABLE:
     case D3DRS_SRCBLEND: case D3DRS_DESTBLEND: case D3DRS_BLENDOP: case D3DRS_SEPARATEALPHABLENDENABLE:
     case D3DRS_SRCBLENDALPHA: case D3DRS_DESTBLENDALPHA: case D3DRS_BLENDOPALPHA: case D3DRS_COLORWRITEENABLE:
     case D3DRS_COLORWRITEENABLE1: case D3DRS_COLORWRITEENABLE2: case D3DRS_COLORWRITEENABLE3:
@@ -472,6 +730,13 @@ static HRESULT STDMETHODCALLTYPE v_SetRenderState(IDirect3DDevice9 *self, D3DREN
         break;
     case D3DRS_ALPHAREF:
         d->ps_dirty = 1;
+        break;
+    case D3DRS_CULLMODE: case D3DRS_ZENABLE: case D3DRS_ZWRITEENABLE: case D3DRS_ZFUNC: case D3DRS_STENCILENABLE:
+    case D3DRS_STENCILFAIL: case D3DRS_STENCILPASS: case D3DRS_STENCILZFAIL: case D3DRS_STENCILFUNC:
+    case D3DRS_TWOSIDEDSTENCILMODE: case D3DRS_CCW_STENCILFAIL: case D3DRS_CCW_STENCILPASS:
+    case D3DRS_CCW_STENCILZFAIL: case D3DRS_CCW_STENCILFUNC: case D3DRS_DEPTHBIAS: case D3DRS_SLOPESCALEDEPTHBIAS:
+        if (d->core) d->pipe_gen++;   /* modo Vulkan 1.1: vão na chave do pipeline */
+        d->dyn_dirty = 1;
         break;
     default:
         d->dyn_dirty = 1;
@@ -493,7 +758,7 @@ static HRESULT STDMETHODCALLTYPE v_SetSamplerState(IDirect3DDevice9 *self, DWORD
     if (d->ss[s][t] != v) {
         d->ss[s][t] = v;
         d->desc_dirty = 1;
-        d->smp_cache[s][0] = d->smp_cache[s][1] = VK_NULL_HANDLE;
+        memset(d->smp_cache[s], 0, sizeof d->smp_cache[s]);
     }
     return D3D_OK;
 }
@@ -536,6 +801,7 @@ static HRESULT STDMETHODCALLTYPE v_SetStreamSource(IDirect3DDevice9 *self, UINT 
     if (i >= 16) return D3DERR_INVALIDCALL;
     re5vk_lock(d);
     set_obj((vk_obj **)&d->streams[i].vb, (vk_obj *)vb);
+    if (d->streams[i].stride != stride) d->pipe_gen++;   /* o stride entra na chave do pipeline */
     d->streams[i].off = off;
     d->streams[i].stride = stride;
     re5vk_unlock(d);
@@ -693,11 +959,65 @@ static VkSamplerAddressMode address_of(DWORD a)
     }
 }
 
-static VkSampler sampler_get(vk_device *d, int s, int compare)
+/* O formato aceita filtro linear nesta GPU? No Mali os float de 32 bits (R32F, A32B32G32R32F: texturas
+ * de vértice da animação facial, mapas de sombra) não aceitam, e amostrar com LINEAR é indefinido: o
+ * Mali devolvia lixo (listras pretas saindo da cabeça dos personagens, luz e sombra erradas). O Intel
+ * filtra float de 32 bits, por isso o PC não mostrava. Como a DXVK: cai para NEAREST. */
+static int format_linear(vk_device *d, VkFormat f)
 {
-    uint32_t key[14];
+    static int8_t memo[256];   /* 0 = não consultado, 1 = sim, 2 = não */
+    if ((uint32_t)f < 256 && memo[f]) return memo[f] == 1;
+    VkFormatProperties p;
+    vkGetPhysicalDeviceFormatProperties(d->phys, f, &p);
+    int ok = !!(p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+    if ((uint32_t)f < 256) {
+        memo[f] = ok ? 1 : 2;
+        if (!ok) RE5_INFO("re5vk", "formato Vulkan %d sem filtro linear nesta GPU: amostrado com NEAREST", (int)f);
+    }
+    return ok;
+}
+
+/* RE5VK_VTX_NEAREST=0 desliga. Textura de vertice (animacao facial: texldl nos VS de skinning) sempre
+ * com NEAREST: o D3D9 em hardware so garante amostragem por ponto em textura de vertice, e o filtro
+ * linear em float16/32 no estagio de vertice do Mali e a suspeita da linha atravessando a cabeca.
+ * CONTORNO ate o teste no celular. */
+static int vtx_nearest(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_VTX_NEAREST");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static int static_stride_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_STATIC_STRIDE");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static int stage_note_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_STAGE_NOTE");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static VkSampler sampler_get(vk_device *d, int s, int compare, int multimip, int nolin)
+{
+    uint32_t key[16];
     memcpy(key, d->ss[s], 13 * 4);
     key[13] = (uint32_t)compare;
+    key[14] = (uint32_t)multimip;
+    key[15] = (uint32_t)nolin;
     for (uint32_t i = 0; i < d->nsamplers; i++)
         if (!memcmp(d->samplers[i].key, key, sizeof key)) return d->samplers[i].s;
     const DWORD *st = d->ss[s];
@@ -710,20 +1030,21 @@ static VkSampler sampler_get(vk_device *d, int s, int compare)
     float minlod = (float)st[D3DSAMP_MAXMIPLEVEL];
     VkSamplerCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = filter_of(st[D3DSAMP_MAGFILTER]),
-        .minFilter = filter_of(st[D3DSAMP_MINFILTER]),
-        .mipmapMode = st[D3DSAMP_MIPFILTER] == D3DTEXF_LINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-                                                              : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .magFilter = nolin ? VK_FILTER_NEAREST : filter_of(st[D3DSAMP_MAGFILTER]),
+        .minFilter = nolin ? VK_FILTER_NEAREST : filter_of(st[D3DSAMP_MINFILTER]),
+        .mipmapMode = (!multimip || nolin) ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                     : (st[D3DSAMP_MIPFILTER] == D3DTEXF_LINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                                                                : VK_SAMPLER_MIPMAP_MODE_NEAREST),
         .addressModeU = address_of(st[D3DSAMP_ADDRESSU]),
         .addressModeV = address_of(st[D3DSAMP_ADDRESSV]),
         .addressModeW = address_of(st[D3DSAMP_ADDRESSW]),
-        .mipLodBias = f_of(st[D3DSAMP_MIPMAPLODBIAS]),
-        .anisotropyEnable = aniso && maxa > 1.0f,
+        .mipLodBias = !multimip ? 0.0f : f_of(st[D3DSAMP_MIPMAPLODBIAS]),
+        .anisotropyEnable = multimip && aniso && maxa > 1.0f && !nolin,
         .maxAnisotropy = maxa < 1.0f ? 1.0f : maxa,
         .compareEnable = compare ? VK_TRUE : VK_FALSE,
         .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
-        .minLod = minlod,
-        .maxLod = st[D3DSAMP_MIPFILTER] == D3DTEXF_NONE ? minlod + 0.25f : VK_LOD_CLAMP_NONE,
+        .minLod = !multimip ? 0.0f : minlod,
+        .maxLod = !multimip ? 1.0f : (st[D3DSAMP_MIPFILTER] == D3DTEXF_NONE ? minlod + 0.25f : VK_LOD_CLAMP_NONE),
         .borderColor = border,
     };
     VkSampler smp;
@@ -738,10 +1059,10 @@ static VkSampler sampler_get(vk_device *d, int s, int compare)
     return smp;
 }
 
-static VkSampler sampler_cached(vk_device *d, int s, int compare)
+static VkSampler sampler_cached(vk_device *d, int s, int compare, int multimip, int nolin)
 {
-    VkSampler *p = &d->smp_cache[s][compare != 0];
-    if (!*p) *p = sampler_get(d, s, compare);
+    VkSampler *p = &d->smp_cache[s][compare != 0][multimip != 0][nolin != 0];
+    if (!*p) *p = sampler_get(d, s, compare, multimip, nolin);
     return *p;
 }
 
@@ -781,32 +1102,107 @@ static struct vk_set_cache_entry *set_cache_slot(vk_device *d, const uint64_t *k
 static VkFormat vertex_format(BYTE type);
 
 /* Formato do atributo para a GPU. Os *SCALED (inteiro lido como float) são opcionais no Vulkan e
- * o Adreno não os tem: nesse caso o atributo vai como UINT/SINT e o VS converte (variante
- * in_uint/in_sint). *intk: 0 float, 1 sem sinal, 2 com sinal. */
+ * o Adreno não os tem: nesse caso o atributo vai como UINT/SINT (ou R32_UINT para UDEC3) e o VS
+ * converte (variante in_uint/in_sint/in_udec3). *intk: 0 float, 1 uint, 2 sint, 3 udec3 packed. */
 static VkFormat vertex_format_dev(vk_device *d, BYTE type, int *intk)
 {
-    VkFormat vf = vertex_format(type), alt = VK_FORMAT_UNDEFINED;
-    int k = 0;
     *intk = 0;
+    VkFormat vf = vertex_format(type);
+    if (vf == VK_FORMAT_UNDEFINED) return VK_FORMAT_UNDEFINED;
+
+    static struct {
+        VkFormat fmt;
+        int intk;
+        int8_t status; /* 0: não consultado, 1: resolvido */
+    } dev_cache[32];
+
+    if (type < 32 && dev_cache[type].status == 1) {
+        *intk = dev_cache[type].intk;
+        return dev_cache[type].fmt;
+    }
+
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(d->phys, vf, &fp);
+    RE5_INFO("re5vk", "D3DDECLTYPE %u -> formato Vulkan %d: %s", (unsigned)type, (int)vf,
+             (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? "suportado" : "SEM suporte");
+    if (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+        if (type < 32) {
+            dev_cache[type].fmt = vf;
+            dev_cache[type].intk = 0;
+            dev_cache[type].status = 1;
+        }
+        return vf;
+    }
+
+    VkFormat chosen = VK_FORMAT_UNDEFINED;
+    int chosen_intk = 0;
+
     switch (type) {
-    case D3DDECLTYPE_UBYTE4: alt = VK_FORMAT_R8G8B8A8_UINT; k = 1; break;
-    case D3DDECLTYPE_SHORT2: alt = VK_FORMAT_R16G16_SINT; k = 2; break;
-    case D3DDECLTYPE_SHORT4: alt = VK_FORMAT_R16G16B16A16_SINT; k = 2; break;
-    case D3DDECLTYPE_UDEC3: alt = VK_FORMAT_A2B10G10R10_UINT_PACK32; k = 1; break;
-    default: return vf;
+    case D3DDECLTYPE_UBYTE4:
+        vkGetPhysicalDeviceFormatProperties(d->phys, VK_FORMAT_R8G8B8A8_UINT, &fp);
+        if (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+            chosen = VK_FORMAT_R8G8B8A8_UINT;
+            chosen_intk = 1;
+        }
+        break;
+
+    case D3DDECLTYPE_SHORT2:
+        vkGetPhysicalDeviceFormatProperties(d->phys, VK_FORMAT_R16G16_SINT, &fp);
+        if (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+            chosen = VK_FORMAT_R16G16_SINT;
+            chosen_intk = 2;
+        }
+        break;
+
+    case D3DDECLTYPE_SHORT4:
+        vkGetPhysicalDeviceFormatProperties(d->phys, VK_FORMAT_R16G16B16A16_SINT, &fp);
+        if (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+            chosen = VK_FORMAT_R16G16B16A16_SINT;
+            chosen_intk = 2;
+        }
+        break;
+
+    case D3DDECLTYPE_UDEC3:
+        /* Tenta UINT_PACK32 primeiro */
+        vkGetPhysicalDeviceFormatProperties(d->phys, VK_FORMAT_A2B10G10R10_UINT_PACK32, &fp);
+        if (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+            chosen = VK_FORMAT_A2B10G10R10_UINT_PACK32;
+            chosen_intk = 1;
+        } else {
+            /* Fallback R32_UINT: mandatório em Vulkan, mesmo tamanho (4 bytes), desempacota 10-10-10-2 no VS */
+            vkGetPhysicalDeviceFormatProperties(d->phys, VK_FORMAT_R32_UINT, &fp);
+            if (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+                chosen = VK_FORMAT_R32_UINT;
+                chosen_intk = 3;
+            }
+        }
+        break;
+
+    default:
+        break;
     }
-    static int8_t scaled_ok[32];   /* por D3DDECLTYPE: 0 não sabido, 1 sim, -1 não (um device só) */
-    if (!scaled_ok[type]) {
-        VkFormatProperties fp;
-        vkGetPhysicalDeviceFormatProperties(d->phys, vf, &fp);
-        scaled_ok[type] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : -1;
-        if (scaled_ok[type] < 0)
-            RE5_INFO("re5vk", "D3DDECLTYPE %u: sem o formato SCALED %d, vai como inteiro (%d) e o VS converte",
-                     (unsigned)type, (int)vf, (int)alt);
+
+    if (chosen != VK_FORMAT_UNDEFINED) {
+        RE5_INFO("re5vk", "D3DDECLTYPE %u: sem suporte a %d, usando fallback %d (intk=%d)",
+                 (unsigned)type, (int)vf, (int)chosen, chosen_intk);
+        if (type < 32) {
+            dev_cache[type].fmt = chosen;
+            dev_cache[type].intk = chosen_intk;
+            dev_cache[type].status = 1;
+        }
+        *intk = chosen_intk;
+        return chosen;
     }
-    if (scaled_ok[type] > 0) return vf;
-    *intk = k;
-    return alt;
+
+    /* Sem suporte e sem fallback: o atributo chegaria com lixo (comportamento indefinido no Vulkan). */
+    RE5_ERROR("re5vk", "D3DDECLTYPE %u: formato Vulkan %d sem suporte a vertex buffer nesta GPU e sem fallback",
+              (unsigned)type, (int)vf);
+    if (type < 32) {
+        dev_cache[type].fmt = vf;
+        dev_cache[type].intk = 0;
+        dev_cache[type].status = 1;
+    }
+    return vf;
 }
 
 /* Elemento da declaração que alimenta o v<r> do VS (pela semântica). */
@@ -879,13 +1275,45 @@ typedef struct {
     uint32_t vs_hash, vs_len, ps_hash, ps_len;
     re5vk_dxso_variant vsv, psv;
     uint32_t decl_hash;
+    uint32_t stride[16];        /* stride de cada stream usado pela declaracao (vai estatico no pipeline) */
     uint32_t topo_class;        /* 0 pontos, 1 linhas, 2 triângulos */
     uint32_t fill;
     uint32_t blend[6];          /* enable, src, dst, op, srca, dsta/opa empacotados */
     uint32_t write[4];
     VkFormat color[4], depth;
     uint8_t stencil;
+    /* modo Vulkan 1.1 (d->core): estado que o EDS deixaria dinâmico; zero fora dele */
+    uint8_t c_cull, c_ztest, c_zwrite, c_zop, c_stencil, c_two, c_bias, c_pad;
+    uint32_t c_sops;            /* frente: fail|pass<<4|zfail<<8|func<<12; trás: o mesmo <<16 */
 } pipe_key;
+
+/* Estado de rasterização/profundidade do D3D9 no formato do Vulkan (o mesmo do set_dynamic). */
+static VkStencilOp stencil_op(DWORD o);
+static VkCompareOp cmp_op(DWORD f);
+static void core_state(const vk_device *d, pipe_key *k)
+{
+    DWORD cull = d->rs[D3DRS_CULLMODE];
+    k->c_cull = (uint8_t)(cull == D3DCULL_CCW ? VK_CULL_MODE_BACK_BIT : cull == D3DCULL_CW ? VK_CULL_MODE_FRONT_BIT
+                                                                                          : VK_CULL_MODE_NONE);
+    int has_depth = d->ds != NULL;
+    k->c_ztest = (has_depth && d->rs[D3DRS_ZENABLE] != D3DZB_FALSE) ? 1 : 0;
+    k->c_zwrite = (k->c_ztest && d->rs[D3DRS_ZWRITEENABLE]) ? 1 : 0;
+    k->c_zop = k->c_ztest ? (uint8_t)cmp_op(d->rs[D3DRS_ZFUNC]) : 0;   /* sem teste, o op não importa */
+    k->c_stencil = (has_depth && d->ds->img->fmt->stencil && d->rs[D3DRS_STENCILENABLE]) ? 1 : 0;
+    if (k->c_stencil) {
+        k->c_two = d->rs[D3DRS_TWOSIDEDSTENCILMODE] ? 1 : 0;
+        uint32_t f = (uint32_t)stencil_op(d->rs[D3DRS_STENCILFAIL]) | (uint32_t)stencil_op(d->rs[D3DRS_STENCILPASS]) << 4 |
+                     (uint32_t)stencil_op(d->rs[D3DRS_STENCILZFAIL]) << 8 | (uint32_t)cmp_op(d->rs[D3DRS_STENCILFUNC]) << 12;
+        uint32_t b = k->c_two ? ((uint32_t)stencil_op(d->rs[D3DRS_CCW_STENCILFAIL]) |
+                                 (uint32_t)stencil_op(d->rs[D3DRS_CCW_STENCILPASS]) << 4 |
+                                 (uint32_t)stencil_op(d->rs[D3DRS_CCW_STENCILZFAIL]) << 8 |
+                                 (uint32_t)cmp_op(d->rs[D3DRS_CCW_STENCILFUNC]) << 12)
+                              : f;
+        k->c_sops = f | b << 16;
+    }
+    float bias = f_of(d->rs[D3DRS_DEPTHBIAS]), slope = f_of(d->rs[D3DRS_SLOPESCALEDEPTHBIAS]);
+    k->c_bias = (has_depth && (bias != 0.0f || slope != 0.0f)) ? 1 : 0;
+}
 
 static uint64_t key_hash(const pipe_key *k)
 {
@@ -953,8 +1381,23 @@ static int format_blends(vk_device *d, VkFormat f)
     return !!(p.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
 }
 
+/* RE5VK_MASKED_KILL=1 liga (experimento). Com a escrita de cor toda mascarada (passada só de profundidade), o
+ * driver do Mali pula o fragment shader, e com ele o discard do alpha test/texkill: a profundidade do
+ * quad inteiro fica gravada, e o que está atrás das folhas, da cerca de arame e do cabelo some (sobra
+ * o fundo preto). Confirmado no A54 com RE5VK_SKIP_NOCOLOR=1. Nesses draws, a escrita fica ligada com
+ * blend ZERO/ONE (a cor no alvo não muda) e o shader roda. */
+static int masked_kill_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_MASKED_KILL");
+        on = e && *e == '1';   /* não resolveu no A54 (2026-11-18): só com =1 */
+    }
+    return on;
+}
+
 static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModule vsm, const re5vk_shader *vsi,
-                                  VkShaderModule psm)
+                                  VkShaderModule psm, const re5vk_shader *psi)
 {
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -977,8 +1420,9 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
         }
         int intk;
         VkFormat vf = vertex_format_dev(d, e->Type, &intk);
-        if (intk != ((k->vsv.in_uint >> r & 1) ? 1 : (k->vsv.in_sint >> r & 1) ? 2 : 0))
-            re5_fatal("re5vk", "v%u: variante do VS não bate com o formato de vértice", r);
+        int expected_intk = (k->vsv.in_uint >> r & 1) ? 1 : (k->vsv.in_sint >> r & 1) ? 2 : (k->vsv.in_udec3 >> r & 1) ? 3 : 0;
+        if (intk != expected_intk)
+            re5_fatal("re5vk", "v%u: variante do VS não bate com o formato de vértice (intk=%d vs %d)", r, intk, expected_intk);
         if (vf == VK_FORMAT_UNDEFINED) re5_fatal("re5vk", "D3DDECLTYPE %u sem tradução", (unsigned)e->Type);
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(d->phys, vf, &fp);
@@ -989,7 +1433,13 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
         used_streams |= 1u << e->Stream;
     }
     for (uint32_t s = 0; s < 15; s++)
-        if (used_streams >> s & 1) bind[nb++] = (VkVertexInputBindingDescription){s, 0, VK_VERTEX_INPUT_RATE_VERTEX};
+        if (used_streams >> s & 1) {
+            /* Stride tambem estatico (o valor do draw que cria o pipeline): com o estado dinamico ele e
+             * ignorado, mas um driver Mali que so respeita o stride dinamico no binding 0 leria o stream 1
+             * (tangente, UV2 das cabecas) com stride 0 = mesmo vertice para todos. RE5VK_STATIC_STRIDE=0 tira. */
+            uint32_t st = (static_stride_on() || d->core) ? k->stride[s] : 0u;
+            bind[nb++] = (VkVertexInputBindingDescription){s, st, VK_VERTEX_INPUT_RATE_VERTEX};
+        }
     if (need_zero) bind[nb++] = (VkVertexInputBindingDescription){15, 0, VK_VERTEX_INPUT_RATE_VERTEX};
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
                                                .vertexBindingDescriptionCount = nb, .pVertexBindingDescriptions = bind,
@@ -997,7 +1447,9 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
     static const VkPrimitiveTopology cls[3] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
                                                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                                 .topology = cls[k->topo_class]};
+                                                 .topology = k->topo_class >= 100 ? (VkPrimitiveTopology)(k->topo_class - 100)
+                                                                                  : cls[k->topo_class],
+                                                 .primitiveRestartEnable = VK_FALSE};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
                                             .viewportCount = 1, .scissorCount = 1};
     VkPipelineRasterizationStateCreateInfo rs = {
@@ -1005,11 +1457,35 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
         .polygonMode = k->fill == D3DFILL_WIREFRAME ? VK_POLYGON_MODE_LINE
                      : k->fill == D3DFILL_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL,
         .lineWidth = 1.0f,
+        .depthBiasEnable = d->core ? k->c_bias : d->has_eds2 ? VK_FALSE : VK_TRUE,
+        .cullMode = d->core ? k->c_cull : VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+        .rasterizerDiscardEnable = VK_FALSE,
     };
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    /* Máscaras de stencil não-zero no estado estático, mesmo sendo dinâmicas: driver da ARM antes do
+     * r43 quebra o estado dinâmico com discard quando a máscara estática de escrita é 0 (ANGLE,
+     * useNonZeroStencilWriteMaskStaticState, anglebug 7556). O valor real vem do estado dinâmico. */
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                                                .front = {.compareMask = 0xFF, .writeMask = 0xFF},
+                                                .back = {.compareMask = 0xFF, .writeMask = 0xFF},
                                                 .maxDepthBounds = 1.0f};
+    if (d->core) {
+        ds.depthTestEnable = k->c_ztest;
+        ds.depthWriteEnable = k->c_zwrite;
+        ds.depthCompareOp = (VkCompareOp)k->c_zop;
+        ds.stencilTestEnable = k->c_stencil;
+        uint32_t f = k->c_sops & 0xFFFF, b = k->c_sops >> 16;
+        ds.front.failOp = (VkStencilOp)(f & 15);
+        ds.front.passOp = (VkStencilOp)(f >> 4 & 15);
+        ds.front.depthFailOp = (VkStencilOp)(f >> 8 & 15);
+        ds.front.compareOp = (VkCompareOp)(f >> 12 & 15);
+        ds.back.failOp = (VkStencilOp)(b & 15);
+        ds.back.passOp = (VkStencilOp)(b >> 4 & 15);
+        ds.back.depthFailOp = (VkStencilOp)(b >> 8 & 15);
+        ds.back.compareOp = (VkCompareOp)(b >> 12 & 15);
+    }
     VkPipelineColorBlendAttachmentState cb[4];
     uint32_t ncol = 0;
     for (uint32_t i = 0; i < 4; i++) {
@@ -1034,6 +1510,32 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
             }
         }
     }
+    if (rs_log_on()) {   /* draws sem escrita de cor: o que a correção do discard vê */
+        int any_w = 0;
+        for (uint32_t i = 0; i < ncol; i++) any_w |= cb[i].colorWriteMask != 0;
+        if (!any_w) {
+            static int n;
+            if (n++ < 40)
+                RE5_INFO("re5vk", "RS_LOG sem cor: ps %08X kill %d alpha %d ncol %u rt0 %d blends %d depth %d write0 %u",
+                         (unsigned)k->ps_hash, psi ? psi->uses_kill : -1, (int)k->psv.alpha_func, ncol,
+                         (int)k->color[0], k->color[0] ? format_blends(d, k->color[0]) : -1, (int)k->depth,
+                         (unsigned)k->write[0]);
+        }
+    }
+    if (psi && psi->uses_kill && masked_kill_fix() && ncol) {
+        int any_write = 0;
+        for (uint32_t i = 0; i < ncol; i++) any_write |= cb[i].colorWriteMask != 0;
+        for (uint32_t i = 0; !any_write && i < ncol; i++) {
+            if (k->color[i] == VK_FORMAT_UNDEFINED || !format_blends(d, k->color[i])) continue;
+            cb[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                                   VK_COLOR_COMPONENT_A_BIT;
+            cb[i].blendEnable = VK_TRUE;
+            cb[i].srcColorBlendFactor = cb[i].srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            cb[i].dstColorBlendFactor = cb[i].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cb[i].colorBlendOp = cb[i].alphaBlendOp = VK_BLEND_OP_ADD;
+            break;
+        }
+    }
     VkPipelineColorBlendStateCreateInfo bs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                               .attachmentCount = ncol, .pAttachments = cb};
     static const VkDynamicState dyn[] = {
@@ -1046,15 +1548,21 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
         VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
     };
+    /* núcleo 1.0: viewport, scissor, depth bias, blend constants e máscaras/referência do stencil */
+    static const VkDynamicState dyn_core[] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+    };
+    uint32_t dyn_count = d->core ? (uint32_t)(sizeof dyn_core / sizeof dyn_core[0])
+                       : d->has_eds2 ? (uint32_t)(sizeof dyn / sizeof dyn[0]) : 17u;
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-                                           .dynamicStateCount = sizeof dyn / sizeof dyn[0], .pDynamicStates = dyn};
-    VkPipelineRenderingCreateInfo rinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-                                           .colorAttachmentCount = ncol, .pColorAttachmentFormats = k->color,
-                                           .depthAttachmentFormat = k->depth,
-                                           .stencilAttachmentFormat = k->stencil ? k->depth : VK_FORMAT_UNDEFINED};
+                                           .dynamicStateCount = dyn_count, .pDynamicStates = d->core ? dyn_core : dyn};
+    /* Qualquer passe com os mesmos formatos é compatível (ops e layouts não contam). */
     VkGraphicsPipelineCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = &rinfo,
+        .renderPass = re5_vkn_compat_pass(ncol, k->color, k->depth, k->stencil),
+        .subpass = 0,
         .stageCount = 2,
         .pStages = stages,
         .pVertexInputState = &vi,
@@ -1069,6 +1577,9 @@ static VkPipeline pipeline_create(vk_device *d, const pipe_key *k, VkShaderModul
     };
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(d->dev, d->pcache, 1, &ci, NULL, &p));
+    /* Conta para o pcache_save: sem isto o contador ficava em 0 e o cache de pipelines nunca era
+     * gravado (toda abertura recompilava tudo: carregamento longo e engasgos). */
+    d->npipes++;
     return p;
 }
 
@@ -1095,15 +1606,17 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
     VkPrimitiveTopology t = topology(pt);
     int force = !d->dyn_valid;
 
-    if (force || d->bound_dyn.topo != t) {
+    if (!d->core && (force || d->bound_dyn.topo != t)) {
         vkCmdSetPrimitiveTopology(cb, t);
         d->bound_dyn.topo = t;
     }
-    if (force) {
+    if (force && !d->core) {
         vkCmdSetFrontFace(cb, VK_FRONT_FACE_CLOCKWISE);
         vkCmdSetDepthBoundsTestEnable(cb, VK_FALSE);
-        vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
-        vkCmdSetRasterizerDiscardEnable(cb, VK_FALSE);
+        if (d->has_eds2) {
+            vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
+            vkCmdSetRasterizerDiscardEnable(cb, VK_FALSE);
+        }
     }
 
     /* Sempre confere o scissor contra d->render_area mesmo se !dyn_dirty (novo passe pode ter área diferente) */
@@ -1133,7 +1646,7 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
     DWORD cull = RS(d, D3DRS_CULLMODE);
     VkCullModeFlags cm = cull == D3DCULL_CCW ? VK_CULL_MODE_BACK_BIT : cull == D3DCULL_CW ? VK_CULL_MODE_FRONT_BIT
                                                                                           : VK_CULL_MODE_NONE;
-    if (force || d->bound_dyn.cull != cm) {
+    if (!d->core && (force || d->bound_dyn.cull != cm)) {
         vkCmdSetCullMode(cb, cm);
         d->bound_dyn.cull = cm;
     }
@@ -1142,21 +1655,21 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
     VkBool32 ztest = (has_depth && RS(d, D3DRS_ZENABLE) != D3DZB_FALSE) ? VK_TRUE : VK_FALSE;
     VkBool32 zwrite = (ztest && RS(d, D3DRS_ZWRITEENABLE)) ? VK_TRUE : VK_FALSE;
     VkCompareOp zop = cmp_op(RS(d, D3DRS_ZFUNC));
-    if (force || d->bound_dyn.depth_test != ztest) {
+    if (!d->core && (force || d->bound_dyn.depth_test != ztest)) {
         vkCmdSetDepthTestEnable(cb, ztest);
         d->bound_dyn.depth_test = ztest;
     }
-    if (force || d->bound_dyn.depth_write != zwrite) {
+    if (!d->core && (force || d->bound_dyn.depth_write != zwrite)) {
         vkCmdSetDepthWriteEnable(cb, zwrite);
         d->bound_dyn.depth_write = zwrite;
     }
-    if (force || d->bound_dyn.depth_op != zop) {
+    if (!d->core && (force || d->bound_dyn.depth_op != zop)) {
         vkCmdSetDepthCompareOp(cb, zop);
         d->bound_dyn.depth_op = zop;
     }
 
     VkBool32 stencil = (has_depth && d->ds->img->fmt->stencil && RS(d, D3DRS_STENCILENABLE)) ? VK_TRUE : VK_FALSE;
-    if (force || d->bound_dyn.stencil_test != stencil) {
+    if (!d->core && (force || d->bound_dyn.stencil_test != stencil)) {
         vkCmdSetStencilTestEnable(cb, stencil);
         d->bound_dyn.stencil_test = stencil;
     }
@@ -1167,15 +1680,15 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
         VkStencilOp sf_p = stencil_op(RS(d, D3DRS_STENCILPASS));
         VkStencilOp sf_z = stencil_op(RS(d, D3DRS_STENCILZFAIL));
         VkCompareOp sf_c = cmp_op(RS(d, D3DRS_STENCILFUNC));
-        if (force || d->bound_dyn.stencil_two_sided != two || d->bound_dyn.sf_fail != sf_f ||
-            d->bound_dyn.sf_pass != sf_p || d->bound_dyn.sf_zfail != sf_z || d->bound_dyn.sf_func != sf_c) {
+        if (!d->core && (force || d->bound_dyn.stencil_two_sided != two || d->bound_dyn.sf_fail != sf_f ||
+            d->bound_dyn.sf_pass != sf_p || d->bound_dyn.sf_zfail != sf_z || d->bound_dyn.sf_func != sf_c)) {
             vkCmdSetStencilOp(cb, two ? VK_STENCIL_FACE_FRONT_BIT : both, sf_f, sf_p, sf_z, sf_c);
             d->bound_dyn.sf_fail = sf_f;
             d->bound_dyn.sf_pass = sf_p;
             d->bound_dyn.sf_zfail = sf_z;
             d->bound_dyn.sf_func = sf_c;
         }
-        if (two) {
+        if (two && !d->core) {
             VkStencilOp sb_f = stencil_op(RS(d, D3DRS_CCW_STENCILFAIL));
             VkStencilOp sb_p = stencil_op(RS(d, D3DRS_CCW_STENCILPASS));
             VkStencilOp sb_z = stencil_op(RS(d, D3DRS_CCW_STENCILZFAIL));
@@ -1208,7 +1721,7 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
     /* depth bias: o do D3D9 é em unidades de profundidade; o do Vulkan, no menor degrau do formato */
     float bias = f_of(RS(d, D3DRS_DEPTHBIAS)), slope = f_of(RS(d, D3DRS_SLOPESCALEDEPTHBIAS));
     VkBool32 bias_on = (has_depth && (bias != 0.0f || slope != 0.0f)) ? VK_TRUE : VK_FALSE;
-    if (force || d->bound_dyn.bias_on != bias_on) {
+    if (d->has_eds2 && (force || d->bound_dyn.bias_on != bias_on)) {
         vkCmdSetDepthBiasEnable(cb, bias_on);
         d->bound_dyn.bias_on = bias_on;
     }
@@ -1221,10 +1734,12 @@ static void set_dynamic(vk_device *d, D3DPRIMITIVETYPE pt)
             d->bound_dyn.depth_bias = vb;
             d->bound_dyn.depth_slope = slope;
         }
-    } else if (force) {
-        vkCmdSetDepthBias(cb, 0.0f, 0.0f, 0.0f);
-        d->bound_dyn.depth_bias = 0.0f;
-        d->bound_dyn.depth_slope = 0.0f;
+    } else if (force || !d->has_eds2) {
+        if (force || d->bound_dyn.depth_bias != 0.0f || d->bound_dyn.depth_slope != 0.0f) {
+            vkCmdSetDepthBias(cb, 0.0f, 0.0f, 0.0f);
+            d->bound_dyn.depth_bias = 0.0f;
+            d->bound_dyn.depth_slope = 0.0f;
+        }
     }
 
     DWORD bf = RS(d, D3DRS_BLENDFACTOR);
@@ -1258,21 +1773,63 @@ static int img_is_attached(const vk_device *d, const vk_image *im)
     return 0;
 }
 
-static void upload_ubos(vk_device *d, const re5vk_shader *vsi, const re5vk_shader *psi, uint8_t vs_ib, uint8_t ps_ib)
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+static inline void copy_floats_flush_nan(void *dst, const void *src, size_t count_vec4)
 {
-    if (d->vs_dirty || vsi->const_f > d->vs_ubo_f || (vs_ib & ~d->vs_ubo_ib)) {
-        uint8_t *u = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
-        memcpy(u, d->vsf, (size_t)vsi->const_f * 16u);
-        if (vsi->uses_i) memcpy(u + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
-        if (vsi->uses_b) memcpy(u + RE5VK_VS_UBO_B, &d->vsb, 4);
-        d->vs_ubo_f = vsi->const_f;
-        d->vs_ubo_ib = vs_ib;
-        d->vs_dirty = 0;
+    float32x4_t *d = (float32x4_t *)dst;
+    const float32x4_t *s = (const float32x4_t *)src;
+    for (size_t i = 0; i < count_vec4; i++) {
+        float32x4_t v = s[i];
+        uint32x4_t mask = vceqq_f32(v, v);
+        d[i] = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(v), mask));
     }
-    if (d->ps_dirty || psi->const_f > d->ps_ubo_f || (ps_ib & ~d->ps_ubo_ib)) {
+}
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+static inline void copy_floats_flush_nan(void *dst, const void *src, size_t count_vec4)
+{
+    __m128 *d = (__m128 *)dst;
+    const __m128 *s = (const __m128 *)src;
+    for (size_t i = 0; i < count_vec4; i++) {
+        __m128 v = _mm_loadu_ps((const float *)&s[i]);
+        __m128 mask = _mm_cmpeq_ps(v, v);
+        _mm_storeu_ps((float *)&d[i], _mm_and_ps(v, mask));
+    }
+}
+#else
+#include <math.h>
+static inline void copy_floats_flush_nan(void *dst, const void *src, size_t count_vec4)
+{
+    float *d = (float *)dst;
+    const float *s = (const float *)src;
+    size_t n = count_vec4 * 4;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = isnan(s[i]) ? 0.0f : s[i];
+    }
+}
+#endif
+
+static void upload_vs_ubo(vk_device *d, const re5vk_shader *vsi, uint8_t vs_ib)
+{
+    uint8_t *u = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
+    copy_floats_flush_nan(u, d->vsf, (size_t)vsi->const_f);
+    if (vsi->uses_i) memcpy(u + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
+    if (vsi->uses_b) memcpy(u + RE5VK_VS_UBO_B, &d->vsb, 4);
+    d->vs_ubo_f = vsi->const_f;
+    d->vs_ubo_ib = vs_ib;
+    d->vs_dirty = 0;
+}
+
+/* force = 1: os dois blocos de novo, no anel do envio corrente (depois de um flush no meio do draw). */
+static void upload_ubos(vk_device *d, const re5vk_shader *vsi, const re5vk_shader *psi, uint8_t vs_ib, uint8_t ps_ib,
+                        int force)
+{
+    if (force || d->vs_dirty || vsi->const_f > d->vs_ubo_f || (vs_ib & ~d->vs_ubo_ib)) upload_vs_ubo(d, vsi, vs_ib);
+    if (force || d->ps_dirty || psi->const_f > d->ps_ubo_f || (ps_ib & ~d->ps_ubo_ib)) {
         uint64_t ser = d->serial;
         uint8_t *u = re5vk_ubo(d, RE5VK_PS_UBO_SIZE, &d->ps_ubo_buf, &d->ps_ubo_off);
-        memcpy(u, d->psf, (size_t)psi->const_f * 16u);
+        copy_floats_flush_nan(u, d->psf, (size_t)psi->const_f);
         if (psi->uses_i) memcpy(u + RE5VK_PS_UBO_I, d->psi, sizeof d->psi);
         if (psi->uses_b) memcpy(u + RE5VK_PS_UBO_B, &d->psb, 4);
         float aref = (float)(RS(d, D3DRS_ALPHAREF) & 0xFF) / 255.0f;
@@ -1280,21 +1837,52 @@ static void upload_ubos(vk_device *d, const re5vk_shader *vsi, const re5vk_shade
         d->ps_ubo_f = psi->const_f;
         d->ps_ubo_ib = ps_ib;
         d->ps_dirty = 0;
-        if (d->serial != ser && d->vs_dirty) {
-            /* PS UBO encheu o anel e disparou flush: reenvia VS UBO no novo slot. */
-            uint8_t *vu = re5vk_ubo(d, RE5VK_VS_UBO_SIZE, &d->vs_ubo_buf, &d->vs_ubo_off);
-            memcpy(vu, d->vsf, (size_t)vsi->const_f * 16u);
-            if (vsi->uses_i) memcpy(vu + RE5VK_VS_UBO_I, d->vsi, sizeof d->vsi);
-            if (vsi->uses_b) memcpy(vu + RE5VK_VS_UBO_B, &d->vsb, 4);
-            d->vs_ubo_f = vsi->const_f;
-            d->vs_ubo_ib = vs_ib;
-            d->vs_dirty = 0;
-        }
+        /* O anel do PS encheu e mandou o envio: o bloco do VS ficou no anel do envio anterior,
+         * que volta a ser escrito quando aquele slot for reaproveitado. Refaz no anel novo.
+         * (Antes a condição era "&& d->vs_dirty", sempre falsa aqui: nunca refazia.) */
+        if (d->serial != ser) upload_vs_ubo(d, vsi, vs_ib);
     }
+}
+
+/* O sub-recurso (layer, level) de im está preso como alvo de cor ou profundidade agora? */
+static int sub_is_attached(const vk_device *d, const vk_image *im, uint32_t layer, uint32_t level)
+{
+    for (int i = 0; i < 4; i++)
+        if (d->rt[i] && d->rt[i]->img == im && d->rt[i]->layer == layer && d->rt[i]->level == level) return 1;
+    return d->ds && d->ds->img == im && d->ds->layer == layer && d->ds->level == level;
+}
+
+/* Imagem amostrada que também está presa como anexo (ex.: desenhar no mip 0 lendo os outros mips,
+ * ou a profundidade presa e lida no mesmo draw). O descritor diz GENERAL para a imagem inteira, e o
+ * anexo vai a GENERAL no begin_rendering; os outros sub-recursos também precisam estar em GENERAL e
+ * com as escritas visíveis. Antes eles ficavam em COLOR_ATTACHMENT/SHADER_READ_ONLY sem barreira:
+ * descritor e layout real divergiam. Na AMD o layout quase não importa; no Adreno (UBWC) e no Mali
+ * (AFBC) a leitura sai como lixo. apply = 0 só pergunta se falta barreira. */
+static int conflict_subs(vk_device *d, vk_image *im, int apply)
+{
+    re5vk_subref att[5];
+    uint32_t na = 0;
+    for (int i = 0; i < 4; i++)
+        if (d->rt[i] && d->rt[i]->img == im) att[na++] = (re5vk_subref){d->rt[i]->layer, d->rt[i]->level};
+    if (d->ds && d->ds->img == im) att[na++] = (re5vk_subref){d->ds->layer, d->ds->level};
+    if (!apply)
+        return re5vk_layout_pending(im->sub_layouts, im->sub_dirty, im->levels, im->layers, VK_IMAGE_LAYOUT_GENERAL,
+                                    att, na, NULL, 0) != 0;
+    uint32_t idx[RE5VK_MAX_SUBS];
+    uint32_t n = re5vk_layout_pending(im->sub_layouts, im->sub_dirty, im->levels, im->layers, VK_IMAGE_LAYOUT_GENERAL,
+                                      att, na, idx, RE5VK_MAX_SUBS);
+    if (n > RE5VK_MAX_SUBS)
+        re5_fatal("re5vk", "imagem com %u sub-recursos a transicionar (máximo %u)", n, RE5VK_MAX_SUBS);
+    for (uint32_t k = 0; k < n; k++)
+        re5vk_img_transition(d, re5vk_cmd(d), im, idx[k] % im->levels, 1, idx[k] / im->levels, 1,
+                             VK_IMAGE_LAYOUT_GENERAL,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    return n != 0;
 }
 
 static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
 {
+    pass_sync(d);   /* antes de olhar layouts e conflitos: eles valem para o conjunto de alvos atual */
     if (!d->vs || !d->ps) re5_fatal("re5vk", "draw sem vertex/pixel shader (fixed function sem implementação)");
     if (RS(d, D3DRS_CLIPPLANEENABLE) && !d->warned_clip) {
         RE5_WARN("re5vk", "D3DRS_CLIPPLANEENABLE=0x%X: planos de recorte não aplicados (como a DXVK no Mali)",
@@ -1304,11 +1892,11 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     if (RS(d, D3DRS_SRGBWRITEENABLE)) re5_fatal("re5vk", "D3DRS_SRGBWRITEENABLE sem implementação");
 
     /* Variantes e pipeline ANTES de begin_rendering para saber quais texturas entram no draw e
-     * preparar as transições de layout fora de vkCmdBeginRendering (exigido pelo Vulkan). */
+     * preparar as transições de layout fora do passe (exigido pelo Vulkan). */
     re5vk_dxso_variant psv;
     const re5vk_shader *vsi, *psi;
     VkPipeline pipe;
-    uint32_t tc = topo_class(pt);
+    uint32_t tc = d->core ? 100u + (uint32_t)topology(pt) : topo_class(pt);
     if (d->last_pipe && d->last_gen == d->pipe_gen && d->last_topo == tc) {
         pipe = d->last_pipe;
         vsi = d->last_vsi;
@@ -1328,11 +1916,13 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
             if (e) vertex_format_dev(d, e->Type, &intk);
             if (intk == 1) vsv.in_uint |= (uint16_t)(1u << r);
             if (intk == 2) vsv.in_sint |= (uint16_t)(1u << r);
+            if (intk == 3) vsv.in_udec3 |= (uint16_t)(1u << r);
         }
-        if (vsv.in_uint || vsv.in_sint) re5vk_shader_variant(d, d->vs, &vsv, &vsm, &vsi);
+        if (vsv.in_uint || vsv.in_sint || vsv.in_udec3) re5vk_shader_variant(d, d->vs, &vsv, &vsm, &vsi);
         /* primeiro sem as profundidades, para saber os samplers do PS */
         psv.alpha_func = RS(d, D3DRS_ALPHATESTENABLE) ? (uint8_t)RS(d, D3DRS_ALPHAFUNC) : 0;
         if (psv.alpha_func == D3DCMP_ALWAYS) psv.alpha_func = 0;
+        if (psv.alpha_func) ps_const_log(d, d->ps->hash, psv.alpha_func);
         for (int s = 0; s < 16; s++)
             if (tex_is_depth(d->tex[s])) psv.depth_samplers |= (uint16_t)(1u << s);
         re5vk_shader_variant(d, d->ps, &psv, &psm, &psi);
@@ -1346,6 +1936,12 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         k.vsv = vsv;
         k.psv = psv;
         k.decl_hash = d->decl ? fnv(d->decl->el, d->decl->n * sizeof d->decl->el[0], 2166136261u) : 0;
+        if (d->core) core_state(d, &k);
+        if (d->decl && (static_stride_on() || d->core))
+            for (uint32_t i = 0; i < d->decl->n; i++) {
+                uint32_t sn = d->decl->el[i].Stream;
+                if (sn < 16) k.stride[sn] = d->streams[sn].stride;
+            }
         k.topo_class = tc;
         k.fill = RS(d, D3DRS_FILLMODE);
         if (RS(d, D3DRS_ALPHABLENDENABLE)) {
@@ -1370,7 +1966,7 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         k.depth = d->ds ? d->ds->img->vkf : VK_FORMAT_UNDEFINED;
         k.stencil = d->ds ? d->ds->img->fmt->stencil : 0;
         VkPipeline *pp = pipe_find(&k, key_hash(&k));
-        if (!*pp) *pp = pipeline_create(d, &k, vsm, vsi, psm);
+        if (!*pp) *pp = pipeline_create(d, &k, vsm, vsi, psm, psi);
         pipe = *pp;
         d->last_pipe = pipe;
         d->last_gen = d->pipe_gen;
@@ -1397,7 +1993,6 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         samp_is_vs[nsamp] = 0;
         samp_conflict[nsamp] = conf;
         samp_layout[nsamp] = (gen || conf) ? VK_IMAGE_LAYOUT_GENERAL
-                           : dep           ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         nsamp++;
     }
@@ -1412,7 +2007,6 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         samp_is_vs[nsamp] = 1;
         samp_conflict[nsamp] = conf;
         samp_layout[nsamp] = (gen || conf) ? VK_IMAGE_LAYOUT_GENERAL
-                           : dep           ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         nsamp++;
     }
@@ -1437,7 +2031,7 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     /* Constantes e descritores ANTES de abrir/dividir o passe: um anel de UBO ou pool cheio
      * chama re5vk_flush() e invalida o VkCommandBuffer e o passe aberto. */
     uint8_t vs_ib = (uint8_t)(vsi->uses_i | vsi->uses_b << 1), ps_ib = (uint8_t)(psi->uses_i | psi->uses_b << 1);
-    upload_ubos(d, vsi, psi, vs_ib, ps_ib);
+    upload_ubos(d, vsi, psi, vs_ib, ps_ib, 0);
 
     uint64_t samp_sig = 0xcbf29ce484222325ull;
     for (uint32_t j = 0; j < nsamp; j++) {
@@ -1453,7 +2047,9 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
         for (uint32_t j = 0; j < nsamp; j++) {
             int s = samp_slot[j];
             int cmp = !samp_is_vs[j] && samp_dep[j] && (psv.depth_samplers >> s & 1);
-            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, s, cmp),
+            int multimip = samp_im[j]->levels > 1;
+            int nolin = !format_linear(d, samp_im[j]->vkf) || (samp_is_vs[j] && vtx_nearest());
+            ii[ni] = (VkDescriptorImageInfo){sampler_cached(d, s, cmp, multimip, nolin),
                                              re5vk_image_sampled_view(d, samp_im[j], d->ss[s][D3DSAMP_SRGBTEXTURE] != 0),
                                              samp_layout[j]};
             bind[ni++] = (samp_is_vs[j] ? RE5VK_BIND_VS_SAMP : RE5VK_BIND_PS_SAMP) +
@@ -1478,7 +2074,8 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
             uint64_t ser = d->serial;
             d->set = re5vk_alloc_set(d);   /* pode mandar o envio e zerar o cache (gen novo) */
             if (d->serial != ser) {
-                upload_ubos(d, vsi, psi, vs_ib, ps_ib);
+                /* o envio mudou: sujo ou não, os blocos têm de estar no anel do envio novo */
+                upload_ubos(d, vsi, psi, vs_ib, ps_ib, 1);
                 key[0] = (uint64_t)(uintptr_t)d->vs_ubo_buf;
                 key[1] = (uint64_t)(uintptr_t)d->ps_ubo_buf;
                 h = set_key_hash(key, nk);
@@ -1517,30 +2114,55 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     }
 
     /* Se o passe já estiver aberto, só fecha se algum anexo mudar para GENERAL ou alguma textura
-     * precisar de barreira/transição (proibidas dentro de vkCmdBeginRendering). */
+     * precisar de barreira/transição (proibidas dentro do passe). */
     if (d->rendering) {
         int need_split = 0;
         for (int i = 0; i < 4 && !need_split; i++)
-            if (d->rt[i] && d->render_rt_layouts[i] != want_rt_l[i]) need_split = 1;
-        if (!need_split && d->ds && d->render_ds_layout != want_ds_l) need_split = 1;
+            if (d->rt[i] && d->render_rt_layouts[i] != want_rt_l[i]) need_split = 1, d->split_why = "divisao:layout_rt";
+        if (!need_split && d->ds && d->render_ds_layout != want_ds_l) need_split = 1, d->split_why = "divisao:layout_ds";
         for (uint32_t j = 0; j < nsamp && !need_split; j++) {
-            if (samp_conflict[j]) continue;
             vk_image *im = samp_im[j];
-            if (re5vk_img_needs_barrier(im, 0, im->levels, 0, im->layers, samp_layout[j])) need_split = 1;
+            if (samp_conflict[j]) {
+                if (conflict_subs(d, im, 0)) need_split = 1, d->split_why = "divisao:amostra_alvo";
+                continue;
+            }
+            if (re5vk_img_needs_barrier(im, 0, im->levels, 0, im->layers, samp_layout[j]))
+                need_split = 1, d->split_why = img_any_dirty(im) ? "divisao:textura_recem_desenhada" : "divisao:transicao_textura";
         }
-        if (need_split) re5vk_end_rendering(d);
+        if (need_split) {
+            d->pass_was_split = 1;
+            re5vk_end_rendering(d);
+        }
     }
 
     /* Marca leitura TBDR das texturas amostradas e aplica transições pendentes fora do passe. */
     for (uint32_t j = 0; j < nsamp; j++) {
         vk_image *im = samp_im[j];
         im->last_use = d->serial;
-        if (!samp_conflict[j] && im->tbdr_subs) {
-            uint8_t amask = im->fmt->depth ? RE5VK_TBDR_DEPTH : RE5VK_TBDR_COLOR;
-            size_t nsub = (size_t)im->levels * im->layers;
-            for (size_t k = 0; k < nsub; k++) re5vk_tbdr_mark_read(&d->tbdr, &im->tbdr_subs[k], amask);
+        if (samp_is_vs[j]) {   /* uma linha por imagem lida no VS: formato, tamanho, mips */
+            static const vk_image *seen[32];
+            static int nseen;
+            int known = 0;
+            for (int q = 0; q < nseen; q++) known |= seen[q] == im;
+            if (!known && nseen < 32) {
+                seen[nseen++] = im;
+                RE5_INFO("re5vk", "textura de vertice slot %d: D3DFMT %u vkf %d %ux%u mips %u layout %d rt_views %d dummy %d", samp_slot[j],
+                         (unsigned)im->fmt->d3d, (int)im->vkf, im->w, im->h, im->levels, (int)samp_layout[j], im->rt_views != NULL,
+                         im == &d->dummy2d);
+            }
         }
-        if (!d->rendering && !samp_conflict[j]) {
+        if (d->tbdr.enabled && im->tbdr_subs) {   /* desligado (padrão): nem percorre os sub-recursos */
+            uint8_t amask = im->fmt->depth ? RE5VK_TBDR_DEPTH : RE5VK_TBDR_COLOR;
+            for (uint32_t ly = 0; ly < im->layers; ly++)
+                for (uint32_t lv = 0; lv < im->levels; lv++)
+                    if (!samp_conflict[j] || !sub_is_attached(d, im, ly, lv))
+                        re5vk_tbdr_mark_read(&d->tbdr, &im->tbdr_subs[(size_t)ly * im->levels + lv], amask);
+        }
+        if (!d->rendering && samp_conflict[j]) {
+            conflict_subs(d, im, 1);
+            continue;
+        }
+        if (!d->rendering) {
             VkPipelineStageFlags stg = samp_is_vs[j] ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
                                                      : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
             /* Se a mesma imagem aparece no VS e no PS neste draw, acumula os dois estágios. */
@@ -1548,15 +2170,30 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
                 if (samp_im[m] == im)
                     stg |= samp_is_vs[m] ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
             re5vk_img_transition(d, re5vk_cmd(d), im, 0, im->levels, 0, im->layers, samp_layout[j], stg);
+        } else if (!samp_conflict[j] && im->sub_stages && stage_note_on()) {
+            /* Passe ja aberto e imagem ja em SHADER_READ_ONLY: sem transicao, o estagio que a le (VS!) nao
+             * entrava em sub_stages. A barreira de um upload/escrita posterior esperava so o FS, e o VS
+             * deste draw (textura de vertice da animacao facial) lia a textura sendo reescrita: lixo no
+             * cabelo e no rosto, so quando a cabeca aparece. RE5VK_STAGE_NOTE=0 desliga. */
+            VkPipelineStageFlags stg = 0;
+            for (uint32_t m = 0; m < nsamp; m++)
+                if (samp_im[m] == im)
+                    stg |= samp_is_vs[m] ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            for (uint32_t i = 0; i < im->layers * im->levels; i++)
+                if (im->sub_layouts[i] == samp_layout[j]) im->sub_stages[i] |= (uint32_t)stg;
         }
     }
 
     begin_rendering_with_layouts(d, want_rt_l, want_ds_l);
+    d->pass_draws++;
 
     VkCommandBuffer cb = re5vk_cmd(d);
     if (pipe != d->bound_pipe) {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         d->bound_pipe = pipe;
+        /* Religa os vertex buffers a cada troca de pipeline: a Mali r38 perdia o binding >0 (cabecas com 2
+         * streams). RE5VK_REBIND_VB=0 volta ao cache. */
+        { static int rb = -1; if (rb < 0) { const char *e = getenv("RE5VK_REBIND_VB"); rb = !(e && *e == '0'); } if (rb) d->vb_valid = 0; }
     }
     set_dynamic(d, pt);
 
@@ -1584,7 +2221,8 @@ static void prepare(vk_device *d, D3DPRIMITIVETYPE pt)
     /* Só se algo mudou desde o último bind neste command buffer. */
     if (!d->vb_valid || memcmp(bufs, d->bound_vb, sizeof bufs) || memcmp(vo, d->bound_vo, sizeof vo) ||
         memcmp(strides, d->bound_vstride, sizeof strides)) {
-        vkCmdBindVertexBuffers2(cb, 0, 16, bufs, vo, NULL, strides);
+        if (d->core) vkCmdBindVertexBuffers(cb, 0, 16, bufs, vo);   /* stride no pipeline */
+        else vkCmdBindVertexBuffers2(cb, 0, 16, bufs, vo, NULL, strides);
         memcpy(d->bound_vb, bufs, sizeof bufs);
         memcpy(d->bound_vo, vo, sizeof vo);
         memcpy(d->bound_vstride, strides, sizeof strides);
@@ -1604,15 +2242,201 @@ static UINT vertex_count(D3DPRIMITIVETYPE t, UINT n)
     }
 }
 
+/* RE5VK_SKIP_REL=1 (diagnóstico): não desenha com VS que lê c[] por endereçamento relativo
+ * (skinning). Se um defeito some junto, ele vem desse caminho. */
+static int skip_rel_draw(const vk_device *d)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_SKIP_REL");
+        on = e && *e == '1';
+        if (on) RE5_WARN("re5vk", "RE5VK_SKIP_REL=1: draws com endereçamento relativo no VS não são desenhados");
+    }
+    if (d->last_vsi && d->last_vsi->uses_rel && d->decl && rs_log_on()) {
+        static uint32_t seen[16];
+        static int nseen;
+        uint32_t h = 2166136261u;
+        for (uint32_t i = 0; i < d->decl->n; i++) h = (h ^ (d->decl->el[i].Type | d->decl->el[i].Usage << 8)) * 16777619u;
+        int dup = 0;
+        for (int i = 0; i < nseen; i++) dup |= seen[i] == h;
+        if (!dup && nseen < 16) {
+            seen[nseen++] = h;
+            char buf[512];
+            int n = snprintf(buf, sizeof buf, "RS_LOG decl de skinning:");
+            for (uint32_t i = 0; i < d->decl->n && n < 480; i++)
+                n += snprintf(buf + n, sizeof buf - (size_t)n, " [s%u+%u tipo %u uso %u.%u]", d->decl->el[i].Stream,
+                              d->decl->el[i].Offset, d->decl->el[i].Type, d->decl->el[i].Usage,
+                              d->decl->el[i].UsageIndex);
+            for (uint32_t s = 0; s < 4 && n < 480; s++)
+                n += snprintf(buf + n, sizeof buf - (size_t)n, " {stream%u off %u stride %u vb %p base ?}", s, d->streams[s].off, d->streams[s].stride, (void *)d->streams[s].vb);
+            RE5_INFO("re5vk", "%s", buf);
+        }
+    }
+    if (rs_log_on() && d->last_psi && d->last_psi->uses_kill && d->ps) {
+        static const D3DRENDERSTATETYPE wr0[4] = {D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1,
+                                                  D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3};
+        int w = 0;
+        for (int i = 0; i < 4; i++)
+            if (d->rt[i] && (d->rs[wr0[i]] & 0xF)) w = 1;
+        static int nlog;
+        if (!w && nlog < 30) {
+            nlog++;
+            RE5_INFO("re5vk", "RS_LOG draw sem cor com kill: ps %08X c0(%g %g %g %g) zwrite %u zfunc %u tex0 %p",
+                     (unsigned)d->ps->hash, d->psf[0][0], d->psf[0][1], d->psf[0][2], d->psf[0][3],
+                     (unsigned)d->rs[D3DRS_ZWRITEENABLE], (unsigned)d->rs[D3DRS_ZFUNC], (void *)d->tex[0]);
+        }
+    }
+    if (on && d->last_vsi && d->last_vsi->uses_rel) return 1;
+    if (small_target(d)) return 1;
+    /* RE5VK_SKIP_VS=<hash>[,<hash>...] (DIAGNOSTICO): nao desenha com esses VS (hash FNV-1a do bytecode,
+     * o mesmo nome de work/shaders/vs_<hash>.bin e do DUMP_HEAD). Isola um shader suspeito. */
+    {
+        static int nsv = -1;
+        static uint32_t sv[8];
+        if (nsv < 0) {
+            nsv = 0;
+            const char *e = getenv("RE5VK_SKIP_VS");
+            while (e && *e && nsv < 8) {
+                char *end;
+                unsigned long h = strtoul(e, &end, 16);
+                if (end == e) break;
+                sv[nsv++] = (uint32_t)h;
+                RE5_WARN("re5vk", "RE5VK_SKIP_VS: draws com o VS %08X nao sao desenhados", (unsigned)h);
+                e = *end == ',' ? end + 1 : end;
+            }
+        }
+        for (int i = 0; i < nsv && d->vs; i++)
+            if (d->vs->hash == sv[i]) return 1;
+    }
+    /* RE5VK_SKIP_VTXTEX=1 (DIAGNOSTICO): nao desenha draws cujo VS le textura (cabecas com texldl). Se o
+     * lixo some, ele vem desses draws; combine com RE5VK_VTX_ZERO=1 para separar textura de geometria. */
+    {
+        static int svt = -1;
+        if (svt < 0) {
+            const char *e = getenv("RE5VK_SKIP_VTXTEX");
+            svt = e && *e == '1';
+            if (svt) RE5_WARN("re5vk", "RE5VK_SKIP_VTXTEX=1: draws com textura no VS nao sao desenhados");
+            const char *z = getenv("RE5VK_VTX_ZERO");
+            RE5_INFO("re5vk", "diagnosticos de cabeca: VTX_ZERO=%s SKIP_VTXTEX=%d VTX_NEAREST=%s STAGE_NOTE=%s", z ? z : "(off)", svt,
+                     getenv("RE5VK_VTX_NEAREST") ? getenv("RE5VK_VTX_NEAREST") : "(padrao 1)", getenv("RE5VK_STAGE_NOTE") ? getenv("RE5VK_STAGE_NOTE") : "(padrao 1)");
+        }
+        if (svt && d->last_vsi && d->last_vsi->samplers) return 1;
+    }
+    /* RE5VK_SKIP_NOCOLOR=1 (diagnóstico): não desenha draws que não escrevem cor (passada só de
+     * profundidade). Se os retângulos pretos de folhas/cerca somem, a profundidade vem dali. */
+    static int nc = -1, zpre = -1;
+    if (nc < 0) {
+        const char *e = getenv("RE5VK_SKIP_NOCOLOR");
+        nc = e && *e == '1';
+        if (nc) RE5_WARN("re5vk", "RE5VK_SKIP_NOCOLOR=1: draws sem escrita de cor não são desenhados");
+        /* Passada só de profundidade (Z-prepass) no Mali: com ela as folhas, a cerca e o cabelo saíam
+         * com retângulos pretos (a profundidade do quad inteiro ficava gravada); sem ela, certo (A54,
+         * 2026-11-18, RE5VK_SKIP_NOCOLOR=1). No Mali ela também não ganha nada: a GPU já descarta os
+         * pixels escondidos (FPK). A passada de cor grava a própria profundidade (LESSEQUAL), e o
+         * backend não tem consulta de oclusão. RE5VK_ZPREPASS=1 mantém; =0 pula em qualquer GPU. */
+        /* 1 = passada inteira; 0 = sem ela (personagens apareciam através das paredes: algumas só
+         * gravam profundidade aqui); 2 = sem os draws dela cujo PS descarta pixel (folhas, cerca,
+         * cabelo: texkill), que no Mali gravavam o quad inteiro. Padrão 1: RE5VK_KILL_DEPTH ataca a causa. */
+        const char *z = getenv("RE5VK_ZPREPASS");
+        zpre = z && *z ? (*z - '0') : 2;   /* padrao 2: KILL_DEPTH ficou desligado (suspeito de hang) */
+        if (zpre != 1) RE5_INFO("re5vk", "passada só de profundidade: modo %d (RE5VK_ZPREPASS=1 inteira, 2 sem os draws com texkill, 0 nenhuma)", zpre);
+    }
+    if (!nc && zpre != 1 && (zpre == 0 || (d->last_psi && d->last_psi->uses_kill)) && d->rs[D3DRS_ZWRITEENABLE] &&
+        !d->rs[D3DRS_STENCILENABLE]) {
+        static const D3DRENDERSTATETYPE wz[4] = {D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1,
+                                                 D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3};
+        int writes = 0;
+        for (int i = 0; i < 4; i++)
+            if (d->rt[i] && (d->rs[wz[i]] & 0xF)) writes = 1;
+        if (!writes) return 1;
+    }
+    if (nc) {
+        static const D3DRENDERSTATETYPE wr[4] = {D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1,
+                                                 D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3};
+        int writes = 0;
+        for (int i = 0; i < 4; i++)
+            if (d->rt[i] && (d->rs[wr[i]] & 0xF)) writes = 1;
+        if (!writes) {
+            static int said;
+            if (!said++) RE5_WARN("re5vk", "RE5VK_SKIP_NOCOLOR: primeiro draw sem cor pulado");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static HRESULT STDMETHODCALLTYPE v_DrawPrimitive(IDirect3DDevice9 *self, D3DPRIMITIVETYPE t, UINT start, UINT n)
 {
     vk_device *d = (vk_device *)self;
     if (!n) return D3D_OK;
     re5vk_lock(d);
     prepare(d, t);
+    if (skip_rel_draw(d)) {
+        re5vk_unlock(d);
+        return D3D_OK;
+    }
     vkCmdDraw(re5vk_cmd(d), vertex_count(t, n), 1, start, 0);
     re5vk_unlock(d);
     return D3D_OK;
+}
+
+/* RE5VK_DUMP_HEAD=1 (DIAGNOSTICO): nos primeiros draws de skinning com 2 streams, loga parametros do draw,
+ * se o fetch de vertice passa do tamanho do buffer, bytes crus dos primeiros/ultimos vertices e as
+ * constantes c0..c3 e c23..c34. Compare com o mesmo quadro no PC. */
+static void dump_head(vk_device *d, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT numv, UINT start, UINT n)
+{
+    static int on = -1, done;
+    if (on < 0) { const char *e = getenv("RE5VK_DUMP_HEAD"); on = e && *e == '1'; }
+    if (!on || done >= 4 || !d->last_vsi || !d->last_vsi->uses_rel || !d->decl) return;
+    int two = 0;
+    for (uint32_t i = 0; i < d->decl->n; i++) if (d->decl->el[i].Stream == 1) two = 1;
+    if (!two) return;
+    done++;
+    RE5_INFO("re5vk", "DUMP_HEAD #%d vs %08X ps %08X base %d minv %u numv %u start %u n %u ibfmt %u ibsize %u", done,
+             d->vs ? (unsigned)d->vs->hash : 0u, d->ps ? (unsigned)d->ps->hash : 0u, (int)base, minv, numv, start, n,
+             (unsigned)d->ib->format, (unsigned)d->ib->size);
+    /* maior índice usado pelo draw (o fetch vai até ele, não até minv+numv) */
+    if (d->ib->mem.map && (t == D3DPT_TRIANGLELIST || t == D3DPT_TRIANGLESTRIP)) {
+        const int i32 = d->ib->format == D3DFMT_INDEX32;
+        const uint32_t isz = i32 ? 4u : 2u;
+        uint64_t cnt = t == D3DPT_TRIANGLELIST ? (uint64_t)n * 3u : (uint64_t)n + 2u, first = (uint64_t)start;
+        uint32_t mx = 0, mn = UINT32_MAX;
+        if ((first + cnt) * isz <= d->ib->size) {
+            for (uint64_t k = first; k < first + cnt; k++) {
+                uint32_t v = i32 ? ((const uint32_t *)d->ib->mem.map)[k] : ((const uint16_t *)d->ib->mem.map)[k];
+                if (v > mx) mx = v;
+                if (v < mn) mn = v;
+            }
+            RE5_INFO("re5vk", "DUMP_HEAD indices (tipo %d) min %u max %u (minv+numv-1 = %u)%s", (int)t, mn, mx,
+                     minv + numv - 1, mx >= minv + numv ? " INDICE ACIMA DE NUMV" : "");
+            for (uint32_t s = 0; s < 2; s++) {
+                vk_buffer *vb = d->streams[s].vb;
+                if (!vb) continue;
+                uint64_t end = (uint64_t)d->streams[s].off + ((uint64_t)((int64_t)base + mx) + 1u) * d->streams[s].stride;
+                RE5_INFO("re5vk", "DUMP_HEAD stream%u pelo maior indice: fim %llu vbsize %u %s", s,
+                         (unsigned long long)end, vb->size, end > vb->size ? "FORA DO BUFFER" : "dentro");
+            }
+        }
+    }
+    for (int r = 4; r < 16; r++) RE5_INFO("re5vk", "DUMP_HEAD c%d: %g %g %g %g", r, d->vsf[r][0], d->vsf[r][1], d->vsf[r][2], d->vsf[r][3]);
+    for (uint32_t s = 0; s < 2; s++) {
+        vk_buffer *vb = d->streams[s].vb;
+        if (!vb) continue;
+        uint64_t first = (uint64_t)d->streams[s].off + (uint64_t)((int64_t)base + minv) * d->streams[s].stride;
+        uint64_t last = (uint64_t)d->streams[s].off + (uint64_t)((int64_t)base + minv + numv) * d->streams[s].stride;
+        RE5_INFO("re5vk", "DUMP_HEAD stream%u off %u stride %u vbsize %u primeiro %llu ultimo_fim %llu %s", s, d->streams[s].off,
+                 d->streams[s].stride, vb->size, (unsigned long long)first, (unsigned long long)last,
+                 last > vb->size ? "FORA DO BUFFER" : "dentro");
+        const uint8_t *m = (const uint8_t *)vb->mem.map;
+        if (!m || first + d->streams[s].stride * 4 > vb->size) continue;
+        for (int v = 0; v < 4; v++) {
+            char buf[200]; int k = 0;
+            for (uint32_t b = 0; b < d->streams[s].stride && b < 32; b++) k += snprintf(buf + k, sizeof buf - (size_t)k, "%02X", m[first + (uint64_t)v * d->streams[s].stride + b]);
+            RE5_INFO("re5vk", "DUMP_HEAD s%u v%d: %s", s, v, buf);
+        }
+    }
+    for (int r = 0; r < 4; r++) RE5_INFO("re5vk", "DUMP_HEAD c%d: %g %g %g %g", r, d->vsf[r][0], d->vsf[r][1], d->vsf[r][2], d->vsf[r][3]);
+    for (int r = 23; r < 35; r++) RE5_INFO("re5vk", "DUMP_HEAD c%d: %g %g %g %g", r, d->vsf[r][0], d->vsf[r][1], d->vsf[r][2], d->vsf[r][3]);
 }
 
 static HRESULT STDMETHODCALLTYPE v_DrawIndexedPrimitive(IDirect3DDevice9 *self, D3DPRIMITIVETYPE t, INT base,
@@ -1623,6 +2447,11 @@ static HRESULT STDMETHODCALLTYPE v_DrawIndexedPrimitive(IDirect3DDevice9 *self, 
     if (!d->ib) return D3DERR_INVALIDCALL;
     re5vk_lock(d);
     prepare(d, t);
+    if (skip_rel_draw(d)) {
+        re5vk_unlock(d);
+        return D3D_OK;
+    }
+    dump_head(d, t, base, minv, numv, start, n);
     VkCommandBuffer cb = re5vk_cmd(d);
     VkIndexType it = d->ib->format == D3DFMT_INDEX32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     if (d->ib->buf != d->bound_ib || it != d->bound_ibt) {   /* o VkBuffer muda num Lock com DISCARD */

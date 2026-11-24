@@ -70,6 +70,7 @@ public class GameActivity extends SDLActivity {
     private int lastPresents = 0;
     private long lastHudTime = 0;
     private long lastProcCpuTicks = -1, lastCpuWallMs = 0;
+    private final java.util.Map<Integer, Long> lastThreadTicks = new java.util.HashMap<>();
     private TextView hudMs;
     private int hudItems;
     // Multiplayer LAN: sem o MulticastLock o Wi-Fi do Android descarta broadcast UDP (a busca de
@@ -117,6 +118,11 @@ public class GameActivity extends SDLActivity {
                     WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
         }
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        SDLActivity.sForceImmersive = true;
+        if (Build.VERSION.SDK_INT >= 30)
+            getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        else
+            getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
 
         gameDir = getIntent().getStringExtra("GAME_DIR");
         if (gameDir == null) gameDir = GameStorage.gameDir(this).getAbsolutePath();
@@ -142,24 +148,61 @@ public class GameActivity extends SDLActivity {
         // vale direto; repassá-lo como RE5_CPUS só reduziria os núcleos vistos (o padrão é 2). Sem o
         // modo paralelo o jogo vê 2 de propósito: as threads se revezam num lock só.
         // Vídeo (launcher, aba Gráficos): renderizador, limite de FPS, apresentação e quadros em voo.
-        setenvPref(prefs, "gfx_renderer", "RE5_GFX");
-        setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");
+        GpuInfo.migrateRendererPref(prefs);   // "re5vk" antigo -> vkadreno/vkmali (ou DXVK)
+        String gfx = prefs.getString(GpuInfo.PREF_RENDERER, "");
+        if (gfx == null || gfx.isEmpty()) gfx = "dxvk";
+        try {
+            nativeSetenv("RE5_GFX", gfx);
+        } catch (Throwable ignored) {}
+        /* Limitador padrao de 60 FPS quando o usuario nunca escolheu (bateria/calor; o menu rodava a ~80
+         * sem necessidade). "Sem limite" nas configuracoes grava "" e continua sem limite. */
+        if (!prefs.contains("gfx_fps_cap")) {
+            try { nativeSetenv("RE5_FPS_CAP", "60"); } catch (Throwable ignored) {}
+        } else {
+            setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");
+        }
+        applyCacheDirs();
         setenvPref(prefs, "gfx_present", "RE5VK_PRESENT");
         setenvPref(prefs, "gfx_latency", "RE5VK_LATENCY");
+        // O re5vk limita os quadros em voo a RE5_QUERY_LAG - 1 (padrão 3 -> 2), para o atalho das
+        // consultas de evento continuar seguro: escolher 3 aqui era reduzido a 2 sem aviso.
+        String lat = prefs.getString("gfx_latency", "");
+        if (lat != null && !lat.isEmpty()) {
+            try {
+                nativeSetenv("RE5_QUERY_LAG", Integer.toString(Math.max(3, Integer.parseInt(lat) + 1)));
+            } catch (Throwable ignored) {}
+        }
         applyVulkanDriverEnv(prefs);
-        boolean hudEnabled = prefs.getBoolean("hud_enabled", true);
+        java.util.Set<String> flags = envFlags();
+        boolean lean = flags.contains("RE5_LEAN=1");
+        boolean noTouch = lean || flags.contains("RE5_NO_TOUCH=1");     // controles na tela
+        boolean noHud = lean || flags.contains("RE5_NO_HUD=1");         // monitor de desempenho
+        boolean noOverlay = lean || flags.contains("RE5_NO_OVERLAY=1"); // tela de carregamento + leitor de log
+        boolean noMisc = lean || flags.contains("RE5_NO_MISC=1");       // vigia de controles + locks de Wi-Fi
+        if (lean) {
+            /* RE5_LEAN=1 no re5_env.txt: só o jogo. Sem controles na tela, monitor, tela de carregamento,
+             * leitor de log, vigia de controles nem locks de Wi-Fi: nenhum custo de Java durante o jogo
+             * (teste do 23/11: o Java do app parece custar ~3 fps no A54). Entrada só por controle/teclado. */
+            Log.i(TAG, "modo RE5_LEAN: só o jogo (sem controles na tela, monitor nem tela de carregamento)");
+            return;
+        }
+        boolean hudEnabled = prefs.getBoolean("hud_enabled", true) && !noHud;
         hudItems = prefs.getInt("hud_items", HudPrefs.DEFAULT_ITEMS);
 
-        TouchControlsView touch = new TouchControlsView(this);
-        touchView = touch;
-        ControlsOptions.apply(this, touch);
-        touch.setOnMenuToggleListener(this::toggleOverlay);
-
-        overlay = buildOverlay();
+        TouchControlsView touch = null;
+        if (!noTouch) {
+            touch = new TouchControlsView(this);
+            touchView = touch;
+            ControlsOptions.apply(this, touch);
+            touch.setOnMenuToggleListener(this::toggleOverlay);
+        }
+        if (!noOverlay) overlay = buildOverlay();
 
         if (mLayout != null) {
-            mLayout.addView(touch, new RelativeLayout.LayoutParams(
-                    RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+            if (touch != null) {
+                mLayout.addView(touch, new RelativeLayout.LayoutParams(
+                        RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+            }
 
             if (hudEnabled) {
                 hudLayout = buildTelemetryHUD();
@@ -170,13 +213,84 @@ public class GameActivity extends SDLActivity {
                 hudHandler.post(hudRunnable);
             }
 
-            mLayout.addView(overlay, new RelativeLayout.LayoutParams(
-                    RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+            if (overlay != null) {
+                mLayout.addView(overlay, new RelativeLayout.LayoutParams(
+                        RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+            }
         }
 
-        startLogReader();
-        watchInputDevices();
-        acquireNetworkLocks();
+        if (!noOverlay) startLogReader();
+        if (!noMisc) {
+            watchInputDevices();
+            acquireNetworkLocks();
+        }
+    }
+
+    /** Caches de shader, pipeline e textura no cache do app (Configurações > Apps > Limpar cache
+     *  apaga só eles, sem tocar no jogo nem nos saves). Antes ficavam em files/; o que sobrou lá
+     *  é apagado uma vez. O re5_env.txt ainda pode apontar outro lugar (lido depois). */
+    private void applyCacheDirs() {
+        File cache = getCacheDir();
+        File dxvk = new File(cache, "dxvk"), tex = new File(cache, "texcache");
+        //noinspection ResultOfMethodCallIgnored
+        dxvk.mkdirs();
+        //noinspection ResultOfMethodCallIgnored
+        tex.mkdirs();
+        try {
+            nativeSetenv("DXVK_STATE_CACHE_PATH", dxvk.getAbsolutePath());
+            nativeSetenv("RE5VK_TEX_CACHE_DIR", tex.getAbsolutePath());
+            nativeSetenv("RE5VK_PCACHE", new File(cache, "re5vk.pcache").getAbsolutePath());
+            nativeSetenv("MESA_SHADER_CACHE_DIR", new File(cache, "mesa").getAbsolutePath());   // drivers Turnip
+        } catch (Throwable t) {
+            Log.w(TAG, "caches: " + t);
+        }
+        File files = getFilesDir();
+        File[] old = {new File(files, "texcache"), new File(files, "dxvk"), new File(files, "re5vk.pcache"),
+                new File(files, "re5vk.pcache.tmp")};
+        new Thread(() -> {
+            for (File f : old) if (f.exists()) GameStorage.deleteTree(f);
+        }, "re5-cache-migrate").start();
+    }
+
+    /** Linhas "CHAVE=VALOR" do re5_env.txt da pasta do jogo. Chaves do Java (testes de custo do app):
+     *  RE5_LEAN=1 (só o jogo, tudo abaixo), RE5_NO_TOUCH=1, RE5_NO_HUD=1, RE5_NO_OVERLAY=1, RE5_NO_MISC=1. */
+    private java.util.Set<String> envFlags() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try (BufferedReader br = new BufferedReader(new FileReader(new File(gameDir, "re5_env.txt")))) {
+            String l;
+            while ((l = br.readLine()) != null) out.add(l.trim());
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    /** Esconde a barra de status e a de navegação (voltam com um deslize e somem sozinhas). */
+    private void hideSystemBars() {
+        android.view.Window w = getWindow();
+        if (Build.VERSION.SDK_INT >= 30) {
+            w.setDecorFitsSystemWindows(false);
+            android.view.WindowInsetsController c = w.getInsetsController();
+            if (c != null) {
+                c.hide(android.view.WindowInsets.Type.systemBars());
+                c.setSystemBarsBehavior(android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) hideSystemBars();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        hideSystemBars();
     }
 
     private void setenvPref(SharedPreferences prefs, String key, String env) {
@@ -399,14 +513,19 @@ public class GameActivity extends SDLActivity {
         hudRam.setText(rssKb >= 1024 * 1024 ? String.format(Locale.US, L.t("%.2f GB"), rssKb / (1024.0f * 1024.0f))
                                             : String.format(Locale.US, L.t("%d MB"), rssKb / 1024));
 
-        // CPU: tempo de CPU do processo / tempo real, em % de todos os núcleos (100% = todos cheios)
+        // CPU: tempo de CPU do processo / tempo real, em % de todos os núcleos (100% = todos cheios),
+        // e a thread mais ocupada em % de um núcleo (perto de 100 = essa thread é o limite do fps).
         long ticks = HudPrefs.processCpuTicks();
         long wall = SystemClock.elapsedRealtime();
+        HudPrefs.BusiestThread top = HudPrefs.busiestThread(lastThreadTicks, wall - lastCpuWallMs);
         if (ticks >= 0 && lastProcCpuTicks >= 0 && wall > lastCpuWallMs) {
             float cpuMs = (ticks - lastProcCpuTicks) * 10f;   // 1 tick = 10 ms (USER_HZ 100)
             int cores = Runtime.getRuntime().availableProcessors();
             float pct = 100f * cpuMs / ((wall - lastCpuWallMs) * (float) cores);
-            hudCpu.setText(String.format(Locale.US, L.t("%.0f%% CPU"), Math.max(0f, Math.min(100f, pct))));
+            String s = String.format(Locale.US, L.t("%.0f%% CPU"), Math.max(0f, Math.min(100f, pct)));
+            if (top.pct >= 0f)
+                s += String.format(Locale.US, L.t(" · máx %.0f%% %s"), top.pct, top.name);
+            hudCpu.setText(s);
         } else if (ticks < 0) {
             hudCpu.setText(L.t("— CPU"));
         }
@@ -492,11 +611,12 @@ public class GameActivity extends SDLActivity {
             notice(startupNotice);
             startupNotice = null;
         }
-        if (overlay.getVisibility() != View.VISIBLE) return;
+        if (overlay == null || overlay.getVisibility() != View.VISIBLE) return;
         overlay.animate().alpha(0f).setDuration(350).withEndAction(() -> overlay.setVisibility(View.GONE));
     }
 
     private void showOverlay() {
+        if (overlay == null) return;
         overlay.setAlpha(0f);
         overlay.setVisibility(View.VISIBLE);
         overlay.animate().alpha(1f).setDuration(250);
@@ -522,6 +642,7 @@ public class GameActivity extends SDLActivity {
     }
 
     private void toggleOverlay() {
+        if (overlay == null) return;
         if (overlay.getVisibility() == View.VISIBLE) hideOverlay();
         else showOverlay();
     }

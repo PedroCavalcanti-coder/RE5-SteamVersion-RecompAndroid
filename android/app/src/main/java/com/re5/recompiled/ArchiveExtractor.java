@@ -150,14 +150,49 @@ public class ArchiveExtractor {
 
         long archiveSize = new File(rarPath).length();
 
-        // Comando: unrar x -y -o+ <rarPath> <targetDir>/
+        // Retomável: lista o arquivo, apaga o que ficou pela metade (tamanho diferente) e extrai
+        // pulando o que já está completo (-o-). Se tudo está numa pasta "game/" (o game.rar), extrai
+        // na pasta acima, direto no lugar: antes ia para game/game/ e era movido depois, e uma
+        // segunda tentativa deixava uma cópia inteira em game/game/ (o jogo passava de 16 GB).
+        callback.onProgress(L.t("Lendo o conteúdo do arquivo…"), 0, -1);
+        java.util.List<RarEntry> entries = listRar(unrarBin, rarPath);
+        File base = targetDir;
+        boolean wrapped = allUnder(entries, targetDir.getName());
+        if (wrapped && targetDir.getParentFile() != null) {
+            base = targetDir.getParentFile();
+            File nested = new File(targetDir, targetDir.getName());   // sobra das extrações antigas
+            if (nested.isDirectory()) {
+                callback.onProgress(L.t("Apagando cópia duplicada de uma extração anterior…"), 0, -1);
+                GameStorage.deleteTree(nested);
+            }
+        }
+        long total = 0, done = 0;
+        int skipped = 0;
+        java.util.Map<String, Long> sizes = new java.util.HashMap<>();
+        for (RarEntry e : entries) {
+            if (e.dir || e.size < 0) continue;
+            total += e.size;
+            sizes.put(e.name, e.size);
+            File f = new File(base, e.name);
+            if (f.isFile()) {
+                if (f.length() == e.size) {
+                    done += e.size;
+                    skipped++;
+                } else if (!f.delete()) {
+                    Log.w(TAG, "não apaguei o arquivo incompleto " + f);
+                }
+            }
+        }
+        boolean resume = !sizes.isEmpty();
+        if (skipped > 0) Log.i(TAG, "retomando: " + skipped + " arquivos já completos");
+
         ProcessBuilder pb = new ProcessBuilder(
                 unrarBin.getAbsolutePath(),
                 "x",
                 "-y",
-                "-o+",
+                resume ? "-o-" : "-o+",
                 rarPath,
-                targetDir.getAbsolutePath() + File.separator
+                base.getAbsolutePath() + File.separator
         );
         pb.redirectErrorStream(true);
         unrarProcess = pb.start();
@@ -176,7 +211,12 @@ public class ArchiveExtractor {
                 if (line.startsWith("Extracting ") || line.startsWith("Extraindo ")) {
                     fileCount++;
                     String display = line.replace("Extracting ", "").replace("Extraindo ", "").trim();
-                    callback.onProgress(display, fileCount, -1);
+                    // "nome   OK": o arquivo terminou
+                    String name = display.endsWith("OK") ? display.substring(0, display.length() - 2).trim() : display;
+                    Long sz = sizes.get(name.replace('\\', '/'));
+                    if (sz != null) done += sz;
+                    callback.onProgress(name, skipped + fileCount,
+                            total > 0 ? (int) Math.min(1000, done * 1000 / total) : -1);
                 }
             }
         }
@@ -188,7 +228,7 @@ public class ArchiveExtractor {
         }
 
         if (exitCode == 0 || exitCode == 1) {
-            organizeExtractedFolder(targetDir);
+            if (!wrapped) organizeExtractedFolder(targetDir);
             callback.onSuccess(fileCount, archiveSize);
         } else {
             callback.onError(L.t("UnRAR falhou com código de saída: ") + exitCode);
@@ -199,14 +239,65 @@ public class ArchiveExtractor {
         File subGame = new File(targetDir, "game");
         if (subGame.exists() && subGame.isDirectory()) {
             File[] files = subGame.listFiles();
-            if (files != null) {
-                for (File f : files) {
-                    File dest = new File(targetDir, f.getName());
-                    f.renameTo(dest);
+            if (files != null) for (File f : files) mergeInto(f, new File(targetDir, f.getName()));
+            GameStorage.deleteTree(subGame);
+        }
+    }
+
+    /** Move src para dest juntando pastas (renameTo falha se dest já existe: era a duplicação). */
+    private static void mergeInto(File src, File dest) {
+        if (src.isDirectory()) {
+            if (!dest.exists() && src.renameTo(dest)) return;
+            dest.mkdirs();
+            File[] kids = src.listFiles();
+            if (kids != null) for (File k : kids) mergeInto(k, new File(dest, k.getName()));
+            src.delete();
+        } else {
+            if (dest.exists()) dest.delete();
+            if (!src.renameTo(dest)) Log.w(TAG, "não movi " + src + " -> " + dest);
+        }
+    }
+
+    /** Uma entrada do arquivo (unrar lt): caminho com '/', tamanho, pasta ou não. */
+    private static final class RarEntry {
+        String name;
+        long size = -1;
+        boolean dir;
+    }
+
+    private static java.util.List<RarEntry> listRar(File unrarBin, String rarPath) {
+        java.util.List<RarEntry> out = new java.util.ArrayList<>();
+        try {
+            Process p = new ProcessBuilder(unrarBin.getAbsolutePath(), "lt", "-c-", rarPath)
+                    .redirectErrorStream(true).start();
+            RarEntry cur = null;
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    String t = line.trim();
+                    if (t.startsWith("Name: ")) {
+                        cur = new RarEntry();
+                        cur.name = t.substring(6).replace('\\', '/');
+                        out.add(cur);
+                    } else if (cur != null && t.startsWith("Type: ")) {
+                        cur.dir = t.substring(6).trim().equalsIgnoreCase("Directory");
+                    } else if (cur != null && t.startsWith("Size: ")) {
+                        try { cur.size = Long.parseLong(t.substring(6).trim()); } catch (NumberFormatException ignored) {}
+                    }
                 }
             }
-            subGame.delete();
+            p.waitFor();
+        } catch (Exception e) {
+            Log.w(TAG, "unrar lt: " + e);
         }
+        return out;
+    }
+
+    private static boolean allUnder(java.util.List<RarEntry> entries, String top) {
+        if (entries.isEmpty()) return false;
+        for (RarEntry e : entries)
+            if (!e.name.equals(top) && !e.name.startsWith(top + "/")) return false;
+        return true;
     }
 
     private void extractZip(Context context, Uri archiveUri, File targetDir, Callback callback) throws Exception {
@@ -243,6 +334,12 @@ public class ArchiveExtractor {
                 } else {
                     File parent = targetFile.getParentFile();
                     if (parent != null && !parent.exists()) parent.mkdirs();
+                    if (entry.getSize() >= 0 && targetFile.isFile() && targetFile.length() == entry.getSize()) {
+                        fileCount++;   // já extraído numa tentativa anterior
+                        zis.closeEntry();
+                        callback.onProgress(entryName, fileCount, -1);
+                        continue;
+                    }
 
                     try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(targetFile), BUFFER_SIZE)) {
                         int len;

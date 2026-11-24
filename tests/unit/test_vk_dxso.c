@@ -40,6 +40,13 @@ enum { TEMP = 0, INPUT = 1, CONST = 2, ADDR = 3, OUTPUT = 6, CONSTINT = 7, COLOR
 static const char *g_val;   /* spirv-val */
 static int g_fail;
 
+/* mesma regra do tradutor no host (o Android liga por padrão; o ctest roda as duas formas) */
+static int nanguard_on(void)
+{
+    const char *e = getenv("RE5VK_NANGUARD");
+    return e && *e == '1';
+}
+
 static int validate(const re5vk_shader *s, const char *name)
 {
     if (s->nwords < 5 || s->spv[0] != 0x07230203u) {
@@ -73,6 +80,23 @@ static void check_shader(const char *name, const uint32_t *code, size_t n, const
         return;
     }
     if (validate(&s, name) != 0) g_fail++;
+    /* RE5_DXSO_STATS=1: conta instruções que viram ALU (custo da emulação de float e da guarda de NaN) */
+    const char *st = getenv("RE5_DXSO_STATS");
+    if (st && *st == '1') {
+        unsigned alu = 0, sel = 0, cmp = 0, mul = 0, ext = 0;
+        for (uint32_t i = 5; i < s.nwords;) {
+            uint32_t op = s.spv[i] & 0xFFFF, len = s.spv[i] >> 16;
+            if (!len) break;
+            if (op == 169) sel++;                                   /* OpSelect */
+            else if (op >= 180 && op <= 191) cmp++;                 /* OpFOrd* / OpFUnord* */
+            else if (op == 133 || op == 142 || op == 148) mul++;    /* OpFMul, OpVectorTimesScalar, OpDot */
+            else if (op == 12) ext++;                               /* OpExtInst (clamp, min, max...) */
+            if ((op >= 127 && op <= 156) || op == 166 || op == 167 || op == 169 || (op >= 180 && op <= 191) || op == 12)
+                alu++;
+            i += len;
+        }
+        printf("STATS %s alu %u select %u cmp %u mul %u extinst %u\n", name, alu, sel, cmp, mul, ext);
+    }
     free(s.spv);
 }
 
@@ -177,7 +201,67 @@ static void run_builtin(void)
     CHECK_EQ_U32(s.in_usage[1], 5);
     CHECK_EQ_U32(s.pixel, 0);
     CHECK_EQ_U32(s.const_f, 256);   /* c[a0.x+10]: endereçamento relativo, o banco inteiro */
+    {   /* posição Invariant (passada de profundidade + cor com VS diferentes precisa bater no Mali) */
+        int inv = 0;
+        for (size_t w = 5; w < s.nwords;) {
+            uint32_t op = s.spv[w] & 0xFFFF, len = s.spv[w] >> 16;
+            if (op == 71 && len >= 3 && s.spv[w + 2] == 18) inv++;
+            w += len ? len : 1;
+        }
+        CHECK_EQ_U32(inv, 1);
+        int any = 0;   /* posição com NaN em qualquer componente vira NaN inteira (Mali) */
+        for (size_t w = 5; w < s.nwords;) {
+            uint32_t op = s.spv[w] & 0xFFFF, len = s.spv[w] >> 16;
+            if (op == 154) any++;
+            w += len ? len : 1;
+        }
+        CHECK(any >= 1);
+    }
     CHECK_EQ_U32(s.uses_i, 0);
+    {   /* texkill antes de um texld: o OpKill tem que vir depois da última amostragem (senão o Mali
+         * perde as derivadas do quad e o texld lê o mip errado nas bordas recortadas) */
+        static const uint32_t ps_kill[] = {
+            PS3,
+            INS(31, 2), DCL(5, 0), DST(INPUT, 0, 0xF),
+            INS(31, 2), DCLS(2), DST(SAMPLER, 0, 0xF),
+            INS(66, 3), DST(TEMP, 0, 0xF), SRC(INPUT, 0), SRC(SAMPLER, 0),
+            INS(2, 3), DST(TEMP, 1, 0xF), SRCSW(TEMP, 0, WWWW), SRC(CONST, 0),   /* r1 = a - c0 */
+            INS(65, 1), DST(TEMP, 1, 0xF),                                       /* texkill r1 */
+            INS(66, 3), DST(TEMP, 2, 0xF), SRC(INPUT, 0), SRC(SAMPLER, 0),       /* texld depois */
+            INS(1, 2), DST(COLOROUT, 0, 0xF), SRC(TEMP, 2),
+            END,
+        };
+        re5vk_dxso_variant at = {.alpha_func = 7};
+        for (int pass = 0; pass < 2; pass++) {
+            re5vk_shader k;
+            CHECK(re5vk_dxso_compile(ps_kill, sizeof ps_kill / 4, pass ? &at : &plain, &k, err, sizeof err) == 0);
+            size_t last_sample = 0, first_kill = 0, kills = 0;
+            for (size_t w = 5; w < k.nwords;) {
+                uint32_t op = k.spv[w] & 0xFFFF, len = k.spv[w] >> 16;
+                if (op >= 87 && op <= 90) last_sample = w;   /* OpImageSample* */
+                if (op == 252) { kills++; if (!first_kill) first_kill = w; }
+                w += len ? len : 1;
+            }
+            CHECK(kills >= 1);
+            CHECK(first_kill > last_sample);
+            {   /* contorno do discard ignorado (Mali < r40, Adreno 5xx): FragDepth + DepthUnchanged */
+                int unchanged = 0, fragdepth = 0;
+                for (size_t w = 5; w < k.nwords;) {
+                    uint32_t op = k.spv[w] & 0xFFFF, len = k.spv[w] >> 16;
+                    if (op == 16 && len >= 3 && k.spv[w + 2] == 16) unchanged++;
+                    if (op == 71 && len >= 4 && k.spv[w + 2] == 11 && k.spv[w + 3] == 22) fragdepth++;
+                    w += len ? len : 1;
+                }
+                /* DESLIGADO por padrao (suspeito de GPU hang); RE5VK_KILL_DEPTH=1 liga */
+                const char *kd = getenv("RE5VK_KILL_DEPTH");
+                uint32_t want = (kd && *kd == '1') ? 1u : 0u;
+                CHECK_EQ_U32(unchanged, want);
+                CHECK_EQ_U32(fragdepth, want);
+            }
+            if (validate(&k, pass ? "ps_kill (alpha test)" : "ps_kill") != 0) g_fail++;
+            free(k.spv);
+        }
+    }
     {   /* mov oC0, c7 (+ c200 por def, que não vem do UBO): só c0..c7 */
         static const uint32_t ps_c7[] = {
             PS3,
@@ -191,7 +275,7 @@ static void run_builtin(void)
         CHECK_EQ_U32(c7.uses_i, 0);
         CHECK_EQ_U32(c7.uses_b, 0);
         free(c7.spv);
-        /* rcp r0, c0 ; mov oC0, r0: com a emulação de float (padrão) o resultado passa por FClamp
+        /* rcp r0, c0 ; mov oC0, r0: o resultado sempre passa por FClamp
          * (GLSL.std.450 43) para não sair infinito, como na D3D9. */
         static const uint32_t ps_rcp[] = {
             PS3,
@@ -200,14 +284,66 @@ static void run_builtin(void)
             END,
         };
         CHECK(re5vk_dxso_compile(ps_rcp, sizeof ps_rcp / 4, &plain, &c7, err, sizeof err) == 0);
+        /* com a guarda de NaN (RE5VK_NANGUARD=1) o FClamp vira NClamp (81) */
+        uint32_t want_clamp = nanguard_on() ? 81 : 43;
         int clamp = 0;
         for (size_t w = 5; w < c7.nwords;) {   /* OpExtInst = 12: [res type, res, set, inst, ...] */
             uint32_t op = c7.spv[w] & 0xFFFFu, len = c7.spv[w] >> 16;
-            if (op == 12 && len >= 5 && c7.spv[w + 4] == 43) clamp = 1;
+            if (op == 12 && len >= 5 && c7.spv[w + 4] == want_clamp) clamp = 1;
             w += len ? len : 1;
         }
         CHECK(clamp);
         free(c7.spv);
+    }
+    {   /* mul r0, c0, c1: sem RE5VK_FLOATEMU=1 é um OpFMul puro (como a DXVK); com ela, OpSelect (169) */
+        static const uint32_t ps_mul[] = {
+            PS3,
+            INS(5, 3), DST(TEMP, 0, 0xF), SRC(CONST, 0), SRC(CONST, 1),
+            INS(1, 2), DST(COLOROUT, 0, 0xF), SRC(TEMP, 0),
+            END,
+        };
+        re5vk_shader sm;
+        CHECK(re5vk_dxso_compile(ps_mul, sizeof ps_mul / 4, &plain, &sm, err, sizeof err) == 0);
+        int sel = 0;
+        for (size_t w = 5; w < sm.nwords;) {
+            uint32_t op = sm.spv[w] & 0xFFFFu, len = sm.spv[w] >> 16;
+            sel += op == 169;
+            w += len ? len : 1;
+        }
+        const char *fe = getenv("RE5VK_FLOATEMU");
+        if (fe && *fe == '1') CHECK(sel >= 1);
+        else CHECK_EQ_U32(sel, 0);
+        free(sm.spv);
+    }
+    {   /* exp, lit, pow e _sat: com a guarda, NaN -> 0 por OpIsNan (156) e NClamp (81); sem ela (PC),
+         * nenhum dos dois aparece (SPIR-V igual ao de antes da guarda). */
+        static const uint32_t ps_nan[] = {
+            PS3,
+            INS(14, 2), DST(TEMP, 0, 0x1), SRCSW(CONST, 0, XXXX),                          /* exp r0.x */
+            INS(16, 2), DST(TEMP, 1, 0xF), SRC(CONST, 1),                                  /* lit r1 */
+            INS(32, 3), DST(TEMP, 0, 0x2), SRCSW(CONST, 2, XXXX), SRCSW(CONST, 3, XXXX),   /* pow r0.y */
+            INS(2, 3), DST(TEMP, 1, 0xF), SRC(TEMP, 1), SRC(TEMP, 0),                      /* add r1 */
+            INS(1, 2), DSTSAT(COLOROUT, 0, 0xF), SRC(TEMP, 1),                             /* mov_sat oC0 */
+            END,
+        };
+        re5vk_shader sn;
+        check_shader("ps_nan", ps_nan, sizeof ps_nan / 4, &plain);
+        CHECK(re5vk_dxso_compile(ps_nan, sizeof ps_nan / 4, &plain, &sn, err, sizeof err) == 0);
+        int isnan_n = 0, nclamp = 0;
+        for (size_t w = 5; w < sn.nwords;) {
+            uint32_t op = sn.spv[w] & 0xFFFFu, len = sn.spv[w] >> 16;
+            isnan_n += op == 156;
+            nclamp += op == 12 && len >= 5 && sn.spv[w + 4] == 81;
+            w += len ? len : 1;
+        }
+        free(sn.spv);
+        if (nanguard_on()) {
+            CHECK(isnan_n >= 3);   /* exp, lit, pow */
+            CHECK(nclamp >= 4);    /* os três + _sat */
+        } else {
+            CHECK_EQ_U32(isnan_n, 0);
+            CHECK_EQ_U32(nclamp, 0);
+        }
     }
     free(s.spv);
     {   /* entradas inteiras: um OpConvertUToF (112) e um OpConvertSToF (111) a mais */
@@ -231,6 +367,25 @@ static void run_builtin(void)
         free(si.spv);
         CHECK(u > u0);
         CHECK(sg > sg0);
+    }
+    {   /* entrada UDEC3 (10-10-10-2): bitwise and/shift, OpConvertUToF e OpCompositeConstruct */
+        re5vk_dxso_variant udec = {.in_udec3 = 1u << 1};
+        re5vk_shader su;
+        CHECK(re5vk_dxso_compile(vs_basic, sizeof vs_basic / 4, &udec, &su, err, sizeof err) == 0);
+        int band = 0, shift = 0, u2f = 0, comp = 0;
+        for (size_t w = 5; w < su.nwords;) {
+            uint32_t op = su.spv[w] & 0xFFFFu, len = su.spv[w] >> 16;
+            band += op == 199;   /* SOpBitwiseAnd */
+            shift += op == 194;  /* SOpShiftRightLogical */
+            u2f += op == 112;    /* OpConvertUToF */
+            comp += op == 80;    /* OpCompositeConstruct */
+            w += len ? len : 1;
+        }
+        free(su.spv);
+        CHECK(band >= 3);   /* x, y, z masked */
+        CHECK(shift >= 2);  /* y (10) e z (20) shifts */
+        CHECK(u2f >= 3);    /* x, y, z convertidos para float */
+        CHECK(comp >= 1);   /* float4(x, y, z, 1.0f) */
     }
     CHECK(re5vk_dxso_compile(ps_basic, sizeof ps_basic / 4, &plain, &s, err, sizeof err) == 0);
     CHECK_EQ_U32(s.samplers, 0xF);

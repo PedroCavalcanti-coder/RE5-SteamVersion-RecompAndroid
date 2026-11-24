@@ -24,6 +24,7 @@
 #include "re5/runtime.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/re5vk.h"
+#include "re5/renderer.h"
 #include "re5/vk_loader.h"
 #include "re5/user32.h"
 
@@ -144,7 +145,7 @@ static void load(void)
     if (gfx == RE5_GFX_GL && (!path || !*path)) {
         re5_fatal("d3d9",
                   "RE5_GFX=gl requer um tradutor D3D9->OpenGL externo em RE5_D3D9_DLL. "
-                  "O runtime embutido suporta apenas dxvk e re5vk.");
+                  "O runtime embutido suporta dxvk, vkadreno e vkmali.");
     }
     char dxvk[MAX_PATH];
     if (!path || !*path) {
@@ -184,7 +185,7 @@ static void load(void)
         if (!path || !*path) {
             re5_fatal("d3d9",
                       "RE5_GFX=gl requer um tradutor D3D9->OpenGL ES externo em RE5_D3D9_LIB "
-                      "(ex.: libwined3d/Nine). O runtime embutido suporta apenas dxvk e re5vk.");
+                      "(ex.: libwined3d/Nine). O runtime embutido suporta dxvk, vkadreno e vkmali.");
         }
         void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!lib) re5_fatal("d3d9", "dlopen(\"%s\") falhou: %s", path, dlerror());
@@ -193,6 +194,29 @@ static void load(void)
         RE5_INFO("d3d9", "Direct3D do host (RE5_GFX=gl externo): %s", path);
         return;
     }
+    void *lib = NULL;
+#if defined(__ANDROID__)
+    /* Padrão no Android: a DXVK 1.9.2b (libdxvk_d3d9_192b.so), a que desenha certo no Mali. A 2.6.2
+     * portada (libdxvk_d3d9.so) ainda mostra texto quebrado e tela preta no A54 (20/11/2026);
+     * RE5_DXVK=2.6.2 a escolhe, RE5_D3D9_LIB escolhe qualquer arquivo. */
+    if (!path || !*path) {
+        const char *want = getenv("RE5_DXVK");
+        if (!(want && !strcmp(want, "2.6.2"))) {
+            /* DXVK 1.9.2b (libdxvk_d3d9_192b.so) é o padrão: tem o patch da janela nova ao voltar do
+             * segundo plano (re5_dxvk_set_window_fn). Medida em 23/11 no A54, 360p, mesma parte do
+             * benchmark: empata em fps (pico 31, média ~25) com a "ref" (a do APK de 07/11,
+             * libdxvk_d3d9_ref.so, escolhida por RE5_DXVK=ref), que pode cair ao voltar do segundo plano. */
+            if (want && !strcmp(want, "ref")) {
+                lib = dlopen("libdxvk_d3d9_ref.so", RTLD_NOW | RTLD_LOCAL);
+                if (lib) path = "libdxvk_d3d9_ref.so";
+            }
+            if (!lib) {
+                lib = dlopen("libdxvk_d3d9_192b.so", RTLD_NOW | RTLD_LOCAL);
+                if (lib) path = "libdxvk_d3d9_192b.so";
+            }
+        }
+    }
+#endif
     if (!path || !*path) path = "libdxvk_d3d9.so";
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* a janela que a ponte entrega é um SDL_Window* */
 #if defined(__ANDROID__)
@@ -210,7 +234,7 @@ static void load(void)
         RE5_INFO("d3d9", "cache da DXVK em %s", cache);
     }
 #endif
-    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!lib) re5_fatal("d3d9", "dlopen(\"%s\") falhou: %s", path, dlerror());
     g_create9 = (create9_fn)dlsym(lib, "Direct3DCreate9");
     if (!g_create9) re5_fatal("d3d9", "%s não exporta Direct3DCreate9", path);
@@ -227,6 +251,9 @@ static void load(void)
     }
     /* O WSI do Android (android/dxvk/android_wsi.cpp) lista os modos do
      * adaptador a partir do tamanho da tela, antes de existir device. */
+    void (*set_window_fn)(void *(*)(void)) = (void (*)(void *(*)(void)))dlsym(lib, "re5_dxvk_set_window_fn");
+    if (set_window_fn) set_window_fn(re5_android_current_window);
+    else RE5_WARN("d3d9", "%s sem re5_dxvk_set_window_fn: voltar do segundo plano pode derrubar o jogo", path);
     void (*set_screen)(uint32_t, uint32_t) = (void (*)(uint32_t, uint32_t))dlsym(lib, "re5_dxvk_set_screen");
     if (!set_screen) re5_fatal("d3d9", "%s não exporta re5_dxvk_set_screen (não é a DXVK do Android)", path);
     SDL_DisplayMode dm;
@@ -241,29 +268,25 @@ static void load(void)
 #endif
 }
 
+static re5_gfx_backend backend_of(re5_renderer_kind k)
+{
+    if (k == RE5_RENDERER_GL) return RE5_GFX_GL;
+    return re5_renderer_is_native_vk(k) ? RE5_GFX_RE5VK : RE5_GFX_DXVK;
+}
+
+/* O nome de RE5_GFX é do seletor (re5/renderer.h); aqui só a família do backend. */
 int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out)
 {
-    re5_gfx_backend mode = RE5_GFX_DXVK;
-    if (env && *env) {
-        if (!strcmp(env, "dxvk")) mode = RE5_GFX_DXVK;
-        else if (!strcmp(env, "re5vk")) mode = RE5_GFX_RE5VK;
-        else if (!strcmp(env, "gl")) mode = RE5_GFX_GL;
-        else return -1;
-    }
-    if (out) *out = mode;
+    re5_renderer_kind k;
+    if (re5_renderer_parse(env, &k) != 0) return -1;
+    if (out) *out = backend_of(k);
     return 0;
 }
 
 re5_gfx_backend re5_gfx_mode(void)
 {
     static int mode = -1;
-    if (mode < 0) {
-        const char *g = getenv("RE5_GFX");
-        re5_gfx_backend parsed = RE5_GFX_DXVK;
-        if (re5_parse_gfx_mode(g, &parsed) != 0)
-            re5_fatal("d3d9", "RE5_GFX=%s: valores aceitos: dxvk (padrão), re5vk, gl", g);
-        mode = (int)parsed;
-    }
+    if (mode < 0) mode = (int)backend_of(re5_renderer_selected()); /* aborta com a mensagem certa */
     return (re5_gfx_backend)mode;
 }
 
@@ -272,13 +295,118 @@ int re5vk_enabled(void)
     return re5_gfx_mode() == RE5_GFX_RE5VK;
 }
 
-/* RE5_GFX=re5vk: o IDirect3D9 da DXVK continua respondendo as consultas do adaptador e o
- * device é o Vulkan próprio (runtime/src/gfx/vk/re5vk.c). */
+/* vkadreno/vkmali: o seletor (re5/renderer.h) recebe o Direct3DCreate9 da DXVK, que segue
+ * respondendo as consultas do adaptador; o device é o Vulkan nativo. */
 static void *host_create9(uint32_t sdk)
 {
     load();
-    void *d3d = g_create9(sdk);
-    return d3d && re5vk_enabled() ? re5vk_wrap_d3d9(d3d) : d3d;
+    if (re5vk_enabled()) return re5_renderer_create_d3d9(sdk, g_create9);
+    return g_create9(sdk);
+}
+
+/* ---- janela do Android em segundo plano ----
+ * Ao sair do primeiro plano o Android destrói a superfície (SDLSurface.surfaceDestroyed) e o SDL
+ * solta o ANativeWindow; ao voltar dá OUTRO ANativeWindow. A DXVK e o re5vk guardavam o da criação
+ * do device e o processo caía na volta (uso de janela liberada / swapchain sem superfície). Agora:
+ *  - o Java fecha o portão antes de a superfície morrer (espera o Present em curso acabar) e o abre
+ *    quando a nova existe (SDLActivity.nativeSurfaceGate);
+ *  - o Present do jogo espera com o portão fechado (o jogo fica parado em segundo plano);
+ *  - quem cria superfície pede a janela atual (re5_android_current_window), nunca a guardada. */
+#if defined(__ANDROID__)
+#include <pthread.h>
+#include <jni.h>
+#include <time.h>
+
+static pthread_mutex_t g_gate_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
+static int g_gate_closed, g_in_present;
+static uint32_t g_gate_gen;
+static SDL_Window *g_game_window;
+
+void *re5_android_current_window(void)
+{
+    SDL_Window *w = g_game_window;
+    if (!w) return NULL;
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(w, &info) || info.subsystem != SDL_SYSWM_ANDROID) return NULL;
+    return info.info.android.window;
+}
+
+uint32_t re5_android_surface_gen(void) { return __atomic_load_n(&g_gate_gen, __ATOMIC_ACQUIRE); }
+
+void re5_android_present_enter(void)
+{
+    pthread_mutex_lock(&g_gate_mu);
+    if (g_gate_closed) {
+        RE5_INFO("d3d9", "segundo plano: Present parado até a janela voltar");
+        while (g_gate_closed) pthread_cond_wait(&g_gate_cv, &g_gate_mu);
+        RE5_INFO("d3d9", "janela de volta: Present segue (superfície %u)", g_gate_gen);
+    }
+    g_in_present = 1;
+    pthread_mutex_unlock(&g_gate_mu);
+}
+
+void re5_android_present_leave(void)
+{
+    pthread_mutex_lock(&g_gate_mu);
+    g_in_present = 0;
+    pthread_cond_broadcast(&g_gate_cv);
+    pthread_mutex_unlock(&g_gate_mu);
+}
+
+JNIEXPORT void JNICALL Java_org_libsdl_app_SDLActivity_nativeSurfaceGate(JNIEnv *env, jclass cls, jint open)
+{
+    (void)env;
+    (void)cls;
+    pthread_mutex_lock(&g_gate_mu);
+    if (!open) {
+        if (!g_gate_closed) {
+            re5_dsound_pause(1);
+            re5_k32_clock_pause(1);
+        }
+        g_gate_closed = 1;
+        /* espera o Present em curso (no máximo 3 s: um driver preso não segura a UI até o ANR) */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 3;
+        while (g_in_present)
+            if (pthread_cond_timedwait(&g_gate_cv, &g_gate_mu, &ts) != 0) {
+                RE5_WARN("d3d9", "superfície destruída com um Present ainda em curso");
+                break;
+            }
+    } else if (g_gate_closed) {
+        re5_k32_clock_pause(0);
+        re5_dsound_pause(0);
+        g_gate_closed = 0;
+        __atomic_add_fetch(&g_gate_gen, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_gate_cv);
+    }
+    pthread_mutex_unlock(&g_gate_mu);
+}
+#endif
+
+void re5_android_frame_rate(void *anw)
+{
+#if defined(__ANDROID__)
+    static void *last;
+    static float rate = -1.0f;
+    static int (*set_rate)(void *, float, int8_t);
+    if (rate < 0.0f) {
+        const char *e = getenv("RE5_FRAME_RATE");
+        rate = e ? (float)atof(e) : 60.0f;
+        if (rate < 0.0f) rate = 0.0f;
+        void *lib = dlopen("libandroid.so", RTLD_NOW);
+        set_rate = lib ? (int (*)(void *, float, int8_t))dlsym(lib, "ANativeWindow_setFrameRate") : NULL;
+    }
+    if (!anw || anw == last || rate == 0.0f || !set_rate) return;
+    last = anw;
+    int r = set_rate(anw, rate, 1 /* ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE */);
+    RE5_INFO("d3d9", "ANativeWindow_setFrameRate(%.0f, FIXED_SOURCE): %s (RE5_FRAME_RATE=0 desliga)", rate,
+             r == 0 ? "ok" : "recusado");
+#else
+    (void)anw;
+#endif
 }
 
 static void *host_window(uint32_t hwnd)
@@ -296,8 +424,10 @@ static void *host_window(uint32_t hwnd)
      * dela cria a superfície Vulkan direto do ANativeWindow da janela. */
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
+    g_game_window = w;
     if (!SDL_GetWindowWMInfo(w, &info) || info.subsystem != SDL_SYSWM_ANDROID || !info.info.android.window)
         re5_fatal("d3d9", "janela 0x%X sem ANativeWindow (SDL_GetWindowWMInfo: %s)", hwnd, SDL_GetError());
+    re5_android_frame_rate(info.info.android.window);
     return info.info.android.window;
 #else
     return w;

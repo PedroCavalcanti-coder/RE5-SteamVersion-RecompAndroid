@@ -10,6 +10,10 @@
 #include <stdio.h>
 
 #include "vk_core.h"
+#include "re5_dxt_to_etc2.h"
+#include "re5_tex_cache.h"
+#include "vk_etc2_pool.h"
+#include "../../win32/dxt_decode.h"
 
 uint32_t re5_d3d9_shader_dwords(const uint32_t *code, uint32_t max);   /* win32/d3d9.c */
 
@@ -89,6 +93,10 @@ static VkFormat srgb_pair(VkFormat f)
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
     case VK_FORMAT_BC2_UNORM_BLOCK: return VK_FORMAT_BC2_SRGB_BLOCK;
     case VK_FORMAT_BC3_UNORM_BLOCK: return VK_FORMAT_BC3_SRGB_BLOCK;
+    case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
+    case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK;
+    case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
+    case VK_FORMAT_ASTC_4x4_UNORM_BLOCK: return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -98,8 +106,10 @@ int re5vk_layout_general(void)
     static int g = -1;
     if (g < 0) {
         const char *e = getenv("RE5VK_LAYOUT_GENERAL");
-        g = e && *e == '1';
-        if (g) RE5_INFO("re5vk", "RE5VK_LAYOUT_GENERAL=1: mantendo imagens em VK_IMAGE_LAYOUT_GENERAL");
+        g = re5vk_layout_general_choice(e, 0);
+        RE5_INFO("re5vk", "layouts: %s (RE5VK_LAYOUT_GENERAL=%s)",
+                 g ? "tudo em GENERAL, barreira no fim do passe (modo legado)" : "ótimos por sub-recurso (AFBC/UBWC)",
+                 e && *e ? e : "padrão");
     }
     return g;
 }
@@ -136,7 +146,7 @@ static void layout_stage_src(VkImageLayout l, uint32_t read_stages, VkPipelineSt
         break;
     case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
         *stg = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        *acc = 0;
+        *acc = VK_ACCESS_TRANSFER_READ_BIT;
         break;
     case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
         *stg = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -147,9 +157,16 @@ static void layout_stage_src(VkImageLayout l, uint32_t read_stages, VkPipelineSt
         *acc = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         break;
     case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        /* Sempre VS+FS (alem do registrado): o registro de estagios pode ter perdido o VS (textura de
+         * vertice lida dentro de um passe ja aberto) e a escrita seguinte corria com a leitura. */
+        *stg = (VkPipelineStageFlags)read_stages | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        *acc = VK_ACCESS_SHADER_READ_BIT;
+        break;
     case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
-        *stg = read_stages ? (VkPipelineStageFlags)read_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        *acc = 0;
+        *stg = read_stages ? (VkPipelineStageFlags)read_stages
+                           : (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        *acc = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         break;
     case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
         *stg = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
@@ -157,7 +174,7 @@ static void layout_stage_src(VkImageLayout l, uint32_t read_stages, VkPipelineSt
         break;
     default: /* GENERAL */
         *stg = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        *acc = VK_ACCESS_MEMORY_WRITE_BIT;
+        *acc = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         break;
     }
 }
@@ -182,9 +199,15 @@ static void layout_stage_dst(VkImageLayout l, VkPipelineStageFlags shader_stages
         *acc = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         break;
     case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
-        *stg = shader_stages ? shader_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        *stg = shader_stages ? shader_stages
+                             : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         *acc = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        *stg = shader_stages ? shader_stages
+                             : (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        *acc = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         break;
     case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
         *stg = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
@@ -283,7 +306,7 @@ void re5vk_img_transition(vk_device *d, VkCommandBuffer cb, vk_image *im, uint32
                 size_t idx = (size_t)ly * im->levels + lv;
                 im->sub_layouts[idx] = new_layout;
                 im->sub_dirty[idx] = 0;
-                im->sub_stages[idx] = is_ro ? (uint32_t)(shader_stages ? shader_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) : 0u;
+                im->sub_stages[idx] = is_ro ? (uint32_t)(shader_stages ? shader_stages : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)) : 0u;
             }
         }
         return;
@@ -319,7 +342,7 @@ void re5vk_img_transition(vk_device *d, VkCommandBuffer cb, vk_image *im, uint32
             };
             im->sub_layouts[idx] = new_layout;
             im->sub_dirty[idx] = 0;
-            im->sub_stages[idx] = is_ro ? (uint32_t)(shader_stages ? shader_stages : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) : 0u;
+            im->sub_stages[idx] = is_ro ? (uint32_t)(shader_stages ? shader_stages : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)) : 0u;
             if (nb == 64) {
                 vkCmdPipelineBarrier(cb, ss_union, ds_union, 0, 0, NULL, 0, NULL, nb, bars);
                 nb = 0;
@@ -348,13 +371,33 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
         }
         if (force32 && format_ok(d, VK_FORMAT_D32_SFLOAT_S8_UINT, need)) vf = VK_FORMAT_D32_SFLOAT_S8_UINT;
     }
+    if (fmt->bw == 4 && !rt && !ds) {
+        static int said;
+        if (!said) {
+            said = 1;
+            if (format_ok(d, vf, need)) RE5_INFO("re5vk", "texturas DXT: BC nativo");
+            else RE5_INFO("re5vk", "texturas DXT: transcodificadas para ETC2/EAC (cache em disco, versão %u)",
+                          (unsigned)RE5_TEX_CACHE_VERSION);
+        }
+    }
     if (!format_ok(d, vf, need)) {
         /* D24S8 não existe na AMD: D32F+S8, como a DXVK */
-        if (vf == VK_FORMAT_D24_UNORM_S8_UINT && format_ok(d, VK_FORMAT_D32_SFLOAT_S8_UINT, need))
+        if (vf == VK_FORMAT_D24_UNORM_S8_UINT && format_ok(d, VK_FORMAT_D32_SFLOAT_S8_UINT, need)) {
             vf = VK_FORMAT_D32_SFLOAT_S8_UINT;
-        else
+        } else if (vf == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && format_ok(d, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, need)) {
+            /* Mali / mobile sem BC: transcodificação direta para ETC2 RGBA8 EAC (preserva o alpha 1-bit de folhas/cabelos) */
+            vf = VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+        } else if (vf == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && format_ok(d, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, need)) {
+            /* Fallback para GPUs mobile que só tenham ETC2 RGB8 */
+            vf = VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+        } else if ((vf == VK_FORMAT_BC2_UNORM_BLOCK || vf == VK_FORMAT_BC3_UNORM_BLOCK) &&
+                   format_ok(d, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, need)) {
+            /* Mali / mobile sem BC: transcodificação direta para ETC2 RGBA8 EAC (mesmo tamanho: 8 bpp) */
+            vf = VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+        } else {
             re5_fatal("re5vk", "formato D3D %u (Vulkan %d) sem suporte para %s nesta GPU", (unsigned)fmt->d3d, (int)vf,
                       ds ? "profundidade" : rt ? "render target" : "textura");
+        }
     }
     if (!levels) {
         uint32_t m = w > h ? w : h;
@@ -383,19 +426,36 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
      * quando sabe quais vistas vão existir). */
     VkFormat sv = (usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !ds ? srgb_pair(vf) : VK_FORMAT_UNDEFINED;
     if (sv != VK_FORMAT_UNDEFINED && !format_ok(d, sv, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) sv = VK_FORMAT_UNDEFINED;
+#if defined(__ANDROID__)
+    /* MUTABLE_FORMAT desliga a compressão de framebuffer (AFBC no Mali, UBWC em parte dos Adreno)
+     * justamente nos render targets, que são o grosso da banda. Só texturas comuns ganham o par sRGB;
+     * RE5VK_RT_MUTABLE=1 devolve o par aos render targets. Se um RT sem o par for amostrado com
+     * D3DSAMP_SRGBTEXTURE, re5vk_image_sampled_view avisa (uma vez) em vez de errar a gama calado. */
+    static int rt_mut = -1;
+    if (rt_mut < 0) {
+        const char *e = getenv("RE5VK_RT_MUTABLE");
+        rt_mut = e && *e == '1';
+    }
+    if (rt && !rt_mut && sv != VK_FORMAT_UNDEFINED) {
+        sv = VK_FORMAT_UNDEFINED;
+        im->srgb_dropped = 1;
+    }
+#endif
     VkFormat views[2] = {vf, sv};
     VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
                                       .viewFormatCount = 2, .pViewFormats = views};
     if (sv != VK_FORMAT_UNDEFINED) {
         ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+#if defined(__ANDROID__)
+        if (d->has_fmt_list) ci.pNext = &fl;   /* Vulkan 1.1 sem VK_KHR_image_format_list: a lista é inválida */
+#else
         ci.pNext = &fl;
+#endif
     }
-    VK_CHECK(vkCreateImage(d->dev, &ci, NULL, &im->image));
+    memset(&im->mem, 0, sizeof im->mem);
+    im->image = re5_vkn_image_create(&ci, rt ? "re5vk.render_target" : ds ? "re5vk.profundidade" : "re5vk.textura",
+                                     &im->mem.v);   /* vmaCreateImage */
     im->srgb = sv;
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(d->dev, im->image, &req);
-    im->mem = re5vk_mem_alloc(d, req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-    VK_CHECK(vkBindImageMemory(d->dev, im->image, im->mem.mem, im->mem.off));
     im->fmt = fmt;
     im->vkf = vf;
     im->w = w;
@@ -426,6 +486,7 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
         VK_CHECK(vkCreateImageView(d->dev, &vi, NULL, &im->view));
     }
     im->rt_views = calloc(nsub, sizeof *im->rt_views);
+    im->attach = (uint8_t)(rt || ds);
     int gen = re5vk_layout_general();
     if (gen || (fmt->bw == 1 && fmt->bh == 1)) {
         re5vk_end_rendering(d);
@@ -447,6 +508,12 @@ int re5vk_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_fo
                 vkCmdClearColorImage(cb, im->image, init_layout, &z, 1, &all);
             }
             re5vk_img_mark_written(im, 0, levels, 0, layers);
+            if (!gen) {
+                VkImageLayout rest_layout = rt ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                          : ds ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                               : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                re5vk_img_transition(d, cb, im, 0, levels, 0, layers, rest_layout, 0);
+            }
         }
     }
     return 0;
@@ -469,6 +536,16 @@ VkImageView re5vk_image_rt_view(vk_device *d, vk_image *im, uint32_t layer, uint
 
 VkImageView re5vk_image_sampled_view(vk_device *d, vk_image *im, int srgb)
 {
+#if defined(__ANDROID__)
+    if (srgb && im->srgb_dropped) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            RE5_WARN("re5vk", "render target %ux%u amostrado com D3DSAMP_SRGBTEXTURE sem vista sRGB (gama linear); "
+                              "RE5VK_RT_MUTABLE=1 corrige ao custo da compressão AFBC/UBWC", im->w, im->h);
+        }
+    }
+#endif
     if (!srgb || im->srgb == VK_FORMAT_UNDEFINED) return im->view;
     if (im->view_srgb) return im->view_srgb;
     VkImageViewCreateInfo vi = {
@@ -503,22 +580,94 @@ void re5vk_image_destroy(vk_device *d, vk_image *im)
 
 /* Sobe a região [x, y, z] x [w, h, depth] de `data` (linhas de `pitch` bytes, fatias de
  * `slice` bytes) para o nível/camada da imagem. */
+static int upload_cb_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RE5VK_UPLOAD_CB");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* Faixa de uma textura DXT recodificada para ETC2/EAC, com o cache em disco. Sem o lock do device: o hash,
+ * a E/S do cache e a recodificação levam milissegundos e seguravam a thread de render (A54, 20/11/2026). */
+static int etc2_target(const vk_image *im)
+{
+    const vk_format *f = im->fmt;
+    return (im->vkf == VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK || im->vkf == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) &&
+           (f->d3d == D3DFMT_DXT1 || f->d3d == D3DFMT_DXT2 || f->d3d == D3DFMT_DXT3 || f->d3d == D3DFMT_DXT4 ||
+            f->d3d == D3DFMT_DXT5);
+}
+
+static uint8_t *etc2_encode(const vk_image *im, uint32_t level, uint32_t w, uint32_t h, uint32_t depth,
+                            const uint8_t *data, uint32_t pitch, uint32_t slice)
+{
+    const vk_format *f = im->fmt;
+    uint32_t bb = im->vkf == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK ? 16 : 8;
+    uint32_t row = (w + f->bw - 1) / f->bw * bb, rows = (h + f->bh - 1) / f->bh;
+    uint8_t *out = malloc((size_t)row * rows * depth);
+    if (!out) re5_fatal("re5vk", "sem memória");
+    int mode = (f->d3d == D3DFMT_DXT1) ? 1 : (f->d3d == D3DFMT_DXT2 || f->d3d == D3DFMT_DXT3) ? 3 : 5;
+    for (uint32_t s = 0; s < depth; s++) {
+        uint8_t *dst_slice = out + (size_t)s * rows * row;
+        const uint8_t *src_slice = data + (size_t)s * slice;
+        uint64_t hash = re5_tex_calc_hash(w, h, level, (uint32_t)f->d3d, src_slice, (size_t)rows * pitch);
+        if (!re5_tex_cache_load(hash, (uint32_t)(rows * row), dst_slice)) {
+            re5vk_etc2_surface(mode, w, h, src_slice, pitch, dst_slice, row);
+            re5_tex_cache_save(hash, w, h, im->levels, (uint32_t)f->d3d, dst_slice, (uint32_t)(rows * row));
+        }
+    }
+    return out;
+}
+
+/* pre: a faixa já recodificada (etc2_encode, fora do lock); NULL recodifica aqui. */
 static void upload(vk_device *d, vk_image *im, uint32_t layer, uint32_t level, uint32_t x, uint32_t y, uint32_t z,
-                   uint32_t w, uint32_t h, uint32_t depth, const uint8_t *data, uint32_t pitch, uint32_t slice)
+                   uint32_t w, uint32_t h, uint32_t depth, const uint8_t *data, uint32_t pitch, uint32_t slice,
+                   const uint8_t *pre)
 {
     if (!w || !h || !depth) return;
     const vk_format *f = im->fmt;
     uint32_t bw = f->bw, bh = f->bh;
-    uint32_t row = (w + bw - 1) / bw * f->bytes, rows = (h + bh - 1) / bh;
+    int is_etc2_target = (im->vkf == VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK ||
+                          im->vkf == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK);
+    int is_dxt_source = (f->d3d == D3DFMT_DXT1 || f->d3d == D3DFMT_DXT2 || f->d3d == D3DFMT_DXT3 ||
+                         f->d3d == D3DFMT_DXT4 || f->d3d == D3DFMT_DXT5);
+    uint32_t dst_block_bytes = (is_etc2_target && is_dxt_source) ?
+        ((im->vkf == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) ? 16 : 8) : f->bytes;
+    uint32_t row = (w + bw - 1) / bw * dst_block_bytes, rows = (h + bh - 1) / bh;
     VkDeviceSize size = (VkDeviceSize)row * rows * depth;
     VkBuffer buf;
     VkDeviceSize off;
-    re5vk_end_rendering(d);
-    uint8_t *p = re5vk_stage(d, size, f->bytes, &buf, &off);
-    for (uint32_t s = 0; s < depth; s++)
-        for (uint32_t r = 0; r < rows; r++)
-            memcpy(p + ((size_t)s * rows + r) * row, data + (size_t)s * slice + (size_t)r * pitch, row);
-    VkCommandBuffer cb = re5vk_cmd(d);
+    /* Textura nova (subrecurso ainda UNDEFINED, so amostrada): grava no cb de upload, que roda antes do
+     * principal, sem fechar o passe da cena (num tiler cada fechamento regrava e relê o tile inteiro;
+     * na carga sobem milhares de texturas). RE5VK_UPLOAD_CB=0 volta ao caminho antigo. */
+    /* (até 20/11 testava !im->rt_views, que existe em toda imagem: o caminho nunca rodava) */
+    int sep = upload_cb_on() && !re5vk_layout_general() && !im->attach && !f->depth && im->sub_layouts &&
+              im->sub_layouts[(size_t)layer * im->levels + level] == VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!sep) re5vk_end_rendering(d);
+    uint8_t *p = re5vk_stage(d, size, dst_block_bytes, &buf, &off);
+
+    if (is_etc2_target && is_dxt_source && pre) {
+        memcpy(p, pre, (size_t)row * rows * depth);
+    } else if (is_etc2_target && is_dxt_source) {
+        int mode = (f->d3d == D3DFMT_DXT1) ? 1 : (f->d3d == D3DFMT_DXT2 || f->d3d == D3DFMT_DXT3) ? 3 : 5;
+        for (uint32_t s = 0; s < depth; s++) {
+            uint8_t *dst_slice = p + (size_t)s * rows * row;
+            const uint8_t *src_slice = data + (size_t)s * slice;
+            uint64_t hash = re5_tex_calc_hash(w, h, level, (uint32_t)f->d3d, src_slice, (size_t)rows * pitch);
+            if (!re5_tex_cache_load(hash, (uint32_t)(rows * row), dst_slice)) {
+                re5vk_etc2_surface(mode, w, h, src_slice, pitch, dst_slice, row);
+                re5_tex_cache_save(hash, w, h, im->levels, (uint32_t)f->d3d, dst_slice, (uint32_t)(rows * row));
+            }
+        }
+    } else {
+        for (uint32_t s = 0; s < depth; s++)
+            for (uint32_t r = 0; r < rows; r++)
+                memcpy(p + ((size_t)s * rows + r) * row, data + (size_t)s * slice + (size_t)r * pitch, row);
+    }
+    VkCommandBuffer cb = sep ? re5vk_upload_cmd(d) : re5vk_cmd(d);
+    if (d->tm.on) { if (sep) d->tm.up_fast++; else d->tm.up_slow++; }
     VkImageLayout dst_layout = re5vk_layout_general() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     re5vk_img_transition(d, cb, im, level, 1, layer, 1, dst_layout, 0);
     VkBufferImageCopy c = {
@@ -533,6 +682,11 @@ static void upload(vk_device *d, vk_image *im, uint32_t layer, uint32_t level, u
     re5vk_img_mark_written(im, level, 1, layer, 1);
     re5vk_tbdr_mark_external_write(&im->tbdr_subs[(size_t)layer * im->levels + level],
                                    RE5VK_TBDR_COLOR | RE5VK_TBDR_DEPTH | RE5VK_TBDR_STENCIL);
+    if (!re5vk_layout_general() && !im->rt_views && !im->fmt->depth) {
+        re5vk_img_transition(d, cb, im, level, 1, layer, 1,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
     im->last_use = d->serial;
 }
 
@@ -842,8 +996,32 @@ static HRESULT tex_unlock(vk_texture *t, uint32_t layer, uint32_t level)
 {
     if (level >= t->img.levels || layer >= t->img.layers) return D3DERR_INVALIDCALL;
     vk_device *d = t->o.dev;
-    re5vk_lock(d);
     size_t i = (size_t)layer * t->img.levels + level;
+    /* O Lock/Unlock de um nível é da thread do jogo que o pediu; a recodificação DXT -> ETC2 (hash, cache
+     * em disco, codificador) sai do lock do device para não parar a thread de render. */
+    uint8_t *pre = NULL;
+    if (t->locks[i].on && t->locks[i].data && etc2_target(&t->img)) {
+        const vk_format *f = t->img.fmt;
+        uint32_t pitch, rows, slices;
+        level_layout(t, level, &pitch, &rows, &slices);
+        RECT r = t->locks[i].r;
+        D3DBOX bx = t->locks[i].box;
+        uint32_t lw = t->img.w >> level, lh = t->img.h >> level;
+        if (!lw) lw = 1;
+        if (!lh) lh = 1;
+        uint32_t x = (uint32_t)r.left / f->bw * f->bw, y = (uint32_t)r.top / f->bh * f->bh;
+        uint32_t x2 = (uint32_t)r.right, y2 = (uint32_t)r.bottom;
+        if (x2 > lw) x2 = lw;
+        if (y2 > lh) y2 = lh;
+        uint32_t z = t->img.type == VK_IMAGE_TYPE_3D ? bx.Front : 0;
+        uint32_t nz = t->img.type == VK_IMAGE_TYPE_3D ? bx.Back - bx.Front : 1;
+        if (x2 > x && y2 > y) {
+            const uint8_t *src = t->locks[i].data + (size_t)z * pitch * rows + (size_t)(y / f->bh) * pitch +
+                                 (size_t)(x / f->bw) * f->bytes;
+            pre = etc2_encode(&t->img, level, x2 - x, y2 - y, nz, src, pitch, pitch * rows);
+        }
+    }
+    re5vk_lock(d);
     if (t->locks[i].on && t->locks[i].data) {
         const vk_format *f = t->img.fmt;
         uint32_t pitch, rows, slices;
@@ -863,11 +1041,12 @@ static HRESULT tex_unlock(vk_texture *t, uint32_t layer, uint32_t level)
         if (x2 > x && y2 > y) {
             const uint8_t *src = t->locks[i].data + (size_t)z * pitch * rows + (size_t)(y / f->bh) * pitch +
                                  (size_t)(x / f->bw) * f->bytes;
-            upload(d, &t->img, layer, level, x, y, z, x2 - x, y2 - y, nz, src, pitch, pitch * rows);
+            upload(d, &t->img, layer, level, x, y, z, x2 - x, y2 - y, nz, src, pitch, pitch * rows, pre);
         }
         t->locks[i].on = 0;
     }
     re5vk_unlock(d);
+    free(pre);
     return D3D_OK;
 }
 
@@ -1023,32 +1202,17 @@ HRESULT STDMETHODCALLTYPE re5vk_CreateDepthStencilSurface(IDirect3DDevice9 *self
 
 static void buffer_alloc(vk_device *d, vk_buffer *b)
 {
-    VkBufferCreateInfo ci = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = b->size ? b->size : 4,
-        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-    };
-    VkMemoryRequirements req;
+    const VkDeviceSize size = b->size ? b->size : 4;
+    const VkBufferUsageFlags usage =
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     /* DYNAMIC (travado a cada quadro): na memória do guest, e o Unlock da ponte não copia. Os
      * estáticos ficam fora, para não gastar o espaço de 32 bits do guest com malhas. */
     if (d->zerocopy && (b->usage & D3DUSAGE_DYNAMIC)) {
-        VkExternalMemoryBufferCreateInfo ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-                                                .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
-        ci.pNext = &ext;
-        VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &b->buf));
-        vkGetBufferMemoryRequirements(d->dev, b->buf, &req);
-        b->mem = re5vk_mem_alloc_guest(d, req);
-        if (b->mem.mem) {
-            VK_CHECK(vkBindBufferMemory(d->dev, b->buf, b->mem.mem, b->mem.off));
-            return;
-        }
-        vkDestroyBuffer(d->dev, b->buf, NULL);   /* desligou: refaz pelo caminho comum */
-        ci.pNext = NULL;
+        b->buf = re5vk_buffer_new_guest(d, size, usage, &b->mem);
+        if (b->buf) return;   /* senão desligou: caminho comum */
     }
-    VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &b->buf));
-    vkGetBufferMemoryRequirements(d->dev, b->buf, &req);
-    b->mem = re5vk_mem_alloc(d, req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
-    VK_CHECK(vkBindBufferMemory(d->dev, b->buf, b->mem.mem, b->mem.off));
+    b->buf = re5vk_buffer_new(d, size, usage, 1, b->o.kind == VKO_IB ? "re5vk.index_buffer" : "re5vk.vertex_buffer",
+                              &b->mem);
 }
 
 static vk_buffer *buffer_new(vk_device *d, int kind, const void *vt, UINT size, DWORD usage, D3DPOOL pool)
@@ -1215,7 +1379,8 @@ HRESULT re5vk_shader_variant(vk_device *d, vk_shader *s, const re5vk_dxso_varian
 {
     for (int i = 0; i < s->nv; i++) {
         if (s->v[i].var.depth_samplers == var->depth_samplers && s->v[i].var.alpha_func == var->alpha_func &&
-            s->v[i].var.in_uint == var->in_uint && s->v[i].var.in_sint == var->in_sint) {
+            s->v[i].var.in_uint == var->in_uint && s->v[i].var.in_sint == var->in_sint &&
+            s->v[i].var.in_udec3 == var->in_udec3) {
             *mod = s->v[i].mod;
             *info = &s->v[i].info;
             return D3D_OK;
@@ -1383,12 +1548,11 @@ void re5vk_init_dummies(vk_device *d)
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     re5vk_img_transition(d, cb, &d->dummycube, 0, 1, 0, 6, ro_layout,
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    VkBufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256,
-                             .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT};
-    VK_CHECK(vkCreateBuffer(d->dev, &ci, NULL, &d->zero_vb));
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(d->dev, d->zero_vb, &req);
-    d->zero_vb_mem = re5vk_mem_alloc(d, req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
-    VK_CHECK(vkBindBufferMemory(d->dev, d->zero_vb, d->zero_vb_mem.mem, d->zero_vb_mem.off));
+    d->zero_vb = re5vk_buffer_new(d, 256, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 1, "re5vk.vertex_zero", &d->zero_vb_mem);
     memset(d->zero_vb_mem.map, 0, 256);
+    {   /* D3D9: elemento ausente na declaracao le (0,0,0,1) (a DXVK tambem). RE5VK_MISSING_W1=0 deixa tudo zero. */
+        const char *e = getenv("RE5VK_MISSING_W1");
+        if (!(e && *e == '0'))
+            for (int i = 0; i < 256 / 16; i++) ((float *)d->zero_vb_mem.map)[i * 4 + 3] = 1.0f;
+    }
 }

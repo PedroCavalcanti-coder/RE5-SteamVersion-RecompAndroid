@@ -90,6 +90,12 @@ patch("src/d3d9/d3d9_common_texture.cpp",
       '    }\n'
       '    DxvkImageViewCreateInfo viewInfo;')
 
+# Present: medida e quadros em voo (DXVK_RE5_PRESENT_DEPTH); ver android/dxvk/re5_present.py.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import re5_present  # noqa: E402
+
+re5_present.apply(patch)
+
 # Shaders embutidos: os .h que a DXVK inclui (gerados pelo meson no build original).
 generated = args.output / "generated"
 generated.mkdir(exist_ok=True)

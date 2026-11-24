@@ -24,7 +24,15 @@ std::mutex screenMutex;
 // Tamanho da tela (orientação atual), dado pelo runtime antes do Direct3DCreate9.
 uint32_t screenWidth = 1280, screenHeight = 720;
 HMONITOR monitor() { return reinterpret_cast<HMONITOR>(uintptr_t{1}); }
-ANativeWindow* nativeWindow(HWND window) { return reinterpret_cast<ANativeWindow*>(window); }
+// A janela muda ao voltar do segundo plano (o Android dá outro ANativeWindow e o SDL solta o
+// antigo): com o provedor do runtime (re5_dxvk_set_window_fn), a superfície e o tamanho saem
+// sempre da janela atual, nunca do HWND guardado na criação do device.
+std::atomic<void* (*)()> windowFn{nullptr};
+ANativeWindow* nativeWindow(HWND window) {
+    auto fn = windowFn.load();
+    if (fn) return reinterpret_cast<ANativeWindow*>(fn());
+    return reinterpret_cast<ANativeWindow*>(window);
+}
 // O driver Vulkan que a DXVK usa (o patch do vulkan_loader.cpp vem do porte do
 // NFSU2, que permite trocar pelo adrenotools); aqui é sempre o do sistema.
 std::atomic<PFN_vkGetInstanceProcAddr> instanceProcAddr{nullptr};
@@ -38,6 +46,7 @@ extern "C" __attribute__((visibility("default"))) void re5_dxvk_set_screen(uint3
         screenHeight = height;
     }
 }
+extern "C" __attribute__((visibility("default"))) void re5_dxvk_set_window_fn(void* (*fn)()) { windowFn = fn; }
 extern "C" void dxvkAndroidSetInstanceProcAddr(PFN_vkGetInstanceProcAddr entry) { instanceProcAddr = entry; }
 extern "C" PFN_vkGetInstanceProcAddr dxvkAndroidGetInstanceProcAddr() {
     auto entry = instanceProcAddr.load();
@@ -66,6 +75,7 @@ VkResult createSurface(HWND window, const Rc<vk::InstanceFn>& instance, VkSurfac
     if (!create) return VK_ERROR_EXTENSION_NOT_PRESENT;
     VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
     info.window = nativeWindow(window);
+    if (!info.window) return VK_ERROR_SURFACE_LOST_KHR;   // em segundo plano: sem janela agora
     VkResult vr = create(instance->instance(), &info, nullptr, surface);
     if (vr != VK_SUCCESS)
         Logger::err(str::format("Android WSI: vkCreateAndroidSurfaceKHR(", window, ") = ", vr));

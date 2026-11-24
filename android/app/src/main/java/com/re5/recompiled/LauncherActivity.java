@@ -57,6 +57,7 @@ import java.util.Locale;
 public final class LauncherActivity extends Activity {
     private static final int REQUEST_ARCHIVE_PICK = 1001;
     private static final int REQUEST_STORAGE_PERMISSION = 1002;
+    private static final int REQUEST_NOTIFICATIONS = 1003;
 
     private static final int BG = 0xFF0A0B0D;
     private static final int SURFACE = 0xFF15171B;
@@ -95,6 +96,7 @@ public final class LauncherActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refresh();
+        watchExtraction();
         String launchedAt = GameSession.consumeLaunch(this);
         if (launchedAt != null) reportLastRun(launchedAt);
     }
@@ -301,6 +303,10 @@ public final class LauncherActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_ARCHIVE_PICK && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            try {   // o serviço lê o arquivo mesmo depois que esta activity some
+                getContentResolver().takePersistableUriPermission(data.getData(), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (SecurityException ignored) {
+            }
             startExtraction(data.getData(), null);
         }
         if (requestCode == REQUEST_SETTINGS && resultCode == RESULT_OK && data != null
@@ -310,38 +316,60 @@ public final class LauncherActivity extends Activity {
     }
 
     private void startExtraction(Uri uri, String directPath) {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
+        if (!ExtractService.start(this, uri, directPath))
+            Toast.makeText(this, L.t("A extração já está em andamento."), Toast.LENGTH_SHORT).show();
+        watchExtraction();
+    }
+
+    /** Mostra o progresso do ExtractService (que segue com o app fora da tela) e o resultado uma vez. */
+    private final Runnable extractPoll = new Runnable() {
+        @Override
+        public void run() {
+            ExtractService.State st = ExtractService.state;
+            if (st.running) {
+                if (!busy) setBusy(true, L.t("Extraindo arquivos do jogo…"));
+                if (st.permille >= 0) {
+                    progressBar.setIndeterminate(false);
+                    progressBar.setMax(1000);
+                    progressBar.setProgress(st.permille);
+                }
+                progressDetail.setText(st.files + L.t(" arquivos") + (st.permille >= 0
+                        ? String.format(Locale.US, " · %.1f%%", st.permille / 10f) : "") + "\n" + st.detail);
+                main.postDelayed(this, 500);
+                return;
+            }
+            if (st.finished && !st.reported) {
+                st.reported = true;
+                onExtractionDone(st.uri, st.error);
+            } else if (busy && !st.running) {
+                setBusy(false, null);
+            }
+        }
+    };
+
+    private void watchExtraction() {
+        main.removeCallbacks(extractPoll);
+        ExtractService.State st = ExtractService.state;
+        if (st.running || (st.finished && !st.reported)) main.post(extractPoll);
+    }
+
+    private void onExtractionDone(Uri uri, String error) {
+        gameSize = -1;
+        setBusy(false, null);
         File target = GameStorage.gameDir(this);
-        setBusy(true, L.t("Extraindo arquivos do jogo…"));
-        new ArchiveExtractor().extractArchive(this, uri, directPath, target, new ArchiveExtractor.Callback() {
-            @Override
-            public void onProgress(String currentFile, long processedCount, int percent) {
-                main.post(() -> progressDetail.setText(processedCount + L.t(" arquivos\n") + currentFile));
-            }
-
-            @Override
-            public void onSuccess(int totalFiles, long totalBytes) {
-                main.post(() -> {
-                    gameSize = -1;
-                    setBusy(false, null);
-                    if (GameStorage.isInstalled(target)) {
-                        Toast.makeText(LauncherActivity.this, L.t("Jogo instalado."), Toast.LENGTH_LONG).show();
-                        if (uri != null) offerDeleteArchive(uri);
-                    } else {
-                        alert(L.t("Arquivo incompleto"), L.t("A extração terminou, mas não encontrei ")
-                                + GameStorage.DATA_DIR_NAME + "/ e " + GameStorage.EXE_NAME
-                                + L.t(" na pasta do jogo. O arquivo tem a pasta do jogo completa?"));
-                    }
-                });
-            }
-
-            @Override
-            public void onError(String error) {
-                main.post(() -> {
-                    setBusy(false, null);
-                    alert(L.t("Erro na extração"), error);
-                });
-            }
-        });
+        if (error != null) {
+            alert(L.t("Erro na extração"), error + L.t("\n\nToque em extrair de novo: o que já foi extraído é aproveitado."));
+        } else if (GameStorage.isInstalled(target)) {
+            Toast.makeText(this, L.t("Jogo instalado."), Toast.LENGTH_LONG).show();
+            if (uri != null) offerDeleteArchive(uri);
+        } else {
+            alert(L.t("Arquivo incompleto"), L.t("A extração terminou, mas não encontrei ")
+                    + GameStorage.DATA_DIR_NAME + "/ e " + GameStorage.EXE_NAME
+                    + L.t(" na pasta do jogo. O arquivo tem a pasta do jogo completa?"));
+        }
     }
 
     private void offerDeleteArchive(Uri uri) {

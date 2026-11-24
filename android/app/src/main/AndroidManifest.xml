@@ -9,6 +9,9 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00401000" android:required="true" />
 
@@ -20,7 +23,11 @@
         android:allowBackup="false"
         android:appCategory="game"
         android:isGame="true"
+        android:resizeableActivity="true"
         android:supportsRtl="true">
+
+        <meta-data android:name="android.allow_multiple_resumed_activities" android:value="true" />
+        <meta-data android:name="com.samsung.android.multidisplay.keep_process_alive" android:value="true" />
 
         <!-- Modos do Game Mode (res/xml/game_mode_config.xml): performance e bateria -->
         <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
@@ -30,8 +37,11 @@
             android:exported="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
-            android:screenOrientation="portrait"
+            android:resizeableActivity="true"
+            android:screenOrientation="unspecified"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density"
             android:theme="@android:style/Theme.Material.NoActionBar">
+            <meta-data android:name="com.samsung.android.activity.showWhenLocked" android:value="true" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -43,10 +53,12 @@
             android:exported="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
+            android:resizeableActivity="true"
             android:process=":game"
             android:screenOrientation="sensorLandscape"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <meta-data android:name="com.samsung.android.activity.showWhenLocked" android:value="true" />
         </activity>
 
         <!-- Configurações em tela cheia (abas). -->
@@ -63,6 +75,12 @@
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+
+        <!-- Extração do jogo: segue com o app fora da tela (ExtractService). -->
+        <service
+            android:name=".ExtractService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- Mostra a pasta do jogo (Android/data/.../files/game) no app Arquivos. -->
         <provider

@@ -21,13 +21,16 @@
 
 #include <stdint.h>
 
+/* Família do backend. RE5_GFX_RE5VK = Vulkan nativo (RE5_GFX=vkadreno ou vkmali; o nome exato
+ * é do seletor, re5/renderer.h). */
 typedef enum {
     RE5_GFX_DXVK  = 0,
     RE5_GFX_RE5VK = 1,
     RE5_GFX_GL    = 2
 } re5_gfx_backend;
 
-/* Interpreta RE5_GFX ("", "dxvk", "re5vk", "gl"). 0 = valido, -1 = desconhecido. */
+/* Interpreta RE5_GFX ("", "dxvk", "vkadreno", "vkmali", "gl"). 0 = valido, -1 = desconhecido
+ * (inclusive o antigo "re5vk"). */
 int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out);
 re5_gfx_backend re5_gfx_mode(void);
 
@@ -42,6 +45,22 @@ typedef struct {
 
 /* Backend do host (runtime/src/gfx/d3d9_host.c). */
 const re5_d3d9_backend *re5_d3d9_host_backend(void);
+
+/* Android: ANativeWindow_setFrameRate(janela, RE5_FRAME_RATE, FIXED_SOURCE) uma vez por janela
+ * (padrão 60; 0 desliga). Painéis de taxa variável (LTPO) não derrubam a cadência quando um quadro
+ * atrasa. Sem efeito fora do Android ou abaixo da API 30. */
+void re5_android_frame_rate(void *anw);
+
+/* Android, janela em segundo plano (d3d9_host.c): ANativeWindow atual do jogo (NULL sem superfície),
+ * geração da superfície (muda a cada volta do segundo plano) e o portão do Present. */
+void *re5_android_current_window(void);
+uint32_t re5_android_surface_gen(void);
+void re5_android_present_enter(void);
+void re5_android_present_leave(void);
+/* dsound.c: pausa (1) / retoma (0) a saída de áudio do host junto com o portão. */
+void re5_dsound_pause(int on);
+/* kernel32.c: congela (1) / solta (0) o relógio que o jogo vê (QPC, GetTickCount, timeGetTime). */
+void re5_k32_clock_pause(int on);
 
 /* Troca o backend (testes). NULL volta ao do host. */
 void re5_d3d9_set_backend(const re5_d3d9_backend *b);

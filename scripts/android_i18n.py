@@ -6,6 +6,26 @@ import os
 import sys
 
 T = {
+"Vulkan nativo Adreno (experimental)": (
+    "Native Vulkan for Adreno (experimental)",
+    "Vulkan nativo para Adreno (experimental)",
+    "Adreno 原生 Vulkan（实验性）",
+    "Нативный Vulkan для Adreno (эксперим.)",
+    "Adreno 向けネイティブ Vulkan（実験的）"),
+"Vulkan nativo Mali (experimental)": (
+    "Native Vulkan for Mali (experimental)",
+    "Vulkan nativo para Mali (experimental)",
+    "Mali 原生 Vulkan（实验性）",
+    "Нативный Vulkan для Mali (эксперим.)",
+    "Mali 向けネイティブ Vulkan（実験的）"),
+"Vulkan nativo": ("Native Vulkan", "Vulkan nativo", "原生 Vulkan", "Нативный Vulkan", "ネイティブ Vulkan"),
+"Os renderizadores nativos são para GPU Adreno ou Mali. Este aparelho usa ": (
+    "The native renderers are for Adreno or Mali GPUs. This device uses ",
+    "Los renderizadores nativos son para GPU Adreno o Mali. Este dispositivo usa ",
+    "原生渲染器适用于 Adreno 或 Mali GPU。本设备使用 ",
+    "Нативные рендереры — для GPU Adreno или Mali. На этом устройстве ",
+    "ネイティブレンダラーは Adreno または Mali GPU 用です。この端末は "),
+": fica a DXVK.": (": DXVK stays.", ": se queda DXVK.", "：保持 DXVK。", ": остаётся DXVK.", "：DXVK のままです。"),
 "Falta o re5dx9.clean.exe na pasta do jogo. Este app não traz arquivos do jogo: coloque o seu ": (
     "re5dx9.clean.exe is missing from the game folder. This app ships no game files: put your own ",
     "Falta re5dx9.clean.exe en la carpeta del juego. Esta app no incluye archivos del juego: coloca tu propio ",
@@ -515,6 +535,7 @@ T = {
 "— CPU": ("— CPU", "— CPU", "— CPU", "— ЦП", "— CPU"),
 "… CPU": ("… CPU", "… CPU", "… CPU", "… ЦП", "… CPU"),
 "%.0f%% CPU": ("%.0f%% CPU", "%.0f%% CPU", "%.0f%% CPU", "%.0f%% ЦП", "%.0f%% CPU"),
+" · máx %.0f%% %s": (" · max %.0f%% %s", " · máx %.0f%% %s", " · 最高 %.0f%% %s", " · макс %.0f%% %s", " · 最大 %.0f%% %s"),
 "↺ RESTAURAR": ("↺ RESET", "↺ RESTAURAR", "↺ 恢复默认", "↺ СБРОС", "↺ リセット"),
 "⌨ Usando o teclado · toque na tela para voltar": ("⌨ Using the keyboard · touch the screen to go back",
     "⌨ Usando el teclado · toca la pantalla para volver", "⌨ 正在使用键盘 · 触摸屏幕切回",

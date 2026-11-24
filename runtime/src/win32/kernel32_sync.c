@@ -24,6 +24,93 @@
 
 #include "kernel32_internal.h"
 #include "../core/host_sync.h"
+#include "re5/stats.h"
+
+/* ---- RE5_FPS_LOG: onde as threads do jogo dormem (2026-11-11) ----
+ * O Perfetto no A54 mostrou a principal dormindo ~1200 vezes por segundo (metade por menos de
+ * 10 us) e os workers do job system acordados ~10 mil vezes por segundo, pagando mais tempo
+ * esperando núcleo que rodando. Isto conta só as esperas que de fato dormiram (o caminho rápido
+ * e o giro não pagam nada): tipo, ponto do jogo que chamou (endereço de retorno no guest) e
+ * a função inicial da thread (o gXXXXXXXX do nome; 0 = principal). re5_k32_wait_report imprime
+ * as maiores a cada 10 s e zera. Desligado (sem RE5_FPS_LOG), custa uma leitura de inteiro. */
+enum { WK_CS, WK_WAIT, WK_N };
+static const char *const g_wk_name[WK_N] = {"EnterCriticalSection", "WaitFor*Object(s)"};
+typedef struct {
+    uint32_t site, start;
+    uint8_t kind, used;
+    uint64_t n, ns;
+} k32_wsite;
+#define K32_WSITES 512
+static k32_wsite g_ws[K32_WSITES];
+static uint64_t g_ws_n[WK_N], g_ws_ns[WK_N], g_ws_lost;
+static re5_mutex g_ws_mu;
+static int g_ws_mu_ready;   /* 0 = não iniciado, 1 = iniciando, 2 = pronto */
+
+/* Inicia o mutex uma vez só, mesmo com várias threads chegando juntas na primeira espera: duas
+ * inicializações do mesmo pthread_mutex com uma delas já travada corrompem o mutex. */
+static void ws_mu_ready(void)
+{
+    if (__atomic_load_n(&g_ws_mu_ready, __ATOMIC_ACQUIRE) == 2) return;
+    int z = 0;
+    if (__atomic_compare_exchange_n(&g_ws_mu_ready, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        re5_mutex_init(&g_ws_mu);
+        __atomic_store_n(&g_ws_mu_ready, 2, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&g_ws_mu_ready, __ATOMIC_ACQUIRE) != 2) re5_host_yield();
+}
+
+static void wait_stat(int kind, uint32_t site, uint64_t ns)
+{
+    ws_mu_ready();
+    re5_thread *t = re5_thread_current();
+    uint32_t start = t && !t->is_main ? t->start_va : 0;
+    re5_mutex_lock(&g_ws_mu);
+    g_ws_n[kind]++;
+    g_ws_ns[kind] += ns;
+    uint32_t h = (site * 2654435761u ^ start * 40503u ^ (uint32_t)kind) % K32_WSITES;
+    for (uint32_t i = 0; i < K32_WSITES; i++, h = (h + 1) % K32_WSITES) {
+        k32_wsite *e = &g_ws[h];
+        if (!e->used) {
+            *e = (k32_wsite){site, start, (uint8_t)kind, 1, 0, 0};
+        } else if (e->site != site || e->start != start || e->kind != kind) {
+            continue;
+        }
+        e->n++;
+        e->ns += ns;
+        re5_mutex_unlock(&g_ws_mu);
+        return;
+    }
+    g_ws_lost++;
+    re5_mutex_unlock(&g_ws_mu);
+}
+
+void re5_k32_wait_report(double secs)
+{
+    if (__atomic_load_n(&g_ws_mu_ready, __ATOMIC_ACQUIRE) != 2 || secs <= 0) return;
+    re5_mutex_lock(&g_ws_mu);
+    RE5_INFO("espera", "por s (só esperas que dormiram): CS %.0f sonos %.1f ms; WaitFor* %.0f sonos %.1f ms%s",
+             g_ws_n[WK_CS] / secs, g_ws_ns[WK_CS] / 1e6 / secs, g_ws_n[WK_WAIT] / secs,
+             g_ws_ns[WK_WAIT] / 1e6 / secs, g_ws_lost ? " (tabela cheia: parte perdida)" : "");
+    for (int k = 0; k < 12; k++) {   /* as 12 maiores por tempo dormido */
+        int best = -1;
+        for (int i = 0; i < K32_WSITES; i++)
+            if (g_ws[i].used && g_ws[i].n && (best < 0 || g_ws[i].ns > g_ws[best].ns)) best = i;
+        if (best < 0) break;
+        k32_wsite *e = &g_ws[best];
+        char who[16];
+        if (e->start) snprintf(who, sizeof who, "g%08X", e->start);
+        else snprintf(who, sizeof who, "principal");
+        RE5_INFO("espera", "  %-21s de 0x%08X  thread %-9s  %7.0f sonos/s  %7.1f ms/s  (média %.3f ms)",
+                 g_wk_name[e->kind], e->site, who, e->n / secs, e->ns / 1e6 / secs, e->ns / 1e6 / (double)e->n);
+        e->n = 0;   /* sai do ranking deste relatório */
+        e->ns = 0;
+    }
+    for (int i = 0; i < K32_WSITES; i++) g_ws[i].n = g_ws[i].ns = 0;
+    for (int k = 0; k < WK_N; k++) g_ws_n[k] = g_ws_ns[k] = 0;
+    g_ws_lost = 0;
+    re5_mutex_unlock(&g_ws_mu);
+}
 
 #define K32_WAIT_OBJECT_0  0x00000000u
 #define K32_WAIT_ABANDONED 0x00000080u
@@ -156,6 +243,10 @@ typedef struct {
     uint32_t last_waiter;
     uint32_t last_owner;
     uint32_t spin;           /* SpinCount que o jogo deu à seção */
+    /* De onde o jogo chamou o EnterCriticalSection que bloqueou (endereço de retorno no guest):
+     * as seções disputadas moram no heap e mudam de endereço a cada execução, mas o ponto de
+     * chamada diz qual classe/lock é. Até 4 pontos por seção. */
+    uint32_t site[4], site_n[4];
 } k32_cs_contention;
 #define K32_CS_CONTEND_MAX 128
 static k32_cs_contention g_cs_contend[K32_CS_CONTEND_MAX];
@@ -175,7 +266,7 @@ static int cs_stats_on(void)
     return on;
 }
 
-static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner)
+static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner, uint32_t site)
 {
     if (!cs_stats_on()) return;
     if (!g_cs_contend_mu_ready) {
@@ -196,6 +287,14 @@ static void cs_record_contention(uint32_t cs, uint32_t waiter, uint32_t owner)
             g_cs_contend[h].last_waiter = waiter;
             g_cs_contend[h].last_owner = owner;
             g_cs_contend[h].spin = k32_r32(cs + CS_SPIN);
+            k32_cs_contention *e = &g_cs_contend[h];
+            for (int j = 0; j < 4; j++) {
+                if (e->site[j] == site || !e->site_n[j]) {
+                    e->site[j] = site;
+                    e->site_n[j]++;
+                    break;
+                }
+            }
             break;
         }
     }
@@ -239,6 +338,11 @@ void re5_k32_cs_contend_report(void)
         RE5_INFO("profile", "    %7u bloqueios: CS 0x%08X SpinCount %u (último dono tid 0x%X, garçom tid 0x%X)%s%s",
                  best, cs, g_cs_contend[bi].spin & 0x00FFFFFFu, g_cs_contend[bi].last_owner, g_cs_contend[bi].last_waiter,
                  nm ? "  " : "", nm ? nm : "");
+        for (int j = 0; j < 4 && g_cs_contend[bi].site_n[j]; j++) {
+            const char *fn = re5_name_lookup(g_cs_contend[bi].site[j]);
+            RE5_INFO("profile", "             chamada de 0x%08X: %u%s%s", g_cs_contend[bi].site[j],
+                     g_cs_contend[bi].site_n[j], fn ? "  " : "", fn ? fn : "");
+        }
         g_cs_contend[bi].count = 0;
     }
     g_cs_contend_total = 0;
@@ -256,7 +360,7 @@ static void cs_enter_global(CPU *c)
         return;
     }
     uint32_t owner = k32_r32(cs + CS_OWNER);
-    cs_record_contention(cs, tid, owner);
+    cs_record_contention(cs, tid, owner, k32_r32(c->esp));
     cs_queue *q = csq_find(s, cs, 1);
     if (q->n == CS_QLEN) re5_fatal("kernel32", "mais de %d threads esperando a seção 0x%08X", CS_QLEN, cs);
     q->tid[q->n++] = tid;
@@ -392,7 +496,7 @@ static void cs_enter_hle(CPU *c)
     uint32_t cs = re5_arg(c, 0), tid = cur_tid();
     if (cs_hle_try(cs, tid)) return;
     volatile uint32_t *own = (volatile uint32_t *)re5_g2h(cs + CS_OWNER);
-    cs_record_contention(cs, tid, *own);
+    cs_record_contention(cs, tid, *own, k32_r32(c->esp));
     uint32_t spin = k32_r32(cs + CS_SPIN) & 0x00FFFFFFu;   /* os bits altos são flags */
     if (!spin) spin = CS_SPIN_DEFAULT;
     if (spin > CS_SPIN_MAX) spin = CS_SPIN_MAX;
@@ -409,6 +513,8 @@ static void cs_enter_hle(CPU *c)
         t->cs_waiting = cs;
         t->cs_owner = *own;
     }
+    uint64_t ws0 = re5_stats_on ? re5_stat_now_ns() : 0;
+    uint32_t ws_site = re5_stats_on ? k32_r32(c->esp) : 0;
     RE5_BLOCKING_BEGIN();
     int pump = re5_thread_has_pump();
     re5_mutex_lock(&s->mu);
@@ -440,6 +546,7 @@ static void cs_enter_hle(CPU *c)
         t->cs_waiting = 0;
         t->cs_owner = 0;
     }
+    if (ws0) wait_stat(WK_CS, ws_site, re5_stat_now_ns() - ws0);
     RE5_BLOCKING_END();
 }
 
@@ -762,6 +869,49 @@ static int ready(const waitable *w, uint32_t tid)
     }
 }
 
+/* Sem g_mu, só como dica para o giro: o estado pode mudar logo depois (quem decide é ready sob g_mu). */
+static int ready_hint(const waitable *w, uint32_t tid)
+{
+    switch (w->type) {
+    case RE5_H_EVENT: case RE5_H_THREAD: return __atomic_load_n(&w->signaled, __ATOMIC_RELAXED);
+    case RE5_H_MUTEX: {
+        uint32_t o = __atomic_load_n(&w->owner, __ATOMIC_RELAXED);
+        return !o || o == tid;
+    }
+    case RE5_H_SEMAPHORE: return __atomic_load_n(&w->count, __ATOMIC_RELAXED) > 0;
+    default: return 0;
+    }
+}
+
+/* RE5_WAIT_SPIN=<voltas> antes de dormir num WaitFor* (padrão 4000 no Android, ~10-20 us; 0 no PC).
+ * Os workers da MT Framework dormem e acordam milhares de vezes por segundo; no celular cada acordar
+ * paga a saída do núcleo do repouso e o escalonador (A54, 20/11/2026: 42% das amostras dos workers em
+ * syscall). Com o giro, a entrega que chega logo não passa pelo condvar. */
+static uint32_t wait_spin(void)
+{
+    static int64_t n = -1;
+    if (n < 0) {
+        const char *e = getenv("RE5_WAIT_SPIN");
+#if defined(__ANDROID__)
+        n = e && *e ? atoll(e) : 4000;
+#else
+        n = e && *e ? atoll(e) : 0;
+#endif
+        if (n < 0) n = 0;
+        if (n > 1000000) n = 1000000;
+    }
+    return (uint32_t)n;
+}
+
+static inline void spin_pause(void)
+{
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
 static void acquire(waitable *w, uint32_t tid)
 {
     switch (w->type) {
@@ -785,7 +935,7 @@ static uint64_t now_ms(void)
 
 #define MAX_WAIT 64u
 
-static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint32_t ms)
+static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint32_t ms, uint32_t site)
 {
     ensure_init();
     if (!n || n > MAX_WAIT) { re5_set_last_error(K32_ERROR_INVALID_PARAMETER); return K32_WAIT_FAILED; }
@@ -803,7 +953,8 @@ static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint3
     int pump = re5_thread_has_pump();
     k32_waiter me;
     k32_wnode nodes[MAX_WAIT];
-    int enrolled = 0, woke = 0;
+    int enrolled = 0, woke = 0, spun = 0;
+    uint64_t ws0 = 0;
     RE5_BLOCKING_BEGIN();
     re5_mutex_lock(&g_mu);
     for (;;) {
@@ -831,7 +982,24 @@ static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint3
             if (now >= deadline) break;
             left = (uint32_t)(deadline - now);
         }
+        if (!spun && ms != 0 && wait_spin()) {   /* giro curto sem g_mu antes de dormir (só uma vez) */
+            spun = 1;
+            re5_mutex_unlock(&g_mu);
+            for (uint32_t k = 0, lim = wait_spin(); k < lim; k++) {
+                int any = 0, all_ok = 1;
+                for (uint32_t i = 0; i < n; i++) {
+                    int r = ready_hint(w[i], tid);
+                    any |= r;
+                    all_ok &= r;
+                }
+                if (all ? all_ok : any) break;
+                spin_pause();
+            }
+            re5_mutex_lock(&g_mu);
+            continue;
+        }
         if (!enrolled) {   /* só quem vai dormir se inscreve; o caminho rápido não paga */
+            if (re5_stats_on) ws0 = re5_stat_now_ns();
             re5_cond_init(&me.cv);
             for (uint32_t i = 0; i < n; i++) {
                 nodes[i].who = &me;
@@ -857,6 +1025,7 @@ static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint3
         re5_cond_destroy(&me.cv);
     }
     re5_mutex_unlock(&g_mu);
+    if (ws0) wait_stat(WK_WAIT, site, re5_stat_now_ns() - ws0);
     RE5_BLOCKING_END();
     return result;
 }
@@ -864,7 +1033,7 @@ static uint32_t wait_objects(uint32_t n, const uint32_t *handles, int all, uint3
 static void k_WaitForSingleObject(CPU *c)
 {
     uint32_t h = re5_arg(c, 0);
-    c->eax = wait_objects(1, &h, 0, re5_arg(c, 1));
+    c->eax = wait_objects(1, &h, 0, re5_arg(c, 1), k32_r32(c->esp));
 }
 
 static void k_WaitForMultipleObjects(CPU *c)
@@ -872,7 +1041,7 @@ static void k_WaitForMultipleObjects(CPU *c)
     uint32_t n = re5_arg(c, 0), arr = re5_arg(c, 1), handles[MAX_WAIT];
     if (!n || n > MAX_WAIT) { re5_set_last_error(K32_ERROR_INVALID_PARAMETER); c->eax = K32_WAIT_FAILED; return; }
     for (uint32_t i = 0; i < n; i++) handles[i] = k32_r32(arr + 4 * i);
-    c->eax = wait_objects(n, handles, re5_arg(c, 2) != 0, re5_arg(c, 3));
+    c->eax = wait_objects(n, handles, re5_arg(c, 2) != 0, re5_arg(c, 3), k32_r32(c->esp));
 }
 
 /* ---- threads do guest ----
@@ -1058,8 +1227,11 @@ static void k_SleepEx(CPU *c)
             re5_host_sleep_ms((uint32_t)(end - now < PUMP_SLICE_MS ? end - now : PUMP_SLICE_MS));
             re5_thread_pump();
         }
+    } else if (ms == K32_INFINITE_MS) {
+        re5_host_sleep_ms(0x7FFFFFFFu);
     } else {
-        re5_host_sleep_ms(ms == K32_INFINITE_MS ? 0x7FFFFFFFu : ms);
+        /* granularidade do Windows (k32_guest_sleep_us): n ms + um tique */
+        re5_host_sleep_us(k32_guest_sleep_us(ms));
     }
     RE5_BLOCKING_END();
     c->eax = 0;

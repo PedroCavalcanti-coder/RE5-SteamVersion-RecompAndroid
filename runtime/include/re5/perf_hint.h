@@ -16,14 +16,34 @@
 #include <stdint.h>
 
 /* A cada Present (thread que apresenta). idle_ns: quanto do quadro foi o limitador de FPS
- * dormindo (RE5_FPS_CAP), que não é trabalho e sai da duração informada ao ADPF. */
-void re5_perf_note_present(uint64_t idle_ns);
+ * dormindo (RE5_FPS_CAP), que não é trabalho e sai da duração informada ao ADPF.
+ * present_ns: quanto a thread ficou dentro do Present do host. No celular é espera pela GPU (o
+ * vkQueuePresentKHR do Mali segura o quadro até a GPU acabar, STATUS 11/11): com o
+ * APerformanceHint_reportActualWorkDuration2 (Android 15+) vai como duração de GPU, para o
+ * sistema subir o clock da GPU que o governador deixava em 221 MHz. */
+void re5_perf_note_present(uint64_t idle_ns, uint64_t present_ns);
+
+/* Divide o quadro para o ADPF: total = intervalo - limitador (>= 1); gpu = a espera no Present,
+ * limitada ao total; cpu = total - gpu (>= 1). */
+void re5_perf_split(int64_t interval_ns, uint64_t idle_ns, uint64_t present_ns, int64_t *total, int64_t *cpu,
+                    int64_t *gpu);
 /* Em um método de desenho frequente (thread de render). Barato depois da primeira vez. */
 void re5_perf_note_render(void);
 
 /* Máscara dos núcleos acima do cluster mais lento (cpuinfo_max_freq > o menor), lendo <sysroot>/cpu<N>/cpufreq/cpuinfo_max_freq
  * (sysroot normal: /sys/devices/system/cpu). 0 se todos iguais ou ilegíveis (sem o que separar). */
 uint64_t re5_perf_big_mask(const char *sysroot);
+
+/* Prender a thread de render nos núcleos grandes? Só com 3 ou mais (A54: 4 A78); com 2 (Dimensity
+ * 7030: 2 A78) ela disputava os dois com a principal, que ficava 16% do tempo pronta sem núcleo
+ * (Perfetto, 20/11/2026). env = RE5_PIN_RENDER ("0" nunca, "1" sempre, NULL/"" automático). */
+int re5_perf_pin_render(uint64_t big_mask, const char *env);
+
+/* No começo de toda thread do host criada pelo runtime: volta à máscara de todos os núcleos. Sem
+ * isso a thread herda a afinidade de quem a criou, e os workers do jogo, criados pela principal já
+ * presa, ficavam todos nos núcleos grandes (A54: 4 pequenos ociosos). RE5_WORKER_BIG=1 mantém a
+ * herança. Fora do Android não faz nada. */
+void re5_perf_thread_start(void);
 
 /* Alvo do ADPF em ns a partir do RE5_FPS_CAP (NULL = sem limite). Com limite de 30 a 240 fps,
  * o período dele; sem limite (o padrão do launcher), 60 fps. Antes, sem limite, o alvo era

@@ -145,6 +145,13 @@ uint64_t re5_perf_big_mask(const char *sysroot)
     return 0;
 }
 
+int re5_perf_pin_render(uint64_t big_mask, const char *env)
+{
+    if (env && *env == '0') return 0;
+    if (env && *env == '1') return big_mask != 0;
+    return __builtin_popcountll(big_mask) >= 3;
+}
+
 int64_t re5_perf_target_ns(const char *fps_cap)
 {
     long fps = fps_cap ? strtol(fps_cap, NULL, 10) : 0;
@@ -158,8 +165,21 @@ int64_t re5_perf_work_ns(int64_t interval_ns, uint64_t idle_ns)
     return w > 0 ? w : 1;
 }
 
+void re5_perf_split(int64_t interval_ns, uint64_t idle_ns, uint64_t present_ns, int64_t *total, int64_t *cpu,
+                    int64_t *gpu)
+{
+    int64_t t = re5_perf_work_ns(interval_ns, idle_ns);
+    int64_t g = present_ns > (uint64_t)t ? t : (int64_t)present_ns;
+    int64_t c = t - g;
+    *total = t;
+    *gpu = g;
+    *cpu = c > 0 ? c : 1;
+}
+
 #if defined(__ANDROID__)
 #include <dlfcn.h>
+#include <stdbool.h>
+#include "re5/d3d9_bridge.h"
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
@@ -171,6 +191,16 @@ typedef struct APerformanceHintSession APerformanceHintSession;
 typedef APerformanceHintManager *(*fn_get_manager)(void);
 typedef APerformanceHintSession *(*fn_create)(APerformanceHintManager *, const int32_t *, size_t, int64_t);
 typedef int (*fn_report)(APerformanceHintSession *, int64_t);
+/* Android 15+ (API 35): duração com CPU e GPU separadas. Todas por dlsym; faltando uma, fica o
+ * relato antigo (só o total). */
+typedef struct AWorkDuration AWorkDuration;
+typedef int (*fn_report2)(APerformanceHintSession *, AWorkDuration *);
+typedef AWorkDuration *(*fn_wd_create)(void);
+typedef void (*fn_wd_set)(AWorkDuration *, int64_t);
+
+static fn_report2 g_report2;
+static fn_wd_set g_wd_start, g_wd_total, g_wd_cpu, g_wd_gpu;
+static AWorkDuration *g_wd;
 
 static int g_on = -1;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -179,6 +209,11 @@ static int g_setup_done;
 static APerformanceHintSession *g_session;
 static fn_report g_report;
 static int64_t g_target_ns;
+/* Android 16 (API 36): pedido de boost quando o quadro estoura o alvo (RE5_PERF_BOOST=0 desliga). */
+typedef int (*fn_boost)(APerformanceHintSession *, bool, bool, const char *);
+static fn_boost g_boost;
+static int64_t g_last_boost;
+static uint32_t g_boosts;
 static __thread int t_present_noted, t_render_noted;
 
 static int enabled(void)
@@ -215,7 +250,11 @@ static void setup(void)
     uint64_t big = re5_perf_big_mask("/sys/devices/system/cpu");
     if (big) {
         pin_big(g_present_tid, big, "principal");
-        if (g_render_tid && g_render_tid != g_present_tid) pin_big(g_render_tid, big, "de render");
+        if (g_render_tid && g_render_tid != g_present_tid) {
+            if (re5_perf_pin_render(big, getenv("RE5_PIN_RENDER"))) pin_big(g_render_tid, big, "de render");
+            else RE5_INFO("perf", "thread de render (tid %d) livre: só %d núcleos grandes, ficam para a principal",
+                          g_render_tid, __builtin_popcountll(big));
+        }
     } else {
         RE5_INFO("perf", "núcleos todos iguais (ou cpufreq ilegível): sem afinidade");
     }
@@ -227,13 +266,75 @@ static void setup(void)
         RE5_INFO("perf", "ADPF indisponível (Android 13+): só a afinidade");
         return;
     }
+    {
+        const char *e = getenv("RE5_PERF_GPU");
+        fn_wd_create wd_create = (fn_wd_create)dlsym(lib, "AWorkDuration_create");
+        g_report2 = (fn_report2)dlsym(lib, "APerformanceHint_reportActualWorkDuration2");
+        g_wd_start = (fn_wd_set)dlsym(lib, "AWorkDuration_setWorkPeriodStartTimestampNanos");
+        g_wd_total = (fn_wd_set)dlsym(lib, "AWorkDuration_setActualTotalDurationNanos");
+        g_wd_cpu = (fn_wd_set)dlsym(lib, "AWorkDuration_setActualCpuDurationNanos");
+        g_wd_gpu = (fn_wd_set)dlsym(lib, "AWorkDuration_setActualGpuDurationNanos");
+        int off = e && *e == '0';
+        if (!off && wd_create && g_report2 && g_wd_start && g_wd_total && g_wd_cpu && g_wd_gpu) g_wd = wd_create();
+        if (!g_wd) g_report2 = NULL;
+        RE5_INFO("perf", "ADPF com duração de GPU: %s", g_wd ? "sim (Android 15+)"
+                                                          : off ? "desligado (RE5_PERF_GPU=0)" : "indisponível");
+    }
     g_target_ns = re5_perf_target_ns(getenv("RE5_FPS_CAP"));
     int32_t tids[2] = {g_present_tid, g_render_tid};
     size_t nt = g_render_tid && g_render_tid != g_present_tid ? 2 : 1;
     APerformanceHintManager *m = get();
-    g_session = m ? create(m, tids, nt, g_target_ns) : NULL;
-    RE5_INFO("perf", "ADPF: %s (alvo %.1f ms, %zu thread%s)", g_session ? "sessão criada" : "recusada",
-             g_target_ns / 1e6, nt, nt > 1 ? "s" : "");
+    const char *how = "createSession";
+    /* API 36: sessão marcada como pipeline gráfico, ligada à janela do jogo e sem preferência por
+     * economia; o PowerHAL trata essas como jogo/render (CPU e GPU). Falhando, a sessão antiga. */
+    {
+        typedef void *(*fn_cfg_create)(void);
+        typedef void (*fn_cfg_release)(void *);
+        typedef void (*fn_cfg_tids)(void *, const int32_t *, size_t);
+        typedef void (*fn_cfg_target)(void *, int64_t);
+        typedef void (*fn_cfg_bool)(void *, bool);
+        typedef void (*fn_cfg_surf)(void *, void **, size_t, void **, size_t);
+        typedef int (*fn_create_cfg)(APerformanceHintManager *, void *, APerformanceHintSession **);
+        fn_cfg_create cc = (fn_cfg_create)dlsym(lib, "ASessionCreationConfig_create");
+        fn_cfg_release cr = (fn_cfg_release)dlsym(lib, "ASessionCreationConfig_release");
+        fn_cfg_tids ct = (fn_cfg_tids)dlsym(lib, "ASessionCreationConfig_setTids");
+        fn_cfg_target cg = (fn_cfg_target)dlsym(lib, "ASessionCreationConfig_setTargetWorkDurationNanos");
+        fn_cfg_bool cp = (fn_cfg_bool)dlsym(lib, "ASessionCreationConfig_setGraphicsPipeline");
+        fn_cfg_bool ce = (fn_cfg_bool)dlsym(lib, "ASessionCreationConfig_setPreferPowerEfficiency");
+        fn_cfg_surf cs = (fn_cfg_surf)dlsym(lib, "ASessionCreationConfig_setNativeSurfaces");
+        fn_create_cfg ccfg = (fn_create_cfg)dlsym(lib, "APerformanceHint_createSessionUsingConfig");
+        const char *e = getenv("RE5_PERF_GFX");
+        if (m && cc && ct && cg && ccfg && !(e && *e == '0')) {
+            void *cfg = cc();
+            if (cfg) {
+                ct(cfg, tids, nt);
+                cg(cfg, g_target_ns);
+                if (cp) cp(cfg, true);
+                if (ce) ce(cfg, false);
+                void *win = re5_android_current_window();
+                if (cs && win) cs(cfg, &win, 1, NULL, 0);
+                APerformanceHintSession *s = NULL;
+                int r = ccfg(m, cfg, &s);
+                if (r == 0 && s) {
+                    g_session = s;
+                    how = win ? "pipeline gráfico + janela" : "pipeline gráfico";
+                } else {
+                    RE5_WARN("perf", "createSessionUsingConfig recusou (%d): sessão comum", r);
+                }
+                if (cr) cr(cfg);
+            }
+        }
+    }
+    if (!g_session && m) g_session = create(m, tids, nt, g_target_ns);
+    if (g_session) {
+        typedef int (*fn_eff)(APerformanceHintSession *, bool);
+        fn_eff eff = (fn_eff)dlsym(lib, "APerformanceHint_setPreferPowerEfficiency");
+        if (eff) eff(g_session, false);
+        const char *b = getenv("RE5_PERF_BOOST");
+        if (!(b && *b == '0')) g_boost = (fn_boost)dlsym(lib, "APerformanceHint_notifyWorkloadIncrease");
+    }
+    RE5_INFO("perf", "ADPF: %s (%s, alvo %.1f ms, %zu thread%s, boost %s)", g_session ? "sessão criada" : "recusada",
+             how, g_target_ns / 1e6, nt, nt > 1 ? "s" : "", g_boost ? "sim" : "não");
 }
 
 void re5_perf_note_render(void)
@@ -245,7 +346,7 @@ void re5_perf_note_render(void)
     pthread_mutex_unlock(&g_mu);
 }
 
-void re5_perf_note_present(uint64_t idle_ns)
+void re5_perf_note_present(uint64_t idle_ns, uint64_t present_ns)
 {
     if (!enabled()) return;
     static int64_t last;
@@ -266,14 +367,52 @@ void re5_perf_note_present(uint64_t idle_ns)
     int64_t now = now_ns();
     if (g_session && last) {
         int64_t d = now - last;
-        if (d > 0 && d < 1000000000LL) g_report(g_session, re5_perf_work_ns(d, idle_ns));   /* fora: carregamento/pausa */
+        if (d > 0 && d < 1000000000LL) {   /* fora: carregamento/pausa */
+            if (g_report2) {
+                int64_t total, cpu, gpu;
+                re5_perf_split(d, idle_ns, present_ns, &total, &cpu, &gpu);
+                g_wd_start(g_wd, last);
+                g_wd_total(g_wd, total);
+                g_wd_cpu(g_wd, cpu);
+                g_wd_gpu(g_wd, gpu);
+                if (g_report2(g_session, g_wd) != 0) {   /* recusou: volta ao relato antigo de vez */
+                    RE5_WARN("perf", "reportActualWorkDuration2 recusado: só a duração total daqui em diante");
+                    g_report2 = NULL;
+                    g_report(g_session, total);
+                }
+            } else {
+                g_report(g_session, re5_perf_work_ns(d, idle_ns));
+            }
+            /* quadro acima do alvo: pede mais CPU e GPU, no máximo a cada 300 ms */
+            if (g_boost && re5_perf_work_ns(d, idle_ns) > g_target_ns && now - g_last_boost > 300000000LL) {
+                g_last_boost = now;
+                if (g_boost(g_session, true, true, "re5_frame") == 0 && ++g_boosts == 1)
+                    RE5_INFO("perf", "ADPF: primeiro pedido de boost aceito (quadro acima do alvo)");
+            }
+        }
     }
     last = now;
 }
 
+void re5_perf_thread_start(void)
+{
+    static int keep = -1;
+    if (keep < 0) {
+        const char *e = getenv("RE5_WORKER_BIG");
+        keep = e && *e == '1';
+    }
+    if (keep) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    long n = sysconf(_SC_NPROCESSORS_CONF);
+    for (long i = 0; i < n && i < CPU_SETSIZE; i++) CPU_SET((int)i, &set);
+    sched_setaffinity(0, sizeof set, &set);
+}
+
 #else
 
-void re5_perf_note_present(uint64_t idle_ns) { (void)idle_ns; }
+void re5_perf_note_present(uint64_t idle_ns, uint64_t present_ns) { (void)idle_ns; (void)present_ns; }
 void re5_perf_note_render(void) {}
+void re5_perf_thread_start(void) {}
 
 #endif

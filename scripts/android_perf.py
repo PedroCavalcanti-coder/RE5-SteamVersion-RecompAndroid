@@ -42,6 +42,11 @@ GPU_MAXCLOCK_FILES = ["/sys/kernel/gpu/gpu_max_clock", "/sys/class/kgsl/kgsl-3d0
                       "/sys/class/devfreq/*mali*/max_freq", "/sys/class/misc/mali0/device/max_freq"]
 
 FPS_RE = re.compile(r"fps ([\d.]+) \(Present \d+\).*?lock_ms ([\d.]+)(?: d3d9_ms ([\d.]+) present_ms ([\d.]+))?")
+# re5vk (RE5_GFX=re5vk) com RE5_FPS_LOG: ms somados por segundo em cada espera e o tempo de GPU (timestamps).
+VK_KEYS = ("gpu_ms", "acquire_ms", "fence_ms", "em_voo_ms", "submit_ms", "queue_present_ms", "mutex_ms")
+VK_RE = re.compile(r"por s: quadros ([\d.]+) envios ([\d.]+) gpu_ms ([\d.]+) \((\d+) envios medidos\) "
+                   r"acquire_ms ([\d.]+) fence_ms ([\d.]+) em_voo_ms ([\d.]+) submit_ms ([\d.]+) "
+                   r"queue_present_ms ([\d.]+)(?: thread_present_ms [\d.]+)? mutex_ms ([\d.]+)")
 
 
 def adb(args, serial, **kw):
@@ -133,12 +138,20 @@ class Logcat(threading.Thread):
         cmd = ["adb"] + (["-s", serial] if serial else []) + ["logcat", "-T", "1", "-v", "brief", "RE5Native:I", "*:S"]
         self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
         self.samples = []
+        self.vk = []        # dicts com quadros, envios e VK_KEYS por segundo
         self.cpu_lines = []
         self.on = False
 
     def run(self):
         for line in self.p.stdout:
             if not self.on:
+                continue
+            v = VK_RE.search(line)
+            if v:
+                g = [float(x) for x in v.groups()]
+                row = {"quadros": g[0], "envios": g[1], "medidos": g[3]}
+                row.update(zip(VK_KEYS, [g[2]] + g[4:]))
+                self.vk.append(row)
                 continue
             m = FPS_RE.search(line)
             if m:
@@ -323,6 +336,26 @@ def main():
           f"({dx / 100 * frame_ms:.1f} ms/quadro em paralelo; só pesa se houver núcleo grande livre de menos).")
     elif fps:
         p("sem d3d9_ms/present_ms no log: o libre5.so é anterior a essa medida (recompile o runtime)")
+    if log.vk:
+        vq = statistics.mean(r["quadros"] for r in log.vk) or 1.0
+        avgv = {k: statistics.mean(r[k] for r in log.vk) for k in VK_KEYS}
+        p(f"re5vk ({len(log.vk)} s): {vq:.1f} quadros/s, {statistics.mean(r['envios'] for r in log.vk):.1f} envios/s; "
+          "por quadro: " + ", ".join(f"{k[:-3]} {avgv[k] / vq:.2f} ms" for k in VK_KEYS))
+        gpu_s = avgv["gpu_ms"]
+        waits = avgv["fence_ms"] + avgv["em_voo_ms"]
+        pres = avgv["acquire_ms"] + avgv["queue_present_ms"]
+        if not any(r["medidos"] for r in log.vk):
+            p("  re5vk: sem timestamps de GPU nesta fila (gpu_ms não vale)")
+        elif gpu_s >= 850:
+            p(f"  re5vk: GPU ocupada {gpu_s / 10:.0f}% do tempo (timestamps): o limite é a GPU")
+        elif waits >= 250:
+            p(f"  re5vk: a CPU fica {waits / 10:.0f}% do tempo esperando fence com a GPU em {gpu_s / 10:.0f}%: "
+              "sincronização segura demais (quadros em voo, Lock que espera, GetRenderTargetData)")
+        elif pres >= 250:
+            p(f"  re5vk: {pres / 10:.0f}% do tempo em acquire/present: swapchain/compositor (modo de apresentação, "
+              "imagens da swapchain)")
+        else:
+            p(f"  re5vk: GPU em {gpu_s / 10:.0f}% e esperas curtas: o limite está antes do Vulkan (thread do jogo)")
     if log.cpu_lines:
         p("relatório do runtime (RE5_FPS_LOG, a cada 30 s), último:")
         for line in log.cpu_lines[-20:]:

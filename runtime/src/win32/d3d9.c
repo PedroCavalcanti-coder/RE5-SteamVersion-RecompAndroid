@@ -903,7 +903,10 @@ static void fps_log(void)
             re5_log_process_cpu();
             census_log_totals();
         }
-        if (++tick % 10 == 0) re5_thunk_log_top(10, dt / 1000.0 * 10);   /* a cada 10 s, média desse intervalo */
+        if (++tick % 10 == 0) {   /* a cada 10 s, média desse intervalo */
+            re5_thunk_log_top(10, dt / 1000.0 * 10);
+            re5_k32_wait_report(dt / 1000.0 * 10);
+        }
         t0 = now;
         n0 = g_presents;
     }
@@ -1019,7 +1022,10 @@ static uint64_t frame_cap(void)
  * RE5_FPS_LOG conta as chamadas de GetData e quantas devolveram S_FALSE ("ainda não").
  * RE5_QUERY_LAG=<n> (padrão 2 no Android, 0 no PC): evento emitido há n ou mais Present conta como
  * pronto ANTES de chamar o backend (evita lock/flush por D3DGETDATA_FLUSH); quem limita os quadros em
- * voo passa a ser o RE5VK_LATENCY / swapchain da DXVK. */
+ * voo passa a ser o RE5VK_LATENCY / swapchain da DXVK.
+ * Desligado no Android em 11/11 (suspeita de lixo por Lock(NOOVERWRITE) sobre dados que a GPU ainda
+ * lê): o lixo continuou igual e o fps do re5vk caiu muito, com uma thread a 99% (o jogo gira no
+ * GetData até a GPU acabar o quadro; no re5vk cada volta pega o mutex e consulta as fences). Voltou. */
 
 static int query_lag(void)
 {
@@ -1027,7 +1033,7 @@ static int query_lag(void)
     if (lag < 0) {
         const char *e = getenv("RE5_QUERY_LAG");
 #if defined(__ANDROID__)
-        lag = e ? atoi(e) : 2;
+        lag = e ? atoi(e) : 3;
 #else
         lag = e ? atoi(e) : 0;
 #endif
@@ -1075,7 +1081,7 @@ static void d_Present(CPU *c)
     HWND over = host_hwnd(re5_arg(c, 3), "IDirect3DDevice9::Present");
     const RGNDATA *dirty = d9_ptr(re5_arg(c, 4));
     HRESULT hr;
-    uint64_t cap_idle = 0;
+    uint64_t cap_idle = 0, present_ns = 0;
     re5_coldebug_draw(dev);
 #if !defined(__ANDROID__)
     re5_lan_menu_draw(dev);
@@ -1086,17 +1092,24 @@ static void d_Present(CPU *c)
     re5_det_on_present();
     {
         RE5_BLOCKING_BEGIN();
-        uint64_t t0 = re5_stats_on ? re5_stat_now_ns() : 0;
+#if defined(__ANDROID__)
+        re5_android_present_enter();   /* segundo plano: espera a janela voltar */
+#endif
+        uint64_t t0 = re5_stat_now_ns();   /* sempre: o ADPF recebe a espera no Present como GPU */
         hr = dev->lpVtbl->Present(dev, src, dst, over, dirty);
+        present_ns = re5_stat_now_ns() - t0;
+#if defined(__ANDROID__)
+        re5_android_present_leave();
+#endif
         if (re5_stats_on) {
-            uint64_t dt = re5_stat_now_ns() - t0;
+            uint64_t dt = present_ns;
             RE5_STAT_ADD(RE5_ST_PRESENT_NS, dt);
             if (re5_thunk_current()) ((re5_thunk *)re5_thunk_current())->ns += dt;
         }
         cap_idle = frame_cap();
         RE5_BLOCKING_END();
     }
-    re5_perf_note_present(cap_idle);   /* Android: núcleos grandes + ADPF (fase A2) */
+    re5_perf_note_present(cap_idle, present_ns);   /* Android: núcleos grandes + ADPF (fase A2) */
     if (++g_presents == 1) RE5_INFO("d3d9", "primeiro Present -> 0x%08X", (uint32_t)hr);
     else if (g_presents == 100u || g_presents == 1000u || g_presents == 10000u || g_presents % 100000u == 0)
         RE5_INFO("d3d9", "%u Present (último -> 0x%08X)", g_presents, (uint32_t)hr);

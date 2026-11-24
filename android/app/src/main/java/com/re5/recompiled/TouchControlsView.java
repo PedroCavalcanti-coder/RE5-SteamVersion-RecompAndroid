@@ -234,10 +234,35 @@ public class TouchControlsView extends View {
             } else {
                 ticking = false;
             }
-            invalidate();
+            redraw();
         }
     };
     private boolean ticking = false;
+
+    /* O desenho dos controles (tela cheia, pelo OpenGL do Android) disputa a GPU com o jogo: a cada
+     * evento de toque (~120/s) e a cada tique ele se redesenhava inteiro, e o GPUWatch passava a medir
+     * essa camada. No máximo um redesenho a cada 33 ms (30/s): o botão e o analógico seguem o dedo. */
+    private static final long REDRAW_MS = 33;
+    private long lastRedraw;
+    private boolean redrawPending;
+    private final Runnable redrawLater = () -> {
+        redrawPending = false;
+        lastRedraw = SystemClock.uptimeMillis();
+        invalidate();
+    };
+
+    private void redraw() {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastRedraw >= REDRAW_MS) {
+            lastRedraw = now;
+            handler.removeCallbacks(redrawLater);
+            redrawPending = false;
+            invalidate();
+        } else if (!redrawPending) {
+            redrawPending = true;
+            handler.postDelayed(redrawLater, REDRAW_MS - (now - lastRedraw));
+        }
+    }
 
     public TouchControlsView(Context context) {
         super(context);
@@ -631,7 +656,7 @@ public class TouchControlsView extends View {
                 break;
         }
         sendPad();
-        invalidate();
+        redraw();
         return true;
     }
 

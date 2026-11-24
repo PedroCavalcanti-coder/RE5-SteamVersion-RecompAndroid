@@ -91,6 +91,8 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         Log.v("SDL", "surfaceDestroyed()");
+        // re5: o Present do jogo para antes de a janela morrer (d3d9_host.c, portão da superfície)
+        SDLActivity.surfaceGate(false);
 
         // Transition to pause, if needed
         SDLActivity.mNextNativeState = SDLActivity.NativeState.PAUSED;
@@ -183,6 +185,8 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
 
         SDLActivity.mNextNativeState = SDLActivity.NativeState.RESUMED;
         SDLActivity.handleNativeState();
+        // re5: janela nova pronta; o renderizador recria a superfície nela no próximo Present
+        SDLActivity.surfaceGate(true);
     }
 
     // Key events

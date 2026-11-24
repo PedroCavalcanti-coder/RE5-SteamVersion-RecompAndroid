@@ -876,6 +876,16 @@ static uint32_t vtable_of(int buffer)
     return g_vt[buffer] = va;
 }
 
+/* Android em segundo plano (d3d9_host.c, portão da superfície): o Present do jogo para e o som
+ * seguia tocando (a thread de som do jogo continua enchendo os buffers), saindo de sincronia.
+ * Pausar a saída para também o cursor de reprodução, e a thread de som espera junto. */
+void re5_dsound_pause(int on)
+{
+    if (!g_audio) return;
+    SDL_PauseAudioDevice(g_audio, on ? 1 : 0);
+    RE5_INFO("dsound", "saída de áudio %s", on ? "pausada (segundo plano)" : "retomada");
+}
+
 /* ---- DirectSoundCreate8 ---- */
 
 static int open_output(void)

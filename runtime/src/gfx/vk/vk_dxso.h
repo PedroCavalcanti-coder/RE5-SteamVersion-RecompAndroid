@@ -38,6 +38,7 @@ typedef struct {
     /* VS: entradas v<n> que chegam como inteiro sem sinal / com sinal e viram float no shader.
      * Para GPUs sem os formatos de vértice *SCALED (Adreno): UBYTE4, SHORT2/4, UDEC3. */
     uint16_t in_uint, in_sint;
+    uint16_t in_udec3;         /* VS: entrada v<n> que chega como uint32 (R32_UINT) e é desempacotada (10-10-10-2) */
     uint8_t  alpha_func;       /* PS: D3DCMPFUNC do alpha test; 0 ou 8 (ALWAYS) = sem teste */
     uint8_t  pad_;             /* sem enchimento implícito: a variante entra no hash da pipeline */
 } re5vk_dxso_variant;
@@ -57,6 +58,8 @@ typedef struct {
      * relativo) e se lê i[] / b. O prepare() do device copia só isso a cada draw. */
     uint16_t  const_f;
     uint8_t   uses_i, uses_b;
+    uint8_t   uses_rel;
+    uint8_t   uses_kill;        /* PS descarta pixel (texkill ou alpha test) */         /* lê c[] por endereçamento relativo (skinning: c[a0.x + n]) */
 } re5vk_shader;
 
 /* Location de uma semântica D3DDECLUSAGE (uso, índice) entre o VS e o PS. */

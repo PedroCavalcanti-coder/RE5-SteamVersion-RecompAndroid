@@ -200,6 +200,25 @@ guest nasce com 0x9FC0 (FTZ+DAZ, `re5_guest_mxcsr_default`): subnormais no Havok
 custam ~100 ciclos por operação no host; `RE5_FTZ=0` volta ao 0x1F80 para comparar. É o modelo que levou NFSU2 e outros a jogáveis. Se um bug for
 rastreado até precisão, a correção vai para o pcrecomp com teste.
 
+### D10 — Renderizadores nativos em C++17 atrás de uma fachada C
+
+`RE5_GFX` escolhe `dxvk` (padrão, fallback), `vkadreno` ou `vkmali` (o `re5vk` antigo
+é recusado com mensagem; `gl` segue pelo tradutor externo). Os nativos ficam em
+`runtime/src/gfx/vkn/` em C++17, porque usam vk-bootstrap (instância, device,
+swapchain) e VMA (toda a memória de GPU: nada de `vkAllocateMemory` direto). O resto do
+runtime continua C11 e só vê `re5/renderer.h` (prefixo `re5_`). Passes usam
+`VkRenderPass` (não dynamic rendering) para os drivers Vulkan 1.1 do Mali e para o
+`STORE_OP_NONE` do Adreno; a escolha de load/store por anexo é a política de
+`IRenderer.h` (`policy::`) alimentada pelo oráculo TBDR (`vk_tbdr.c`). O libvulkan
+continua aberto em tempo de execução (`re5_vk_get_instance_proc_addr`, AdrenoTools).
+O device D3D9 (`runtime/src/gfx/vk`, C11) usa essas classes pela ponte C
+`runtime/src/gfx/vkn/vkn_bridge.h`: instância, device e swapchain (vk-bootstrap), buffers e
+imagens (VMA, inclusive a memória do guest importada) e o cache de `VkRenderPass`/
+`VkFramebuffer`. Ele segue dono dos envios, dos anéis por envio, dos layouts por sub-recurso e da
+destruição adiada; não chama `vkCreateInstance`, `vkCreateDevice`, `vkCreateSwapchainKHR`,
+`vkAllocateMemory`, `vkBind*Memory` nem dynamic rendering (essas funções nem estão nas tabelas
+dele). O oráculo TBDR fica desligado por padrão (`RE5VK_TBDR=1` liga), como no re5vk desde 11/11.
+
 ## Pipeline de ponta a ponta (já testado com o PE sintético)
 
 ```

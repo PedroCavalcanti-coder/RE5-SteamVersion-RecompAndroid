@@ -864,14 +864,17 @@ int main(int argc, char **argv)
     CHECK_EQ_U32(rd32(pval), 1);
     CHECK_EQ_U32(g_q_event.getdata_calls, 2);
 
-    /* Parser de RE5_GFX ("", "dxvk", "re5vk", "gl" e rejeição de inválido). */
+    /* Parser de RE5_GFX ("", "dxvk", "vkadreno", "vkmali", "gl"; "re5vk" e inválidos recusados). */
     re5_gfx_backend mode = RE5_GFX_GL;
     CHECK(re5_parse_gfx_mode(NULL, &mode) == 0 && mode == RE5_GFX_DXVK);
     mode = RE5_GFX_GL;
     CHECK(re5_parse_gfx_mode("", &mode) == 0 && mode == RE5_GFX_DXVK);
     mode = RE5_GFX_RE5VK;
     CHECK(re5_parse_gfx_mode("dxvk", &mode) == 0 && mode == RE5_GFX_DXVK);
-    CHECK(re5_parse_gfx_mode("re5vk", &mode) == 0 && mode == RE5_GFX_RE5VK);
+    CHECK(re5_parse_gfx_mode("vkadreno", &mode) == 0 && mode == RE5_GFX_RE5VK);
+    mode = RE5_GFX_DXVK;
+    CHECK(re5_parse_gfx_mode("vkmali", &mode) == 0 && mode == RE5_GFX_RE5VK);
+    CHECK(re5_parse_gfx_mode("re5vk", &mode) == -1 && mode == RE5_GFX_RE5VK);
     CHECK(re5_parse_gfx_mode("gl", &mode) == 0 && mode == RE5_GFX_GL);
     CHECK(re5_parse_gfx_mode("opengl", &mode) == -1 && mode == RE5_GFX_GL);
 

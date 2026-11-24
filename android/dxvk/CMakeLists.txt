@@ -48,3 +48,8 @@ target_compile_options(dxvk_d3d9 PRIVATE -O2 -Wno-deprecated-declarations)
 target_link_options(dxvk_d3d9 PRIVATE -Wl,--exclude-libs,ALL -Wl,-z,max-page-size=16384)
 find_library(DXVK_VULKAN_LIBRARY NAMES vulkan REQUIRED)
 target_link_libraries(dxvk_d3d9 PRIVATE ${DXVK_VULKAN_LIBRARY} android log)
+# NDK 27 (o do Unity, 2026-11-11): o -static-libstdc++ do toolchain não traz mais a libc++ estática
+# sozinho; o mesmo ajuste do libre5 (CMakeLists.txt da raiz).
+if(ANDROID_STL STREQUAL "c++_static")
+    target_link_libraries(dxvk_d3d9 PRIVATE -lc++_static -lc++abi)
+endif()

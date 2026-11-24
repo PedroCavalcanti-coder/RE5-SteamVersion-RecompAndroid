@@ -39,6 +39,51 @@ public final class HudPrefs {
         }
     }
 
+    /** Thread mais ocupada desde a amostra anterior. pct = % de UM núcleo (100 = uma thread que não
+     *  para). A CPU do processo no HUD é a média de todos os núcleos: num aparelho de 8 núcleos a
+     *  thread principal no limite aparece como ~12%, e o HUD parecia dizer "CPU sobrando". */
+    public static final class BusiestThread {
+        public float pct = -1f;
+        public String name = "";
+    }
+
+    /** Lê utime+stime de /proc/self/task/*&#47;stat; prev guarda os tiques da amostra anterior por tid. */
+    public static BusiestThread busiestThread(java.util.Map<Integer, Long> prev, long wallDeltaMs) {
+        BusiestThread out = new BusiestThread();
+        java.util.Map<Integer, Long> cur = new java.util.HashMap<>();
+        java.io.File[] tasks = new java.io.File("/proc/self/task").listFiles();
+        if (tasks == null) return out;
+        long best = -1;
+        for (java.io.File t : tasks) {
+            int tid;
+            try {
+                tid = Integer.parseInt(t.getName());
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            try (BufferedReader br = new BufferedReader(new FileReader(new java.io.File(t, "stat")))) {
+                String l = br.readLine();
+                if (l == null) continue;
+                int a = l.indexOf('('), b = l.lastIndexOf(')');
+                if (a < 0 || b < a) continue;
+                String[] f = l.substring(b + 2).trim().split("\\s+");
+                long ticks = Long.parseLong(f[11]) + Long.parseLong(f[12]);
+                cur.put(tid, ticks);
+                Long p = prev.get(tid);
+                if (p != null && ticks - p > best) {
+                    best = ticks - p;
+                    out.name = l.substring(a + 1, b);
+                }
+            } catch (Exception ignored) {
+                // a thread saiu entre o listFiles e a leitura
+            }
+        }
+        prev.clear();
+        prev.putAll(cur);
+        if (best >= 0 && wallDeltaMs > 0) out.pct = Math.min(100f, 100f * best * 10f / wallDeltaMs);   // 1 tique = 10 ms
+        return out;
+    }
+
     /** Uso da GPU em % (Exynos/Mali da Samsung: /sys/kernel/gpu/gpu_busy), ou -1. */
     public static int gpuBusy() {
         String s = readFirstLine("/sys/kernel/gpu/gpu_busy");
@@ -60,7 +105,10 @@ public final class HudPrefs {
         }
         if (s == null) return -1;
         try {
-            return Integer.parseInt(s.trim());
+            long v = Long.parseLong(s.trim());
+            // Exynos (/sys/kernel/gpu/gpu_clock) dá kHz em vários kernels (949000 no A54): nenhuma
+            // GPU de celular passa de 10 GHz, então valor acima de 10000 é kHz.
+            return (int) (v > 10000L ? v / 1000L : v);
         } catch (Exception e) {
             return -1;
         }

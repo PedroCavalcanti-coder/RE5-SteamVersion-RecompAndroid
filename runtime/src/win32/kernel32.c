@@ -29,7 +29,10 @@ static uint64_t host_ns(void)
     return (uint64_t)((double)t.QuadPart * 1e9 / (double)f.QuadPart);
 }
 static void host_sleep_ms(uint32_t ms) { Sleep(ms); }
+static void host_sleep_us(uint64_t us) { Sleep((DWORD)((us + 999u) / 1000u)); }
+#define K32_SLEEP_TICK_DEFAULT_US 0u      /* o Sleep do Windows já tem o tique */
 #else
+#include <errno.h>
 #include <time.h>
 static uint64_t host_ns(void)
 {
@@ -42,7 +45,27 @@ static void host_sleep_ms(uint32_t ms)
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     nanosleep(&ts, NULL);
 }
+static void host_sleep_us(uint64_t us)
+{
+    struct timespec ts = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L};
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+}
+#define K32_SLEEP_TICK_DEFAULT_US 1000u
 #endif
+
+uint64_t k32_guest_sleep_us(uint32_t ms)
+{
+    static int64_t tick = -1;
+    if (tick < 0) {
+        const char *e = getenv("RE5_SLEEP_TICK_US");
+        int64_t v = e && *e ? (int64_t)strtoul(e, NULL, 10) : (int64_t)K32_SLEEP_TICK_DEFAULT_US;
+        if (v > 100000) v = 100000;
+        if (e && *e) RE5_INFO("kernel32", "RE5_SLEEP_TICK_US=%lld: Sleep(n>0) dura n ms + %lld us", (long long)v,
+                              (long long)v);
+        tick = v;
+    }
+    return ms ? (uint64_t)ms * 1000u + (uint64_t)tick : 0;
+}
 
 #define K32_ERROR_MOD_NOT_FOUND  126u
 #define K32_ERROR_PROC_NOT_FOUND 127u
@@ -104,7 +127,33 @@ static const char *module_name(uint32_t h)
 
 /* ---- handlers ---- */
 
-uint32_t k32_tick_ms(void) { return (uint32_t)(host_ns() / 1000000ull); }
+/* Relógio que o jogo vê (QPC, GetTickCount, timeGetTime). No Android em segundo plano (portão da
+ * superfície, d3d9_host.c) ele para: o Present e o som param juntos, e o jogo não "pula" o tempo
+ * que passou fora (as cenas andavam pelo relógio e o som voltava atrasado). Leitura sem lock:
+ * congelado devolve o valor do momento da pausa; a retomada grava o desvio antes de soltar. */
+static uint64_t g_clk_offset, g_clk_frozen;
+static int g_clk_paused;
+
+static uint64_t guest_ns(void)
+{
+    if (__atomic_load_n(&g_clk_paused, __ATOMIC_ACQUIRE)) return __atomic_load_n(&g_clk_frozen, __ATOMIC_RELAXED);
+    return host_ns() - __atomic_load_n(&g_clk_offset, __ATOMIC_RELAXED);
+}
+
+void re5_k32_clock_pause(int on)
+{
+    static uint64_t since;
+    if (on && !g_clk_paused) {
+        since = host_ns();
+        __atomic_store_n(&g_clk_frozen, since - g_clk_offset, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_clk_paused, 1, __ATOMIC_RELEASE);
+    } else if (!on && g_clk_paused) {
+        __atomic_store_n(&g_clk_offset, g_clk_offset + (host_ns() - since), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_clk_paused, 0, __ATOMIC_RELEASE);
+    }
+}
+
+uint32_t k32_tick_ms(void) { return (uint32_t)(guest_ns() / 1000000ull); }
 
 static void k_GetTickCount(CPU *c) { c->eax = re5_det_is_enabled() ? re5_det_tick() : k32_tick_ms(); }
 static void k_GetCurrentProcessId(CPU *c) { c->eax = RE5_GUEST_PID; }
@@ -123,7 +172,8 @@ static void k_Sleep(CPU *c)
 {
     uint32_t ms = re5_arg(c, 0);
     RE5_BLOCKING_BEGIN();
-    host_sleep_ms(ms);
+    if (ms) host_sleep_us(k32_guest_sleep_us(ms));
+    else host_sleep_ms(0);
     RE5_BLOCKING_END();
 }
 
@@ -174,7 +224,7 @@ static void k_QueryPerformanceFrequency(CPU *c)
 
 static void k_QueryPerformanceCounter(CPU *c)
 {
-    uint64_t t = re5_det_is_enabled() ? re5_det_qpc() : (host_ns() / (1000000000ull / QPC_FREQUENCY));
+    uint64_t t = re5_det_is_enabled() ? re5_det_qpc() : (guest_ns() / (1000000000ull / QPC_FREQUENCY));
     uint32_t p = re5_arg(c, 0);
     w32(p, (uint32_t)t);
     w32(p + 4, (uint32_t)(t >> 32));

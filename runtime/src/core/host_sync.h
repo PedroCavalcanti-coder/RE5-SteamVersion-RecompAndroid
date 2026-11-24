@@ -32,6 +32,7 @@ static inline int re5_cond_wait_ms(re5_cond *c, re5_mutex *m, uint32_t ms)
 }
 static inline void re5_host_yield(void) { SwitchToThread(); }
 static inline void re5_host_sleep_ms(uint32_t ms) { Sleep(ms); }
+static inline void re5_host_sleep_us(uint64_t us) { Sleep((DWORD)((us + 999u) / 1000u)); }
 #else
 #include <errno.h>
 #include <pthread.h>
@@ -78,6 +79,11 @@ static inline void re5_host_sleep_ms(uint32_t ms)
 {
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     nanosleep(&ts, NULL);
+}
+static inline void re5_host_sleep_us(uint64_t us)
+{
+    struct timespec ts = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L};
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
 }
 #endif
 

@@ -149,5 +149,91 @@ int main(void)
     CHECK_EQ_U32(od.depth_store_dont_care, 0);
     CHECK_EQ_U32(od.stencil_store_dont_care, 0);
 
+    /* 6. Proteção absoluta de Shadow Maps (ds_is_texture): nunca usa DONT_CARE */
+    re5vk_tbdr_init(&t, 1);
+    re5vk_tbdr_sub sm_sub;
+    re5vk_tbdr_sub_reset(&sm_sub);
+    re5vk_tbdr_pass_in sm_pass = make_pass(0, NULL, 0, 50, &sm_sub, 0, 1, 0);
+    sm_pass.ds_is_texture = 1;
+    re5vk_tbdr_pass_out sm_out;
+    for (int f = 0; f < 5; f++) {
+        re5vk_tbdr_begin_pass(&t, &sm_pass, &sm_out);
+        CHECK_EQ_U32(sm_out.depth_store_dont_care, 0); /* SEMPRE STORE! */
+        re5vk_tbdr_end_frame(&t);
+    }
+
+    /* 7. Proteção de Texturas de Cor e Backbuffer: nunca sofrem DONT_CARE especulativo */
+    re5vk_tbdr_init(&t, 1);
+    re5vk_tbdr_sub rt_tex, rt_bb;
+    re5vk_tbdr_sub_reset(&rt_tex);
+    re5vk_tbdr_sub_reset(&rt_bb);
+    re5vk_tbdr_pass_in p_tex = make_pass(60, &rt_tex, 1, 0, NULL, 0, 0, 0);
+    p_tex.color_is_texture[0] = 1;
+    re5vk_tbdr_pass_in p_bb = make_pass(61, &rt_bb, 1, 0, NULL, 0, 0, 0);
+    p_bb.color_is_backbuffer[0] = 1;
+    re5vk_tbdr_pass_out o_tex, o_bb;
+    for (int f = 0; f < 4; f++) {
+        re5vk_tbdr_begin_pass(&t, &p_tex, &o_tex);
+        re5vk_tbdr_begin_pass(&t, &p_bb, &o_bb);
+        CHECK_EQ_U32(o_tex.color_store_dont_care, 0);
+        CHECK_EQ_U32(o_bb.color_store_dont_care, 0);
+        re5vk_tbdr_end_frame(&t);
+    }
+
+    /* 8. Continuidade em Split de passe: split força STORE e não desalinha o ordinal */
+    re5vk_tbdr_init(&t, 1);
+    re5vk_tbdr_sub scene_col, scene_ds;
+    re5vk_tbdr_sub_reset(&scene_col);
+    re5vk_tbdr_sub_reset(&scene_ds);
+    /* 2 quadros estáveis para estabilizar */
+    for (int f = 0; f < 2; f++) {
+        re5vk_tbdr_pass_in p_scene = make_pass(70, &scene_col, 1, 71, &scene_ds, 0, 1, 0);
+        re5vk_tbdr_pass_out o_scene;
+        re5vk_tbdr_begin_pass(&t, &p_scene, &o_scene);
+        re5vk_tbdr_end_frame(&t);
+    }
+    /* Quadro 3: sofre need_split no meio do passe */
+    {
+        re5vk_tbdr_pass_in p_part1 = make_pass(70, &scene_col, 1, 71, &scene_ds, 0, 1, 0);
+        p_part1.is_split = 1; /* pedaço 1 fechado por split */
+        re5vk_tbdr_pass_out o_part1;
+        re5vk_tbdr_begin_pass(&t, &p_part1, &o_part1);
+        CHECK_EQ_U32(o_part1.depth_store_dont_care, 0); /* Split NUNCA pode usar DONT_CARE! */
+
+        /* pedaço 2: continuação logo após o split */
+        re5vk_tbdr_pass_in p_part2 = make_pass(70, &scene_col, 0, 71, &scene_ds, 0, 0, 0);
+        re5vk_tbdr_pass_out o_part2;
+        re5vk_tbdr_begin_pass(&t, &p_part2, &o_part2);
+        re5vk_tbdr_end_frame(&t);
+    }
+
+    /* 9. Descarte imediato e determinístico de Stencil quando inativo */
+    re5vk_tbdr_init(&t, 1);
+    re5vk_tbdr_sub ds_nost;
+    re5vk_tbdr_sub_reset(&ds_nost);
+    re5vk_tbdr_pass_in p_nost;
+    memset(&p_nost, 0, sizeof p_nost);
+    p_nost.ds_img = 80;
+    p_nost.ds_sub_state = &ds_nost;
+    p_nost.has_depth = 1;
+    p_nost.has_stencil = 1;
+    p_nost.stencil_enabled = 0; /* jogo não usa stencil neste passe */
+    p_nost.stencil_cleared = 0;
+    p_nost.stencil_loaded = 0;
+    p_nost.width = 1920;
+    p_nost.height = 1080;
+    re5vk_tbdr_pass_out o_nost;
+    re5vk_tbdr_begin_pass(&t, &p_nost, &o_nost);
+    /* No PRIMEIRO frame já é descartado determinísticamente! */
+    CHECK_EQ_U32(o_nost.stencil_store_dont_care, 1);
+    re5vk_tbdr_end_frame(&t);
+
+    /* 10. Instrumentação e estatísticas (re5vk_tbdr_stats) */
+    re5vk_tbdr_stats st;
+    re5vk_tbdr_get_stats(&t, &st);
+    CHECK(st.total_passes >= 1);
+    CHECK(st.dont_care_stencil >= 1);
+    CHECK(st.bytes_saved_est >= 1920 * 1080 * 1);
+
     CHECK_DONE();
 }

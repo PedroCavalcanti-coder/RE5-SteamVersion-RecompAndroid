@@ -788,7 +788,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                     if (context instanceof Activity) {
                         Window window = ((Activity) context).getWindow();
                         if (window != null) {
-                            if ((msg.obj instanceof Integer) && ((Integer) msg.obj != 0)) {
+                            if (sForceImmersive || ((msg.obj instanceof Integer) && ((Integer) msg.obj != 0))) {
                                 if (Build.VERSION.SDK_INT >= 30 /* Android 11 (R) */) {
                                     // The legacy setSystemUiVisibility() flags are ignored on
                                     // Android 15+ (API 35+), where edge-to-edge is enforced for
@@ -976,6 +976,17 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     public static native void onNativeLocaleChanged();
     public static native boolean nativeIsCursorHidden();
     public static native int nativeGetPresents();
+    /** re5: o jogo sempre em tela cheia imersiva (sem barra de status nem de navegação), mesmo com
+     *  a janela do SDL criada sem SDL_WINDOW_FULLSCREEN. GameActivity liga antes do onCreate. */
+    public static boolean sForceImmersive;
+    /** re5 (d3d9_host.c): fecha (false) / abre (true) o Present do jogo em volta da troca de janela. */
+    public static native void nativeSurfaceGate(int open);
+    static void surfaceGate(boolean open) {
+        try {
+            nativeSurfaceGate(open ? 1 : 0);
+        } catch (Throwable ignored) {   // biblioteca ainda não carregada
+        }
+    }
     /* Dispositivo de toque do runtime (runtime/src/win32/touch.c, re5/touch.h). */
     public static native void nativeTouchPad(int buttons, float lx, float ly, float rx, float ry, float lt, float rt);
     public static native void nativeTouchPointer(int action, float nx, float ny);

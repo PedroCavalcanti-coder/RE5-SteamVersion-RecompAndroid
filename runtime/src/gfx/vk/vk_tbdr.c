@@ -60,6 +60,7 @@ static void mark_aspect_read(re5vk_tbdr *t, re5vk_tbdr_sub *s, int slot, uint8_t
             r->color_live |= cmask;
             if (r->color_used_dc & cmask) {
                 t->stat_mismatches++;
+                t->stats.stat_mismatches++;
                 s->sticky_live |= RE5VK_TBDR_COLOR;
                 re5vk_tbdr_hist *h = hist_find(t, r->pass_key, 1);
                 if (h) h->color_live |= cmask;
@@ -68,6 +69,7 @@ static void mark_aspect_read(re5vk_tbdr *t, re5vk_tbdr_sub *s, int slot, uint8_t
             r->depth_live = 1;
             if (r->depth_used_dc) {
                 t->stat_mismatches++;
+                t->stats.stat_mismatches++;
                 s->sticky_live |= RE5VK_TBDR_DEPTH;
                 re5vk_tbdr_hist *h = hist_find(t, r->pass_key, 1);
                 if (h) h->depth_live = 1;
@@ -76,6 +78,7 @@ static void mark_aspect_read(re5vk_tbdr *t, re5vk_tbdr_sub *s, int slot, uint8_t
             r->stencil_live = 1;
             if (r->stencil_used_dc) {
                 t->stat_mismatches++;
+                t->stats.stat_mismatches++;
                 s->sticky_live |= RE5VK_TBDR_STENCIL;
                 re5vk_tbdr_hist *h = hist_find(t, r->pass_key, 1);
                 if (h) h->stencil_live = 1;
@@ -89,6 +92,7 @@ static void mark_aspect_read(re5vk_tbdr *t, re5vk_tbdr_sub *s, int slot, uint8_t
         s->sticky_live |= bit;
         if (s->writer_dc & bit) {
             t->stat_mismatches++;
+            t->stats.stat_mismatches++;
             s->writer_dc &= (uint8_t)~bit;
         }
         if (s->writer_key[slot]) {
@@ -107,6 +111,18 @@ void re5vk_tbdr_init(re5vk_tbdr *t, int enabled)
     memset(t, 0, sizeof *t);
     t->enabled = enabled ? 1 : 0;
     t->frame_id = 1;
+}
+
+void re5vk_tbdr_get_stats(const re5vk_tbdr *t, re5vk_tbdr_stats *out)
+{
+    if (!t || !out) return;
+    *out = t->stats;
+}
+
+void re5vk_tbdr_reset_stats(re5vk_tbdr *t)
+{
+    if (!t) return;
+    memset(&t->stats, 0, sizeof t->stats);
 }
 
 void re5vk_tbdr_sub_reset(re5vk_tbdr_sub *s)
@@ -143,7 +159,7 @@ void re5vk_tbdr_begin_pass(re5vk_tbdr *t, const re5vk_tbdr_pass_in *in, re5vk_tb
     uint64_t tsig = calc_target_sig(in);
     uint32_t ord = 0;
     for (uint32_t i = 0; i < t->n_cur; i++)
-        if (t->cur[i].target_sig == tsig) ord++;
+        if (t->cur[i].target_sig == tsig && !t->cur[i].is_split) ord++;
     uint64_t pkey = fnv64_mix(tsig, (uint64_t)ord);
     if (!pkey) pkey = 1ull;
 
@@ -152,47 +168,109 @@ void re5vk_tbdr_begin_pass(re5vk_tbdr *t, const re5vk_tbdr_pass_in *in, re5vk_tb
     memset(r, 0, sizeof *r);
     r->target_sig = tsig;
     r->pass_key = pkey;
+    r->is_split = in->is_split ? 1 : 0;
     for (int i = 0; i < 4; i++)
         if (in->color_img[i]) r->color_mask |= (uint8_t)(1u << i);
     r->has_depth = in->has_depth ? 1 : 0;
     r->has_stencil = in->has_stencil ? 1 : 0;
 
     re5vk_tbdr_hist *h = hist_find(t, pkey, 0);
-    if (h && h->obs_count >= 2) {
+
+    /* 1. SE É SPLIT: Força STORE em tudo (continuidade física do tile entre draws) */
+    if (in->is_split) {
+        t->stats.stat_splits++;
+        t->stats.stat_conservative_fallback++;
+        /* out->*_store_dont_care permanece 0 */
+    } else {
+        /* 2. STENCIL: Regra determinística pura D3D9 */
+        int stencil_active = in->stencil_enabled || in->stencil_cleared || in->stencil_loaded;
+        if (r->has_stencil) {
+            if (!stencil_active) {
+                /* Stencil não ativado nem limpo nem carregado neste passe: descarta sem custo de memória */
+                out->stencil_store_dont_care = 1;
+                r->stencil_used_dc = 1;
+                t->stats.dont_care_stencil++;
+                t->stats.stat_discarded++;
+                t->stats.bytes_saved_est += (uint64_t)in->width * in->height * 1;
+            } else if (h && h->obs_count >= 2) {
+                uint8_t sticky = in->ds_sub_state ? (in->ds_sub_state->sticky_live & RE5VK_TBDR_STENCIL) : 1u;
+                if (sticky) {
+                    r->stencil_sticky_blocked = 1;
+                    t->stats.store_stencil++;
+                    t->stats.stat_conservative_fallback++;
+                } else if (!h->stencil_live) {
+                    out->stencil_store_dont_care = 1;
+                    r->stencil_used_dc = 1;
+                    t->stats.dont_care_stencil++;
+                    t->stats.stat_discarded++;
+                    t->stats.bytes_saved_est += (uint64_t)in->width * in->height * 1;
+                } else {
+                    t->stats.store_stencil++;
+                }
+            } else {
+                t->stats.store_stencil++;
+                t->stats.stat_conservative_fallback++;
+            }
+        }
+
+        /* 3. COLOR: Regra estrita de proteção de texturas e backbuffer */
         for (int i = 0; i < 4; i++) {
             if (!(r->color_mask & (1u << i))) continue;
+            /* Backbuffer ou Textura de RT: SEMPRE STORE (elimina lixo de textura e tela preta) */
+            if (in->color_is_backbuffer[i] || in->color_is_texture[i]) {
+                t->stats.store_color++;
+                t->stats.stat_conservative_fallback++;
+                continue;
+            }
             uint8_t sticky = in->color_subs[i] ? (in->color_subs[i]->sticky_live & RE5VK_TBDR_COLOR) : 1u;
             if (sticky) {
                 r->color_sticky_blocked |= (uint8_t)(1u << i);
+                t->stats.store_color++;
+                t->stats.stat_conservative_fallback++;
                 continue;
             }
-            if (!(h->color_live & (1u << i))) {
+            if (h && h->obs_count >= 2 && !(h->color_live & (1u << i))) {
                 out->color_store_dont_care |= (uint8_t)(1u << i);
                 r->color_used_dc |= (uint8_t)(1u << i);
-                t->stat_dont_care++;
+                t->stats.dont_care_color++;
+                t->stats.stat_discarded++;
+                t->stats.bytes_saved_est += (uint64_t)in->width * in->height * 4;
+            } else {
+                t->stats.store_color++;
+                t->stats.stat_conservative_fallback++;
             }
         }
+
+        /* 4. DEPTH: Regra estrita de proteção de Shadow Maps e descarte seguro de Depth Standalone */
         if (r->has_depth) {
-            uint8_t sticky = in->ds_sub_state ? (in->ds_sub_state->sticky_live & RE5VK_TBDR_DEPTH) : 1u;
-            if (sticky) {
-                r->depth_sticky_blocked = 1;
-            } else if (!h->depth_live) {
-                out->depth_store_dont_care = 1;
-                r->depth_used_dc = 1;
-                t->stat_dont_care++;
-            }
-        }
-        if (r->has_stencil) {
-            uint8_t sticky = in->ds_sub_state ? (in->ds_sub_state->sticky_live & RE5VK_TBDR_STENCIL) : 1u;
-            if (sticky) {
-                r->stencil_sticky_blocked = 1;
-            } else if (!h->stencil_live) {
-                out->stencil_store_dont_care = 1;
-                r->stencil_used_dc = 1;
-                t->stat_dont_care++;
+            /* Textura de profundidade (Shadow Map): SEMPRE STORE quando escrito (elimina sombras quebradas) */
+            if (in->ds_is_texture) {
+                t->stats.store_depth++;
+                t->stats.stat_conservative_fallback++;
+            } else {
+                uint8_t sticky = in->ds_sub_state ? (in->ds_sub_state->sticky_live & RE5VK_TBDR_DEPTH) : 1u;
+                if (sticky) {
+                    r->depth_sticky_blocked = 1;
+                    t->stats.store_depth++;
+                    t->stats.stat_conservative_fallback++;
+                } else if (h && h->obs_count >= 2 && !h->depth_live) {
+                    out->depth_store_dont_care = 1;
+                    r->depth_used_dc = 1;
+                    t->stats.dont_care_depth++;
+                    t->stats.stat_discarded++;
+                    t->stats.bytes_saved_est += (uint64_t)in->width * in->height * 4;
+                } else {
+                    t->stats.store_depth++;
+                    t->stats.stat_conservative_fallback++;
+                }
             }
         }
     }
+
+    t->stats.total_passes++;
+    t->stats.total_store = t->stats.store_color + t->stats.store_depth + t->stats.store_stencil;
+    t->stats.total_dont_care = t->stats.dont_care_color + t->stats.dont_care_depth + t->stats.dont_care_stencil;
+    t->stat_dont_care = t->stats.total_dont_care;
 
     /* Atualiza os escritores correntes para os passes/leituras seguintes. */
     for (int i = 0; i < 4; i++) {

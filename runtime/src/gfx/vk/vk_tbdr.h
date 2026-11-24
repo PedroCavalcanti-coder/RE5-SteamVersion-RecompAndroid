@@ -62,6 +62,14 @@ typedef struct {
     uint8_t  stencil_loaded;
     re5vk_tbdr_sub *color_subs[4];
     re5vk_tbdr_sub *ds_sub_state;
+    uint8_t  is_split;                 /* 1 se o passe é continuação de split (need_split) */
+    uint8_t  color_is_backbuffer[4];   /* 1 se o alvo de cor é o backbuffer da swapchain */
+    uint8_t  color_is_texture[4];      /* 1 se o alvo de cor é textura amostrável */
+    uint8_t  ds_is_texture;            /* 1 se o depth buffer é textura amostrável (shadow map) */
+    uint8_t  ds_is_auto;               /* 1 se o depth buffer é auto_depth standalone */
+    uint8_t  stencil_enabled;          /* 1 se D3DRS_STENCILENABLE ativo ou clear com D3DCLEAR_STENCIL */
+    uint8_t  depth_write_enabled;      /* 1 se D3DRS_ZWRITEENABLE ativo ou clear com D3DCLEAR_ZBUFFER */
+    uint32_t width, height;            /* dimensões da área para estimativa de tráfego de memória */
 } re5vk_tbdr_pass_in;
 
 typedef struct {
@@ -86,7 +94,26 @@ typedef struct {
     uint8_t  color_sticky_blocked; /* bits 0..3: anexo tinha sticky_live */
     uint8_t  depth_sticky_blocked;
     uint8_t  stencil_sticky_blocked;
+    uint8_t  is_split;
 } re5vk_tbdr_rec;
+
+typedef struct {
+    uint32_t total_passes;
+    uint32_t total_store;
+    uint32_t total_dont_care;
+    uint32_t store_color;
+    uint32_t store_depth;
+    uint32_t store_stencil;
+    uint32_t dont_care_color;
+    uint32_t dont_care_depth;
+    uint32_t dont_care_stencil;
+    uint32_t stat_reused;               /* anexos lidos/reutilizados em passes posteriores */
+    uint32_t stat_discarded;            /* anexos descartados com segurança comprovada */
+    uint32_t stat_conservative_fallback;/* anexos forçados a STORE por cautela */
+    uint32_t stat_splits;               /* passes divididos por necessidade de barreira */
+    uint32_t stat_mismatches;           /* leituras inesperadas após DONT_CARE */
+    uint64_t bytes_saved_est;           /* bytes estimados poupados de gravação na RAM */
+} re5vk_tbdr_stats;
 
 typedef struct {
     uint64_t pass_key;
@@ -98,13 +125,14 @@ typedef struct {
 } re5vk_tbdr_hist;
 
 typedef struct {
-    int             enabled;
-    uint32_t        frame_id;
-    uint32_t        n_cur;
-    re5vk_tbdr_rec  cur[RE5VK_TBDR_MAX_PASSES];
-    re5vk_tbdr_hist map[RE5VK_TBDR_MAP_CAP];
-    uint32_t        stat_dont_care;
-    uint32_t        stat_mismatches;
+    int              enabled;
+    uint32_t         frame_id;
+    uint32_t         n_cur;
+    re5vk_tbdr_rec   cur[RE5VK_TBDR_MAX_PASSES];
+    re5vk_tbdr_hist  map[RE5VK_TBDR_MAP_CAP];
+    uint32_t         stat_dont_care;
+    uint32_t         stat_mismatches;
+    re5vk_tbdr_stats stats;
 } re5vk_tbdr;
 
 void re5vk_tbdr_init(re5vk_tbdr *t, int enabled);
@@ -113,6 +141,8 @@ void re5vk_tbdr_begin_pass(re5vk_tbdr *t, const re5vk_tbdr_pass_in *in, re5vk_tb
 void re5vk_tbdr_mark_read(re5vk_tbdr *t, re5vk_tbdr_sub *s, uint8_t aspect_mask);
 void re5vk_tbdr_mark_external_write(re5vk_tbdr_sub *s, uint8_t aspect_mask);
 void re5vk_tbdr_end_frame(re5vk_tbdr *t);
+void re5vk_tbdr_get_stats(const re5vk_tbdr *t, re5vk_tbdr_stats *out);
+void re5vk_tbdr_reset_stats(re5vk_tbdr *t);
 
 #ifdef __cplusplus
 }

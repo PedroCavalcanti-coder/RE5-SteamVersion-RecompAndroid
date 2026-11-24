@@ -376,6 +376,176 @@ O que mudou:
     global dentro do ctest, outra no hle com `RE5_HLE_SPIN=0`, ou seja, também sem o giro novo);
     não reproduziu em 600 voltas seguidas nem sob o gdb. Corrida rara no teste ou no runtime, a
     investigar.
+- **Rodada de 10/11 no branch `android` (commits `62af2332`, `40ce4f5d`, outra IA), revista em
+  11/11.** Usuário: **nenhuma diferença de desempenho** e, no re5vk, **lixo de textura e sombras
+  quebradas só no ARM**. Nada daquela rodada foi medido no aparelho. Revisão do código:
+  - **`RE5_QUERY_LAG=2` virou padrão no Android** (`d3d9.c`). O evento é a cerca do jogo: respondendo
+    "pronto" antes da GPU acabar, o jogo reescreve por `Lock(NOOVERWRITE)` trechos de vertex/index
+    buffer que a GPU ainda lê (o re5vk entrega a memória viva nesse Lock, `vk_res.c`
+    `buffer_lock`). Só o Android tinha o padrão novo. **Volta a desligado em toda plataforma**
+    (`RE5_QUERY_LAG=<n>` continua para teste).
+  - **Oráculo TBDR (`vk_tbdr.c`, `STORE_OP_DONT_CARE`) ligado por padrão.** Prevê pelo quadro
+    anterior se um anexo será lido e só aprende depois de já ter descartado; a chave do passe é
+    alvo + ordem no quadro, que muda quando o passe é dividido (textura nova no meio) ou quando uma
+    sombra não é refeita todo quadro. É o `DONT_CARE` na profundidade reaproveitada já revertido em
+    07/11. **Desligado por padrão; `RE5VK_TBDR=1` liga** para o A/B. Desligado, o `prepare` nem
+    percorre os sub-recursos das texturas (antes, toda textura de todo draw, na thread de render).
+  - **Layouts ótimos (`vk_draw.c`):** imagem amostrada e presa como anexo no mesmo draw (desenhar no
+    mip 0 lendo a imagem, profundidade presa e lida) ia ao descritor em `GENERAL`, mas só o
+    sub-recurso do anexo mudava de layout; os outros mips/faces ficavam em
+    `COLOR_ATTACHMENT`/`SHADER_READ_ONLY`, sem barreira. Na AMD o layout quase não importa; no
+    Adreno (UBWC) e no Mali (AFBC) a leitura com layout errado sai como lixo. Agora esses
+    sub-recursos vão a `GENERAL` (com barreira) antes do passe, e o passe aberto se divide se
+    faltar alguma. Escolha em `vk_layout.c` (`re5vk_layout_pending`), teste `test_vk_layout`.
+    `RE5VK_LAYOUT_GENERAL=1` continua voltando ao modo antigo (tudo em `GENERAL`).
+  - **UBO depois de flush (`upload_ubos`):** se o anel do PS enchia e mandava o envio, o bloco do VS
+    devia ser refeito no anel novo, mas a condição (`&& vs_dirty`, sempre 0 ali) nunca deixava; e
+    depois do flush de `re5vk_alloc_set` nenhum dos dois era refeito (o set apontava para o anel do
+    envio anterior). Agora os dois são refeitos no envio novo.
+  - **O commit `2737cb77` ("configura branch android e corrige build NDK/Gradle") tinha desfeito
+    a rodada de 07/11 no runtime**, sem dizer na mensagem (veio de uma árvore anterior ao
+    `df54862a`): overrides do CRT (`0x00E7D4FE` SSE2, memset/memcpy/memmove do host, `_ftol2` e
+    `_ftol2_sse`), giro do lock do HLE (`RE5_HLE_SPIN`), `Sleep(n)` = n ms + 1 tique fora do
+    Windows (a thread de som do A54 gastava 42-82% de um núcleo grande girando 1,8x mais), pontos
+    de chamada das seções no `RE5_PROFILE` e o `test_sleep`. O `difftest_override` do `ctest`
+    estava vermelho no branch por isso (exit 5: override ausente). **Restaurados iguais ao
+    `master`** (`kernel32_sync.c` mantém o `yield; isb` do `62af2332`); o resto daquele commit
+    (link do NDK, Gradle, cópia do exe no `GameStorage`) fica. Exige relift (`run_lift.py lift`):
+    o código gerado local não chamava os overrides do CRT, nem no PC nem no Android.
+  - Sem mudança: afinidade (o atalho "sem núcleo pequeno" só vale com o cluster mais lento a
+    2,6 GHz ou mais; não pega o 8 Gen 2 nem o Exynos 1380), `yield; isb` no giro, `-mtune=generic`,
+    cache de estado dinâmico.
+  - **Visual e fps: não testados no aparelho.** A/B pelo `re5_env.txt` (launcher, Avançado):
+    `RE5VK_TBDR=1`, `RE5_QUERY_LAG=2`, `RE5VK_LAYOUT_GENERAL=1`, um de cada vez.
+- **Medida do fps baixo no celular (11/11; o Edge 40 Neo, Dimensity 7030, roda melhor que os
+  outros aparelhos):**
+  - **O HUD enganava sobre a CPU:** a porcentagem é a CPU do processo dividida por todos os
+    núcleos; num aparelho de 8 núcleos a thread principal no limite aparece como ~12%. Agora o HUD
+    mostra também a thread mais ocupada em % de um núcleo e o nome dela
+    (`HudPrefs.busiestThread`, `/proc/self/task/*/stat` a cada segundo): `15% CPU · máx 98% re5-main`.
+  - **re5vk com `RE5_FPS_LOG=1`** (`re5vk.c`, `timing_tick`): uma linha por segundo com os ms em que
+    a CPU ficou parada em `vkAcquireNextImageKHR`, nas fences dos slots, no limite de quadros em voo
+    (`RE5VK_LATENCY`), em `vkQueueSubmit`, em `vkQueuePresentKHR` e esperando o mutex do device; e o
+    tempo de GPU dos envios por timestamps (`vkCmdWriteTimestamp` no começo e no fim de cada command
+    buffer, lido depois da fence, sem esperar; `timestampValidBits`/`timestampPeriod` conferidos, e
+    sem timestamps na fila o log diz). Desligado, nada disso roda (nem relógio nem query pool).
+  - `scripts/android_perf.py` lê a linha nova e dá o veredito do re5vk: GPU no limite (`gpu_ms` ≥
+    850 por s), CPU esperando fence com GPU folgada, apresentação, ou limite antes do Vulkan.
+    Teste em `tests/python/test_android_perf.py`.
+  - Já existiam: ADPF (`perf_hint.c`, fase A2), CPU por thread e clocks no `android_perf.py`, log da
+    swapchain (modo e número de imagens).
+- **Volta parcial (11/11, depois do primeiro APK da revisão):** usuário: fps do re5vk "muito abaixo
+  do normal", lixo igual, HUD "CPU 15% · máx 99%". `RE5_QUERY_LAG=2` volta a ser padrão no Android
+  (o jogo girava no `GetData` com o lixo igual: não era a causa). No Android o re5vk volta ao modo
+  de layouts de até 10/11 (`RE5VK_LAYOUT_GENERAL` padrão 1 lá, `=0` liga os ótimos;
+  `re5vk_layout_general_choice`, `test_vk_layout`), e a barreira global de fim de passe limpa a
+  "escrita pendente" dos anexos (sem isso o modo GENERAL dividia passes à toa). HUD: clock da GPU
+  do Exynos vinha em kHz ("949000 MHz").
+- **Medida no A54 (SM-A546E, Mali-G68, Vulkan 1.3.219, BC não; 11/11, re5vk, Game Mode
+  performance, `RE5VK_LATENCY=1` do launcher, benchmark fixo do jogo a 800x600; logs em
+  `work/android/a54_1111_*`):** `android_perf.py` 141 s: fps médio 29,5, mediana 19,4, p10 12,7.
+  **GPU no limite:** timestamps 28,8 ms de GPU por quadro em média e ~960-980 ms por segundo nos
+  trechos de cena (15-25 fps); `gpu_busy` médio 80%, clock 98% do máximo. CPU folgada: re5-main 39%
+  de um núcleo (pico 77%), `g00457C60` 34%; esperas do re5vk curtas (fence 1,5 ms, em voo 0,07 ms
+  por quadro); o resto é `vkQueuePresentKHR` esperando a GPU (9,5 ms). Os 99% de uma thread no HUD
+  são de carregamento (`lock_ms` ~900). Captura: cena do benchmark quase preta com faixas (o
+  sintoma de 06/11 no Mali, "cena escura"), não algo novo de 10/11.
+  **Mesmo benchmark com a DXVK** (`work/android/a54_1111_dxvk_*`, 146 s): fps médio 17,5, mediana
+  16,1, p10 12,9; **imagem certa** (captura com a cena clara); GPU 72% ocupada com clock médio de
+  **233 MHz, 25% do máximo** (o governador não sobe, como em 07/11); Present 29,8 ms do quadro de
+  57 ms; re5-main 27% de um núcleo. Comparação: fps parecido, mas o re5vk precisa do clock máximo
+  para chegar lá: ~3-4x mais trabalho de GPU por quadro que a DXVK (aproximação: ocupação x clock x
+  tempo do quadro). A ponte não passa latência à DXVK (o "quadros em voo" do launcher é só
+  `RE5VK_LATENCY`).
+- **Fps baixo no celular com CPU e GPU folgadas (11/11, A54, DXVK, benchmark variável roteirizado
+  por `scripts/android_trace.py`; Edge 40 Neo do usuário: ~30 fps com a thread máxima em 60%; os
+  outros aparelhos, <25).** Evidência em `work/android/a54_dxvk_*` (traces do Perfetto, logcat):
+  - Perfetto (`scripts/android_trace_report.py`): núcleos grandes ~50% ocupados; a principal dorme
+    58% do tempo, e as esperas longas (~38 ms, uma por quadro) terminam com a `dxvk-submit`, que
+    dorme 95% esperando o driver do Mali. Afinidade conferida no aparelho: só a principal e a de
+    render ficam em 4-7; workers, DXVK e driver em 0-7 (nada herdou a máscara).
+  - Esperas do jogo (`re5_k32_wait_report`, novo, com `RE5_FPS_LOG`): a principal dorme só
+    ~140 ms/s em `WaitFor*` e quase nada em seções críticas; o resto é o `Present`.
+  - **Patch de medida na DXVK** (`android/dxvk/re5_present.py`, aplicado pelo `prepare.py`):
+    `vkQueuePresentKHR` leva o quadro inteiro (~51-75 ms, 965-990 ms por segundo) em todos os
+    modos; a principal espera o present anterior 540-640 ms/s; o acquire e a latência, ~0.
+  - Tentativas, todas **sem ganho de fps** (12-16 fps no mesmo trecho): `DXVK_RE5_PRESENT_DEPTH=2`
+    (a principal passa a esperar a latência de quadros, 550-600 ms/s; GPU 58%, 226 MHz);
+    `DXVK_RE5_PRESENT_QUEUE=1` (present na 2ª fila gráfica do Mali, que tem 2, numa thread
+    `dxvk-present`: GPU 70%, clock médio 244 MHz, máx 552); FIFO por `d3d9.presentInterval=1`
+    **não aplicado** (a DXVK não leu o `DXVK_CONFIG_FILE`; inconclusivo).
+  - GPU: governador `Interactive`, 49 °C (sem limite térmico), teto 845 MHz; fica em 221-244 MHz
+    com 58-70% de ocupação. O re5vk, com GPU ~98% ocupada, chegou a 949 MHz: o governador sobe
+    só com carga contínua.
+  - Padrão instalado: o original (`DEPTH=1`, sem 2ª fila); as chaves ficam para A/B. A `.so` da
+    DXVK foi refeita com o NDK 27 do Unity (`android/dxvk/CMakeLists.txt` ganhou
+    `-lc++_static -lc++abi`); a árvore preparada (`build/dxvk-android/src`) tinha patches mais
+    novos que o `prepare.py` (aviso do sRGB com formato/uso): divergência a reconciliar.
+  - `kernel32_sync.c`: o contador de esperas iniciava o mutex sem proteção contra duas threads
+    (corrigido com CAS). Uma rodada caiu no `ExitProcess` (`pthread_mutex_lock` em mutex
+    destruído, na thread Java do SDL): o roteiro errou o menu e o jogo saiu; a queda na saída não
+    foi investigada.
+- **ADPF com duração de GPU (12/11, `perf_hint.c`, `d3d9.c`):** a ponte mede sempre o tempo dentro
+  do `Present` do host; no Android 15+ (`APerformanceHint_reportActualWorkDuration2` e
+  `AWorkDuration_*`, todos por `dlsym`) cada quadro vai ao ADPF com total, CPU (total menos a espera
+  no Present) e GPU (a espera no Present, que no Mali é esperar a GPU). Sem a API, ou com o sistema
+  recusando o relato, volta ao relato antigo (só o total); `RE5_PERF_GPU=0` desliga. Conta em
+  `re5_perf_split`, teste em `test_perf_hint`. `ctest` 37/37 (difftest_cpu pulado).
+  **Medido no A54 (12/11, DXVK, benchmark roteirizado, `work/android/a54_dxvk_gpuhint*`):** o
+  sistema aceita o relato (nenhuma recusa), mas **não muda nada**: clock médio da GPU 246 MHz com e
+  sem, ocupação 67% x 75%, 12-16 fps nos dois. Fica ligado (sem custo e sem erro); não é a saída.
+- **re5vk `RE5VK_SRGB=0` no A54 (12/11, `work/android/a54_re5vk_srgb*`):** GPU 66% a 393 MHz
+  contra 96% a 949 MHz com sRGB (~3,5x menos trabalho de GPU), mas o fps não subiu (~13 x ~16: o
+  governador baixou o clock junto), e a captura saiu preta a 3,8 fps com o `mali-compiler` a 55%
+  (pipelines novos compilando, ou erro visual: não separado). **Não vira padrão.**
+  - Pedido de 12/11 (texto de outra IA): opção OpenGL no app não entra (não há tradutor D3D9 ->
+    GLES; escolhê-la abortaria); layouts ótimos e oráculo TBDR continuam desligados no Android
+    (geravam lixo); `RE5VK_SRGB=0` como padrão no re5vk só depois de medir no A54.
+  Próximo: A/B de custo de GPU
+  (DXVK x re5vk; `RE5VK_SRGB=0`, imagens mutáveis sem AFBC; `RE5VK_LAYOUT_GENERAL=0`;
+  `RE5VK_TBDR=1`) no mesmo trecho, e o quadro escuro.
+- **re5vk: correções só do Android a partir de uma revisão externa (12/11).** Pedido do usuário:
+  nada muda no PC. Tudo está em `#if defined(__ANDROID__)` ou com padrão ligado só no Android; no
+  PC o SPIR-V gerado e o comportamento do backend ficam iguais (o teste confere que, sem a
+  variável, nenhuma instrução nova aparece).
+  - **Guarda de NaN/Inf no DXSO (`vk_dxso.c`, `RE5VK_NANGUARD`, padrão 1 no Android):** o `_sat`
+    e o `finite_f` usavam `FClamp`, indefinido com NaN no SPIR-V (a AMD dá 0, o Mali pode
+    propagar); `exp`/`expp`, `pow` e o `lit` não tinham limite (`pow(0, <0)` e `exp` grande davam
+    +Inf). Agora `_sat` usa `NClamp` (NaN -> 0) e `finite_f`, `exp`, `pow` e `lit` passam por
+    `OpIsNan` + `NClamp` (NaN -> 0, Inf -> +-FLT_MAX); `lit` ganha `pow(y, 0) = 1`. Alvo: a cena
+    escura com faixas no Mali. `RE5VK_NANGUARD=0` desliga para o A/B.
+  - **Render targets sem `MUTABLE_FORMAT` (`vk_res.c`, `RE5VK_RT_MUTABLE=1` volta):** o par sRGB
+    deixava todo RT BGRA8/RGBA8 mutável, o que tira o AFBC do Mali (e o UBWC em parte dos Adreno)
+    justamente onde há mais banda; o `RE5VK_SRGB=0` acima mediu ~3,5x menos trabalho de GPU, mas
+    tirava o sRGB também das texturas. Agora só texturas comuns têm o par. Se um RT sem o par for
+    amostrado com `D3DSAMP_SRGBTEXTURE`, sai um aviso no log (uma vez) em vez de errar a gama calado.
+  - **`VkImageFormatListCreateInfo` em Vulkan 1.1:** a lista ia na criação da imagem sem
+    `VK_KHR_image_format_list` habilitada (uso inválido em Adreno/Mali 1.1). Agora a extensão é
+    pedida quando existe e, sem ela nem 1.2, a lista não vai (`vk_device.has_fmt_list`).
+  - **`RE5_QUERY_LAG` x `NOOVERWRITE` (`re5vk.c`, `latency`):** o atalho do `d3d9.c` dá como pronto
+    o evento emitido n Present atrás; isso só é verdade se o Present n-1 depois do `Issue` já
+    esperou aquele envio, ou seja, com `RE5VK_LATENCY <= n-1`. Com o padrão (lag 2, latência 3) a
+    CPU podia reescrever vértices que a GPU ainda lia (candidato ao lixo de geometria). No Android
+    a latência agora é limitada a `lag-1` (1 com o padrão), com linha no log;
+    `RE5VK_LATENCY_UNSAFE=1` tira o limite para o A/B de fps.
+  - **Barreira de fim de passe (`vk_draw.c`, só com `RE5VK_LAYOUT_GENERAL=1`, o padrão do
+    Android):** passa a incluir `VERTEX_SHADER_BIT` no destino (textura escrita num passe e lida
+    no vertex shader ficava sem dependência).
+  - **`Clear` em sequência (`vk_draw.c`):** `Clear(TARGET)` e depois `Clear(ZBUFFER)` antes do draw
+    agora se juntam no mesmo `loadOp CLEAR` (antes o segundo abria o passe e virava
+    `vkCmdClearAttachments`, carregando os tiles).
+  - **Evidência desta sessão:** `cmake --build build/android-arm64 --target re5_runtime` sem erros;
+    o runtime do host (caminho do PC) também compila; `ctest` do host 38/38 (`difftest_cpu`
+    pulado), com o teste novo `vk_dxso_nanguard` (mesmo binário com `RE5VK_NANGUARD=1`: `ps_nan`
+    com `exp`, `lit`, `pow` e `mov_sat` gera `OpIsNan` e `NClamp`); as duas formas passam no
+    `spirv-val` do NDK 30 (`RE5_SPIRV_VAL`). Uma rodada anterior do `ctest` teve o `kernel32`
+    vermelho (`test_kernel32.c:268`, dono da seção crítica) e a seguinte passou: a corrida rara já
+    anotada acima, em código que esta rodada não tocou.
+  - **Não medido no aparelho:** visual (cena escura, lixo) e fps/GPU no A54 e no Adreno. A/B pelo
+    `re5_env.txt`: `RE5VK_NANGUARD=0`, `RE5VK_RT_MUTABLE=1`, `RE5VK_LATENCY_UNSAFE=1`.
+  - Fora desta rodada (revisão aponta, ainda aberto): `OpVariable`/`OpLoad`/`OpStore` por
+    registrador no DXSO (sem otimização SPIR-V), `STORE_OP_STORE` em todo passe sem um grafo do
+    quadro, refcount não atômico, `Lock(DISCARD)` sem zerar memória reaproveitada.
 - **`spin_pause` (A/B 2026-11-03):** 47 laços de espera com pausa de CPU; usuário, mesmo
   benchmark: 89,2 com contra 90,1 sem. Empate; fica desligado.
   - Os acessos do `cpu.h` recebem `re5_gaddr` por `_Generic`; um `uint32_t` continua truncado.
@@ -540,6 +710,147 @@ catálogo fechadas no caminho: `0x00E69D1C` (benchmark variável) e `0x00C212D0`
   falhou 2 vezes em 3 corridas da suíte inteira e passa sozinho: é instável, não vem destas
   mudanças.
 
+### Renderizadores nativos vkadreno/vkmali: base nova (2026-11-12, em andamento)
+
+- Decisão D10 (`docs/ARQUITETURA.md`). Código em `runtime/src/gfx/vkn/`: `VulkanContext`
+  (vk-bootstrap v1.4.363), `VulkanMemory` (VMA v3.5.0, destruição adiada por serial, anel de
+  staging, importação de memória do host por `vmaCreateDedicatedBuffer`), `IRenderer` com
+  `DxvkRenderer`, `NativeVulkanRenderer`, `AdrenoRenderer` e `MaliRenderer`; fachada C em
+  `re5/renderer.h`. Dependências vendorizadas em `third_party/vk-bootstrap` e
+  `third_party/VulkanMemoryAllocator` (com as licenças MIT).
+- Evidência (Windows, MinGW, `build/host-tests`): `ctest` 40/40 (difftest_cpu pulado, como
+  antes). `vkn_policy` cobre a política de load/store e o seletor `RE5_GFX`. `vkn_gpu` roda numa
+  GPU de verdade sem janela (Intel UHD, Vulkan 1.4.312, `RE5_VKN_ANY_GPU=1`): uploads, importação
+  de memória do host, 6 quadros com o oráculo TBDR (profundidade em STORE no 1º quadro e
+  `DONT_CARE` no 6º; a cor lida fica STORE), clear no meio do passe, framebuffer descartado com a
+  imagem e nenhum vazamento no fim. Camadas de validação da Khronos não estão instaladas
+  nesta máquina: **validação não verificada**.
+- **Seletor ligado (mesmo dia):** `d3d9_host.c` lê `RE5_GFX` pelo seletor (`re5_parse_gfx_mode`
+  e `re5_gfx_mode` delegam a `re5/renderer.h`; `host_create9` chama `re5_renderer_create_d3d9`
+  nos nativos). Launcher: `GpuInfo.java` (nó `/dev/kgsl-3d0` ou `/dev/mali0` primeiro) mostra só
+  o nativo da GPU do aparelho e migra a preferência `re5vk` salva para `vkadreno`/`vkmali` (ou
+  DXVK). Traduções novas em `scripts/android_i18n.py` e `assets/i18n`. `test_d3d9` cobre os
+  nomes novos e a recusa de `re5vk`. `ctest` 40/40.
+- **APK (mesmo dia):** build limpo do `libre5.so` com NDK 30.0.16248370
+  (`build/android-arm64-ndk30`, `--clean-first`, 524 passos, sem erro); runtime e `vkn` em `-O2`
+  (RelWithDebInfo), código gerado em `-O1` (o `-O2` não teve ganho medido em 22/10). `libre5.so`
+  sem símbolos: 77,1 MB. Gradle `clean assembleDebug` (JDK do Android Studio) ->
+  `android/app/build/outputs/apk/debug/app-debug.apk`, 52,4 MB. A `libdxvk_d3d9.so` não foi
+  refeita (sem `glslang` nesta máquina): é a de 11/11. **Não instalado em aparelho.**
+- **Device D3D9 portado (mesmo dia):** `runtime/src/gfx/vk` usa as classes pela ponte C
+  `runtime/src/gfx/vkn/vkn_bridge.h` (implementada em `renderer.cpp`):
+  - instância, superfície, GPU, device (EDS1+EDS2 obrigatórios, instância 1.3 quando houver) e
+    swapchain (identidade como a DXVK, modo pelo `PresentationInterval`, `TRANSFER_DST` só se a
+    superfície aceitar) pelo `VulkanContext`;
+  - buffers e imagens por `vmaCreateBuffer`/`vmaCreateImage`; memória do guest (`RE5VK_ZEROCOPY=1`)
+    importada em blocos e subdividida com o alocador virtual do VMA. O alocador de blocos próprio
+    (`vk_chunk` com lista de livres, `re5vk_mem_alloc`) saiu;
+  - passes por `VkRenderPass` + `VkFramebuffer` em cache (posições vazias = `VK_ATTACHMENT_UNUSED`,
+    layout inicial = final = o do anexo, framebuffers descartados com a view), pipelines com passe
+    compatível. Dynamic rendering saiu.
+  - As tabelas de funções do `vk_core.h` não têm mais `vkCreateInstance`, `vkCreateDevice`,
+    `vkCreateSwapchainKHR`, `vkAllocateMemory`, `vkBind*Memory` nem `vkCmdBeginRendering`.
+  - O oráculo TBDR do `NativeVulkanRenderer` passou a desligado por padrão (`RE5VK_TBDR=1`), como
+    no re5vk desde 11/11.
+- **Evidência:** `ctest` 41/41 no Windows; `vkn_bridge` (teste em C11) exercita a ponte numa GPU
+  real. Jogo no PC (`build/host-tests/re5.exe`, Intel UHD, `RE5_GFX=vkmali RE5_VKN_ANY_GPU=1`):
+  - abertura e título corretos (`work/bench/vkn_port/frame_*.png`);
+  - benchmark variável com `RE5_FPS_CAP=57`: 177 s, nenhum `[ERROR]`, cena 3D correta
+    (`work/bench/vkn_port57/frame_7000.png`, `frame_9000.png`), preso no limite de 57 fps.
+  - Sem o limite o menu roda a 120 fps e o roteiro de `bench_re5.py` (que conta Presents) aperta
+    as teclas cedo demais: não entra no benchmark. Não é defeito do device, mas impede a medida de
+    fps sem limite; **comparação de fps contra a DXVK não feita**.
+- Android: `libre5.so` NDK 30 compila; APK refeito (`app-debug.apk` com o `libre5.so` novo,
+  sha256 conferido). **Não testado em Adreno nem Mali.**
+- **`robustBufferAccess2` no device nativo (2026-11-20, hipótese para o defeito das cabeças,
+  ver `docs/RELATORIO_VKNATIVO_CABECA_2026-11-19.md`):** o device pedia só o `robustBufferAccess`
+  "v1", com o qual uma leitura fora do buffer (vértice, `c[a0]`) pode devolver qualquer valor de
+  dentro do buffer: o desktop devolve 0, Mali/Adreno podem prender no limite. A DXVK exige
+  `VK_EXT_robustness2`. Agora `VulkanContext` liga `robustBufferAccess2` quando a GPU tem a extensão
+  (`ContextCreateInfo::wantRobustness2`, `DeviceCaps::robustBufferAccess2`, campo
+  `robust_buffer_access2` da ponte); `RE5VK_ROBUST2=0` desliga para o A/B. A linha `GPU:` do log
+  mostra `robust=` e `robust2=`. Evidência: `ctest` 42/42 (difftest_cpu pulado); `vkn_bridge` confere
+  o campo contra as extensões do device (Intel UHD: `robust=1 robust2=1`). `libre5.so` NDK 30 e
+  `app-debug.apk` refeitos. **Não testado no aparelho; não se sabe se resolve as cabeças.**
+  - **A54, mesmo dia (`work/android/a54_robust2_20261120/`, 3 min, `RE5_GFX=vkmali`):** o driver
+    Mali r38 **não tem** `VK_EXT_robustness2` (`vkprobe`: robustBufferAccess2 NAO; log `robust=1
+    robust2=0`), então o experimento não vale no Mali. E o `RE5VK_DUMP_HEAD=1` mostrou os 4 draws de
+    cabeça com o fetch **dentro** do buffer nos dois streams (stream 1 com stride 8): leitura de
+    vértice fora do buffer está **descartada** como causa. O TEXCOORD1 do stream 1 vem `FFFF FFFF`
+    (NaN em half) em todos os vértices logados: dado do jogo (a DXVK lê o mesmo); pista a seguir no
+    tradutor (como o VS usa esse NaN e como o Mali propaga NaN em `min`/`max`/`sat`).
+  - Desempenho no mesmo trecho: menu a 60 fps; gameplay a 12-15 fps, **limitado pela GPU** (`gpu_ms`
+    ~950 por segundo, ~100 passes de render por quadro, até 33 mil draws/s) com o clock da GPU
+    quase sempre em 650 MHz (máx. 949) e os núcleos grandes em ~1,3 GHz de média (máx. 2,4). A
+    thread de render do jogo (`g00457C60`) roda 30% e dorme 68% (p90 do sono 41 ms). RAM: PSS
+    até 1,8 GB, memória de GPU (`GL mtrack`) até 1,24 GB, nativa ~265 MB; o processo não foi morto.
+    O cache de pipelines foi apagado antes: o `mali-compiler` (~5% de um núcleo) pesa nesta medida.
+  - **Pista do NaN no TEXCOORD1 (mesmo dia): descartada.** Dos 164 VS de `work/shaders`, o único de
+    skinning com 8 ossos e TANGENT (o layout das cabeças: 8 ossos no stream 0, TEXCOORD1+TANGENT no
+    stream 1) é o `vs_7ee27055`, e ele **não lê TEXCOORD1**; o NaN do stream 1 não entra na conta.
+    Esse VS mistura uma projeção paraboloide (`rcp(x²+y²)`) com a normal por `lrp c7.x`; o `lrp`
+    traduzido é `s2 + s0*(s1-s2)` com o mul emulado (0*x = 0), então com `c7.x = 0` o resultado é a
+    projeção normal mesmo com Inf/NaN no outro lado. Não é a causa em teoria; falta ver `c7` no aparelho.
+    Diagnósticos novos (`vk_draw.c`): `DUMP_HEAD` loga o hash do VS/PS, `c4..c15` e o maior índice
+    do draw com o fim do fetch por ele; `RE5VK_SKIP_VS=<hash>[,...]` não desenha com esses VS.
+    `ctest`: 40/42 na rodada; `handle_table` passou ao repetir e `kernel32` falha 5 em 15 vezes
+    (`test_kernel32.c:268`, seção crítica disputada, `Sleep(1)` médio 14,7 ms na máquina carregada;
+    vem das mudanças já presentes em `kernel32_sync.c`, não deste item). APK instalado no A54, **não rodado**.
+  - **Rodadas no A54 e no PC (mesmo dia, `work/android/a54_passes_20261120/`, `a54_trace_20261120/`,
+    `work/bench/pc_vkmali_*`):** a cabeça é desenhada pelo `vs_7EE27055` (PS `6DDFF540`) no A54 e no
+    PC; `c7.x = 0` nos dois (mistura paraboloide desligada); índices dentro de `minv..minv+numv-1` e
+    fetch pelo maior índice dentro do buffer nos dois streams. Vertex input e paraboloide descartados.
+  - **Os ~100 passes por quadro:** contadores novos no `RE5_FPS_LOG` (linha `passes por s`: motivo de
+    cada fechamento, draws por passe, reabertos no mesmo sub-recurso) e `RE5VK_PASS_TRACE=<n>` (rastro de
+    um quadro a cada n). No gameplay do A54 (quadros de 102-103 passes) a maioria é legítima: **~7 cadeias
+    de mipmap desenhadas nível a nível** (128x128 → 1x1) e cadeias de bloom (200x150 → 25x18), um draw
+    cada, mais 19 passes em 800x600; 82 de 103 fecham por `SetRenderTarget` para outro alvo. O contador
+    de "reabertos no mesmo alvo" do primeiro APK comparava só a imagem e contava os níveis de mip (os
+    "54 por quadro" eram isso); agora compara imagem + nível + camada. **Fechamento adiado**
+    (`RE5VK_LAZY_RT`, padrão 1; `=0` volta): `SetRenderTarget`/`SetDepthStencilSurface` só fecham o passe
+    no próximo draw/Clear se o conjunto de alvos mudou; o passe guarda referência dos próprios alvos.
+    Ganho medido pequeno: 13-16 trocas desfeitas por segundo no A54 e ~1 por quadro no PC. Sem erro no
+    benchmark do PC (56,8 fps no limite de 57); **visual no A54 não conferido**. `ctest` 42/42.
+    Próximo passo para saber onde vão os ~70 ms de GPU por quadro: timestamps por passe, agrupados por alvo.
+- **Faixas nas cabeças: causa achada e corrigida (2026-11-20, A54, Mali-G68 r38).** O driver erra o
+  **stride de vértice dinâmico** (`VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE` +
+  `vkCmdBindVertexBuffers2`, do extended dynamic state). Evidência, no mesmo aparelho e dia:
+  - DXVK 2.6.2 portada (`android/dxvk_262`) com stride dinâmico: **linhas até no 2D**; com o stride no
+    pipeline (patch 15 do `prepare.py`, `DXVK_RE5_DYNAMIC_STRIDE=1` volta): **as linhas sumiram**
+    (usuário). A 1.9.2b (Vulkan 1.1, stride no pipeline) nunca teve o defeito.
+  - Backend nativo no **modo Vulkan 1.1** (`RE5VK_CORE`, padrão 1 no Android; `=0` volta ao EDS;
+    `re5_vkn_core_mode` em `vkn_bridge.h`): sem extended dynamic state; cull, topologia, profundidade,
+    stencil, depth bias e stride na chave do pipeline (`core_state`, `vk_draw.c`), só os estados
+    dinâmicos do núcleo 1.0 no draw, `vkCmdBindVertexBuffers` sem stride. Log: `estado dinâmico: só
+    núcleo 1.0`. Usuário: **as faixas na cabeça sumiram**. PC (Intel UHD, `RE5VK_CORE=1`): benchmark
+    52 s sem erro, 54,3 fps (limite 57). `test_vkn_bridge` abre o device no modo núcleo; `ctest` 41/42
+    na rodada (`x87` falhou uma vez e passou ao repetir).
+  - DXVK 2.6.2 no A54, também deste dia: caía em `vkUpdateDescriptorSets` (buffers não ligados com
+    `VK_NULL_HANDLE` sem `nullDescriptor`); corrigido com o buffer de reserva (patch 14). Depois disso
+    roda, mas com **texto quebrado, tela preta** e uma queda em `IDirect3DDevice9::Present` (SIGSEGV no
+    host, processo em 2,5 GB). Não investigado.
+- **Otimizações da varredura de 20/11 (`docs/RELATORIO_GPU_CPU_ENGASGOS_2026-11-20.md`), feitas no mesmo
+  dia; não testadas em celular:**
+  - **Emulação de float e guarda de NaN desligadas por padrão** (`vk_dxso.c`; `RE5VK_FLOATEMU=1` e
+    `RE5VK_NANGUARD=1` religam), como na DXVK 1.9.2b. A trava de `rcp`/`rsq`/`log` em ±FLT_MAX continua.
+    ALU dos 164 shaders: 82,5 mil → 29 mil. Teste novo (`vk_dxso_floatemu`: `mul` sem `OpSelect` por padrão).
+  - **Upload de textura:** recodificação DXT → ETC2 (hash, cache em disco, codificador) fora do lock do
+    device (`etc2_encode` em `tex_unlock`); o caminho de command buffer separado passa a valer (testava
+    `rt_views`, que existe em toda imagem; agora `vk_image.attach`). PC: 7.250 uploads pelo cb separado e
+    1.252 pelo principal num benchmark (antes, 0 e todos).
+  - **Espera com giro** (`kernel32_sync.c`, `wait_objects`): até `RE5_WAIT_SPIN` voltas sem o lock antes
+    de dormir (padrão 4000 no Android, 0 no PC).
+  - **Afinidade** (`perf_hint.c`, `thread.c`): toda thread criada pelo runtime volta à máscara completa
+    (`re5_perf_thread_start`; `RE5_WORKER_BIG=1` mantém a herança); a de render só é presa com 3+ núcleos
+    grandes (`re5_perf_pin_render`, testado em `test_perf_hint`; `RE5_PIN_RENDER=0/1`).
+  - **Modo Vulkan 1.1:** operador de profundidade fora da chave quando o teste está desligado.
+  - **Cache de pipelines** gravado numa thread (era síncrono no `Present`); no `Release`, síncrono.
+  - **Swapchain do Android no tamanho do back buffer** (`ANativeWindow_setBuffersGeometry`; o compositor
+    escala), recriada no `Reset` que muda o tamanho; `RE5VK_SWAP_FULL=1` volta à tela inteira.
+  - **DXVK padrão no Android: 1.9.2b** (`libdxvk_d3d9_192b.so`); `RE5_DXVK=2.6.2` escolhe a portada.
+  - Evidência: `ctest` 43/43; benchmark no PC (Intel UHD, `RE5VK_CORE=1 RE5_WAIT_SPIN=4000`) 60 s sem erro,
+    54,7 fps (limite 57), GPU por quadro 2,03 → 1,64 ms contra a rodada com a emulação. APK gerado.
+
 ### Runtime (Fase 3) feito nesta sessão
 
 - `kernel32`: heap (classes de tamanho + arenas de 32 MiB + blocos grandes em região
@@ -654,4 +965,80 @@ catálogo fechadas no caminho: `0x00E69D1C` (benchmark variável) e `0x00C212D0`
 | 2026-10-21 | `re5dx9.clean.exe` (+ entrada, rede, áudio/vídeo recusados, console, BSTR) | 270 | 241 (89,3%) |
 | 2026-10-21 | `re5dx9.clean.exe` (+ sockets e gravação de AVI) | 270 | **270 (100%)** |
 
-Faltando (270/270): nenhum. `re5 --census --missing` em 2026-10-21: `imports: 270 ligados, 270 implementados (100.0%), 0 faltando`.
+Faltando (270/270): nenhum. `re5 --census --missing` em 2026-10-21: `imports: 270 ligados, 270 implementados (100.0%), 0 faltando`.- **Serialização CPU↔GPU no Present (2026-11-22, NÃO TESTADO no aparelho).** O A54 apresentava em
+  MAILBOX com 5 imagens e o `vkQueuePresentKHR` prendia a thread de render até a GPU acabar o quadro
+  (quadro = CPU + GPU). Mudanças, todas com chave para voltar:
+  - re5vk: present numa thread própria (`RE5VK_PRESENT_THREAD`, padrão 1 no Android; `=0` volta),
+    um present pendente no máximo, fila Vulkan sob `qmu`; `thread_present_ms` no `RE5_FPS_LOG`.
+  - re5vk no Android: FIFO com 3 imagens mesmo com o jogo pedindo "sem vsync" (`RE5VK_PRESENT=mailbox` volta).
+  - `ANativeWindow_setFrameRate(60, FIXED_SOURCE)` para DXVK e re5vk (`RE5_FRAME_RATE=0` desliga, `=<n>` muda).
+  - log da swapchain mostra também a transformação da tela (`da tela 0x..`), para decidir pré-rotação.
+  - diagnóstico `RE5VK_SKIP_SMALL_PASSES=1` (imagem errada): não desenha alvos ≤ 1/16 do back buffer.
+  - Não mudados, por já estarem certos no código: `RE5_QUERY_LAG` (a condição `>= lag` é a
+    intencional; `lag 1` daria corrida com `Lock(NOOVERWRITE)`), máscara de núcleos grandes (já pega
+    todos acima do menor cluster), ADPF (com quadro > 16,6 ms o relato pede mais clock, não menos).
+  - DXVK 1.9.2b: `DXVK_RE5_PRESENT_QUEUE=1` + `DXVK_RE5_PRESENT_DEPTH=3` **juntos** nunca foram testados.
+- **App Android: segundo plano, extração, tela cheia e caches (2026-11-22, A54).**
+  - **Segundo plano FEITO** (A54, `work/android/a54_bg_*_20261122`): o jogo ia para o segundo plano e
+    caía na volta, porque DXVK e re5vk guardavam o `ANativeWindow` da criação do device e o Android
+    entrega outro. Agora o `SDLSurface` fecha um portão antes de a superfície morrer
+    (`SDLActivity.nativeSurfaceGate`, `d3d9_host.c`): o Present espera, a saída de som pausa e o
+    relógio do jogo (QPC/GetTickCount/timeGetTime, `re5_k32_clock_pause`) para. Na volta o re5vk
+    recria superfície e swapchain (`re5_vkn_surface_recreate`) e a WSI da DXVK 1.9.2b pede a janela
+    atual (`re5_dxvk_set_window_fn`). Medido: duas idas e voltas, mesmo processo, com vkmali e DXVK.
+    A DXVK 2.6.2 não recebeu a WSI nova (não recompilada).
+  - Extração: serviço em primeiro plano (`ExtractService`) e retomável (lista o .rar com `unrar lt`,
+    apaga o que ficou pela metade, extrai com `-o-`). O `game.rar` com pasta `game/` é extraído direto
+    no lugar; antes ia para `game/game/` e uma 2ª tentativa deixava uma cópia inteira (>16 GB), que
+    agora é apagada. **Não testado no aparelho.**
+  - Tela cheia imersiva no jogo (`SDLActivity.sForceImmersive`): barra de navegação oculta (medido).
+  - Caches em `getCacheDir()` (`texcache`, `re5vk.pcache`, `dxvk`); os antigos de `files/` são apagados.
+  - Configurações: "quadros em voo" sobe o `RE5_QUERY_LAG` junto (antes 3 virava 2 sem aviso);
+    textos do modo paralelo e das threads de trabalho dizem o que fazem e o risco no ARM.
+- **Carregamento no re5vk/Mali: recodificação ETC2 em paralelo (2026-11-22) — FEITO.** Medido no A54,
+  qualidade toda HIGH, cache de texturas apagado antes de cada rodada (`work/android/a54_loadab_20261122`):
+  do 1º Present ao fim do roteiro do benchmark 111 s com 6 auxiliares contra 174 s com
+  `RE5VK_ETC2_THREADS=0`; do "Start" na tela de título até o menu responder, 39 s contra 100 s.
+  O Mali não tem BC; o re5vk recodifica cada textura DXT para ETC2/EAC na CPU, numa thread só (a
+  que dá o Unlock), com o resto da CPU ocioso; com texturas em qualidade alta são 4x os blocos e o
+  carregamento fica muito mais lento (relato do usuário). `vk_etc2_pool.c` divide as linhas de
+  blocos entre threads do host (`RE5VK_ETC2_THREADS`, padrão núcleos − 2, até 6; 0 = como antes);
+  saída byte a byte igual (`tests/unit/test_etc2_pool.c`). Com o cache de texturas cheio (segunda
+  abertura) a recodificação nem aparece no perfil: o ganho é na primeira abertura e depois de
+  limpar o cache. Perfil do A54 (`work/android/a54_load_20261122`): com `RE5_FPS_LOG=1`, 24% da
+  thread de render vai em `clock_gettime` da própria medição.
+- **Clock da GPU no A54: GOS e ADPF novo descartados (2026-11-22, `work/android/gos_20261122`).** Benchmark,
+  40 s cada, mesmas configurações: APK normal com a sessão ADPF nova (API 36: pipeline gráfico + janela,
+  `setPreferPowerEfficiency(false)`, `notifyWorkloadIncrease` aceito) 17,5 fps, GPU 67% a 246 MHz; sem o
+  ADPF novo (`RE5_PERF_GFX=0 RE5_PERF_BOOST=0`) 17,8 fps, 72% a 231 MHz; APK sem `appCategory`/`isGame`/
+  `game_mode_config` 17,8 fps, 68% a 262 MHz. Nenhum muda o clock: não é trava do GOS por pacote de jogo
+  nem falta de pedido ao PowerHAL. O ADPF novo fica (chaves para desligar). Já existia: buffers em
+  memória host-visible coerente com troca no DISCARD (o "ring UMA" proposto não tira cópia nenhuma).
+- **O compilador explica quase toda a queda de fps no A54 (2026-11-23).** O APK "antigo bom" que o usuário
+  tinha (`apk7030/base.apk`) foi compilado com **clang 18.0.3 (NDK r27.2, o do Unity 6000.3.27f1)**, não com o
+  NDK 30 (clang 21) que as builds recentes usam; também não era o commit `df54862a` (07/11), e sim o ramo
+  `android` de ~10/11 (`49d13bf0`) com os arquivos de 07/11 que os commits de 10/11 perderam (6 sobrescritas do
+  CRT em `config/overrides.txt`/`overrides.c`, `host_sync.h`, `thread.c`, `kernel32*.c`) e FFmpeg também em
+  clang 18. Reproduzido com o NDK r27 (`libre5.so` 0,014% maior; todo o resto do APK idêntico byte a byte).
+  Medido no A54 pelo usuário, DXVK: antigo reproduzido (clang 18) **33 fps**; código de 07/11 em clang 21 **24**;
+  código atual em clang 21 **19**; **código atual em clang 18 30 fps**. Ou seja: NDK 30 custa ~10 fps, o código
+  atual custa ~3. Padrão daqui em diante: compilar o Android com o NDK r27 (`ANDROID_NDK=<Unity>/NDK`) e o FFmpeg
+  com o mesmo (`ANDROID_NDK_HOME`). O que ainda não separa os ~3 fps (30 vs 33): DXVK `192b` vs a antiga, Java.
+  `-mtune=cortex-a78` não foi medido (APK `app-atual-a78.apk` existe, em clang 21).
+  - **Correção de leitura (23/11, usuário):** os fps citados acima (33, 30, 24, 19) são o **pico no meio do
+    benchmark, na mesma parte do teste**, não a média; e o vídeo do APK antigo de 17 dias atrás tem pico
+    **32** (não 35). Na mesma parte, a build atual em clang 18 chegou a **29,1**. A diferença que resta é
+    ~3 fps (29,1 vs 32); o D (código atual + Java antigo) chegou a 33 jogando. No benchmark automático
+    (média de 90 s depois do roteiro, 1 rodada): C2 21,0 (p90 26,4), D 22,9 (p90 28,9); os picos de
+    regime (30,6 e 30,6) são iguais, os "máximos" de 56-96 fps são telas de carregamento.
+  - **Java do app custa fps (23/11, A54, 360p, mesma parte do benchmark, pico):** código atual com Java completo
+    29,1; vídeo do APK antigo 32; atual com Java antigo (D) 33; **atual sem Java algum (`RE5_LEAN=1`, DXVK de
+    referência) 35 (média 24,8)**. O Java atual custa ~6 fps de pico, o antigo ~4. `RE5_LEAN=1` no `re5_env.txt`
+    pula controles na tela, monitor, tela de carregamento, leitor de log, vigia de controles e locks de Wi-Fi.
+    Chaves separadas, para achar a peça que pesa: `RE5_NO_TOUCH=1`, `RE5_NO_HUD=1`, `RE5_NO_OVERLAY=1`,
+    `RE5_NO_MISC=1`. DXVK padrão no Android passou a ser a de referência (`libdxvk_d3d9_ref.so`); a 192b é
+    `RE5_DXVK=192b` (só ela tem o conserto da janela ao voltar do segundo plano).
+- **DXVK padrão no Android volta a ser a 1.9.2b `192b` (2026-11-23).** Medida no A54, 360p, modo lean: `192b` e `ref` (a do APK
+  de 07/11) empatam (pico 31, média ~25), então fica a que tem o conserto da janela ao voltar do segundo plano; `RE5_DXVK=ref`
+  escolhe a antiga. APK `work/android/app-lean3.apk` (NDK r27, clang 18.0.3; não instalado). Ferramentas de medição salvas em
+  `scripts/android_bench/`; prompts das próximas frentes em `docs/prompts/`.
