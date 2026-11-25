@@ -118,6 +118,15 @@ add_library(re5_runtime STATIC
     src/core/vfs.c
     src/gfx/d3d9_host.c
     src/gfx/vk_loader.c
+    src/gfx/vk2/vk2_ctx.c
+    src/gfx/vk2/vk2_dev.c
+    src/gfx/vk2/vk2_draw.c
+    src/gfx/vk2/vk2_dxso.c
+    src/gfx/vk2/vk2_etc2_pool.c
+    src/gfx/vk2/vk2_layout.c
+    src/gfx/vk2/vk2_res.c
+    src/gfx/vk2/vk2_tbdr.c
+    src/gfx/vk2/vk2_warm.c
     src/win32/advapi32.c
     src/win32/avifil32.c
     src/win32/coldebug.c
@@ -158,6 +167,10 @@ if(NOT WIN32)
     target_link_libraries(re5_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(re5_runtime PRIVATE re5_d3d9_headers)
+# vk2 (RE5_GFX=vk2): só os headers do Vulkan (com Win32 e Android); o libvulkan é aberto em tempo de execução.
+set_source_files_properties(
+    src/gfx/vk2/vk2_ctx.c src/gfx/vk2/vk2_dev.c src/gfx/vk2/vk2_draw.c src/gfx/vk2/vk2_res.c src/gfx/vk2/vk2_layout.c src/gfx/vk2/vk2_warm.c
+    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")
 if(WIN32)
     target_link_libraries(re5_runtime PUBLIC ws2_32 winmm)   # sockets do Winsock; timeBeginPeriod do host
 endif()

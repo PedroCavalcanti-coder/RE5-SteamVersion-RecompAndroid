@@ -81,9 +81,9 @@ static void load_env_file(const char *path)
         val[strcspn(val, "\r\n")] = 0;
         /* só as chaves do projeto (RE5VK_* é o backend Vulkan nativo: antes ficava de fora, e as
          * chaves de diagnóstico dele no re5_env.txt eram ignoradas sem aviso) */
-        if (strncmp(key, "RE5_", 4) && strncmp(key, "RE5VK_", 6) &&
+        if (strncmp(key, "RE5_", 4) && strncmp(key, "RE5VK_", 6) && strncmp(key, "RE5VK2_", 7) &&
             strncmp(key, "DXVK_", 5)) {
-            fprintf(stderr, "[host] %s: chave ignorada (fora de RE5_/RE5VK_/DXVK_): %s\n", path, key);
+            fprintf(stderr, "[host] %s: chave ignorada (fora de RE5_/RE5VK_/RE5VK2_/DXVK_): %s\n", path, key);
             continue;
         }
         if (getenv(key)) continue;

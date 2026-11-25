@@ -136,3 +136,35 @@ set_tests_properties(difftest_override PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
 add_test(NAME python_pipeline
          COMMAND Python3::Interpreter -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/python" -v)
 set_tests_properties(python_pipeline PROPERTIES ENVIRONMENT "RE5_TEST_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}")
+
+# vk2 (RE5_GFX=vk2): módulos recuperados da tag base-lean-2026-11-23 e os novos (runtime/src/gfx/vk2).
+set(RE5_VK2_DIR "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk2")
+set(RE5_VK_INC "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")
+# Oráculo TBDR (STORE_OP_DONT_CARE, sticky_live, invalidação).
+add_executable(test_vk2_tbdr unit/test_vk2_tbdr.c "${RE5_VK2_DIR}/vk2_tbdr.c")
+add_test(NAME vk2_tbdr COMMAND test_vk2_tbdr)
+# Layout por sub-recurso: imagem amostrada e presa como anexo.
+add_executable(test_vk2_layout unit/test_vk2_layout.c "${RE5_VK2_DIR}/vk2_layout.c")
+target_include_directories(test_vk2_layout PRIVATE "${RE5_VK_INC}")
+add_test(NAME vk2_layout COMMAND test_vk2_layout)
+# Tradutor SM3 -> SPIR-V. Com o spirv-val em RE5_SPIRV_VAL, cada SPIR-V passa pelo validador da Khronos.
+add_executable(test_vk2_dxso unit/test_vk2_dxso.c "${RE5_VK2_DIR}/vk2_dxso.c")
+add_test(NAME vk2_dxso COMMAND test_vk2_dxso)
+add_test(NAME vk2_dxso_nanguard COMMAND test_vk2_dxso)
+set_tests_properties(vk2_dxso_nanguard PROPERTIES ENVIRONMENT "RE5VK2_NANGUARD=1")
+add_test(NAME vk2_dxso_floatemu COMMAND test_vk2_dxso)
+set_tests_properties(vk2_dxso_floatemu PROPERTIES ENVIRONMENT "RE5VK2_FLOATEMU=1")
+# Recodificação DXT -> ETC2: em paralelo igual byte a byte à de uma thread.
+add_executable(test_vk2_etc2_pool unit/test_vk2_etc2_pool.c)
+target_link_libraries(test_vk2_etc2_pool PRIVATE re5_runtime)
+add_test(NAME vk2_etc2_pool COMMAND test_vk2_etc2_pool)
+set_tests_properties(vk2_etc2_pool PROPERTIES ENVIRONMENT "RE5VK2_ETC2_THREADS=3")
+add_executable(test_dxt_to_etc2 unit/test_dxt_to_etc2.c)
+add_test(NAME dxt_to_etc2 COMMAND test_dxt_to_etc2)
+set_tests_properties(dxt_to_etc2 PROPERTIES ENVIRONMENT "RE5VK2_TEX_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/texcache")
+# Sub-alocador de memória do vk2_ctx.c (lista livre, sem Vulkan).
+add_executable(test_vk2_freelist unit/test_vk2_freelist.c)
+add_test(NAME vk2_freelist COMMAND test_vk2_freelist)
+# Hash de texturas do cache ETC2 (por palavras, 4 acumuladores).
+add_executable(test_vk2_hash unit/test_vk2_hash.c)
+add_test(NAME vk2_hash COMMAND test_vk2_hash)

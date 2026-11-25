@@ -21,13 +21,14 @@
 
 #include <stdint.h>
 
-/* Família do backend: DXVK (padrão) ou um tradutor D3D9->GL externo. */
+/* Família do backend: DXVK (padrão), um tradutor D3D9->GL externo ou o Vulkan 1.1 nativo (vk2). */
 typedef enum {
     RE5_GFX_DXVK = 0,
-    RE5_GFX_GL   = 1
+    RE5_GFX_GL   = 1,
+    RE5_GFX_VK2  = 2
 } re5_gfx_backend;
 
-/* Interpreta RE5_GFX ("", "dxvk", "gl"). 0 = valido, -1 = desconhecido (inclusive os removidos
+/* Interpreta RE5_GFX ("", "dxvk", "gl", "vk2"). 0 = valido, -1 = desconhecido (inclusive os removidos
  * vkmali, vkadreno e re5vk). */
 int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out);
 re5_gfx_backend re5_gfx_mode(void);

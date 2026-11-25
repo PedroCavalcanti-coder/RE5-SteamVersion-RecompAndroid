@@ -156,6 +156,8 @@ public class GameActivity extends SDLActivity {
         } else {
             setenvPref(prefs, "gfx_fps_cap", "RE5_FPS_CAP");
         }
+        setenvPref(prefs, "gfx_renderer", "RE5_GFX");               // "" = DXVK (padrão); "vk2" = Vulkan 1.1 nativo
+        setenvPref(prefs, "gfx_precompile", "RE5VK2_PRECOMPILE");   // "" = segundo plano; "wait" = antes de entrar; "0" = desligada
         applyCacheDirs();
         applyVulkanDriverEnv(prefs);
         java.util.Set<String> flags = envFlags();
@@ -222,6 +224,12 @@ public class GameActivity extends SDLActivity {
         try {
             nativeSetenv("DXVK_STATE_CACHE_PATH", dxvk.getAbsolutePath());
             nativeSetenv("MESA_SHADER_CACHE_DIR", new File(cache, "mesa").getAbsolutePath());   // drivers Turnip
+            // vk2: VkPipelineCache, manifesto de shaders (pré-compilação) e cache de texturas ETC2
+            File vk2 = new File(cache, "vk2");
+            //noinspection ResultOfMethodCallIgnored
+            new File(vk2, "tex").mkdirs();
+            nativeSetenv("RE5VK2_CACHE_DIR", vk2.getAbsolutePath());
+            nativeSetenv("RE5VK2_TEX_CACHE_DIR", new File(vk2, "tex").getAbsolutePath());
         } catch (Throwable t) {
             Log.w(TAG, "caches: " + t);
         }

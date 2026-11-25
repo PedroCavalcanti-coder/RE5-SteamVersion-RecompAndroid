@@ -24,6 +24,7 @@
 #include "re5/runtime.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/vk_loader.h"
+#include "re5/vk2.h"
 #include "re5/user32.h"
 
 #if defined(RE5_HOST_WINDOWS)
@@ -244,7 +245,8 @@ static void load(void)
 #endif
 }
 
-/* RE5_GFX: "" ou "dxvk" = DXVK (padrão); "gl" = tradutor D3D9->GL externo (RE5_D3D9_LIB / RE5_D3D9_DLL).
+/* RE5_GFX: "" ou "dxvk" = DXVK (padrão); "vk2" = Vulkan 1.1 nativo (runtime/src/gfx/vk2, o device é nosso e a DXVK
+ * só responde as consultas do adaptador); "gl" = tradutor D3D9->GL externo (RE5_D3D9_LIB / RE5_D3D9_DLL).
  * Os backends Vulkan nativos (vkmali, vkadreno, re5vk) saíram em 23/11/2026: o código está na tag
  * base-lean-2026-11-23. Valor desconhecido aborta (D8: falhar alto). */
 int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out)
@@ -257,6 +259,10 @@ int re5_parse_gfx_mode(const char *env, re5_gfx_backend *out)
         if (out) *out = RE5_GFX_GL;
         return 0;
     }
+    if (strcmp(env, "vk2") == 0) {
+        if (out) *out = RE5_GFX_VK2;
+        return 0;
+    }
     return -1;
 }
 
@@ -267,7 +273,7 @@ re5_gfx_backend re5_gfx_mode(void)
         const char *e = getenv("RE5_GFX");
         re5_gfx_backend m;
         if (re5_parse_gfx_mode(e, &m) != 0)
-            re5_fatal("d3d9", "RE5_GFX=%s: use dxvk ou gl (vkmali, vkadreno e re5vk foram removidos)", e);
+            re5_fatal("d3d9", "RE5_GFX=%s: use dxvk, vk2 ou gl (vkmali, vkadreno e re5vk foram removidos)", e);
         mode = (int)m;
     }
     return (re5_gfx_backend)mode;
@@ -276,7 +282,9 @@ re5_gfx_backend re5_gfx_mode(void)
 static void *host_create9(uint32_t sdk)
 {
     load();
-    return g_create9(sdk);
+    void *d3d = g_create9(sdk);
+    if (re5_gfx_mode() == RE5_GFX_VK2) return vk2_wrap_d3d9(d3d);
+    return d3d;
 }
 
 /* ---- janela do Android em segundo plano ----

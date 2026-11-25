@@ -149,6 +149,12 @@ public final class SettingsActivity extends Activity {
                 resVals, resVals, "DISPLAY", "Resolution", res);
         choicePref(L.t("Limite de FPS"), L.t("Segura o jogo num ritmo fixo: menos calor e bateria, quadro mais estável."),
                 new String[]{L.t("Sem limite"), L.t("30 FPS"), L.t("45 FPS"), L.t("60 FPS")}, new String[]{"", "30", "45", "60"}, "gfx_fps_cap");
+        choicePref(L.t("Renderizador"), L.t("DXVK é o padrão e o mais testado. Vulkan 1.1 nativo (vk2) é experimental: pode ficar mais leve ou mais pesado, só medindo."),
+                new String[]{L.t("DXVK (padrão)"), L.t("Vulkan 1.1 nativo (vk2, experimental)")}, new String[]{"", "vk2"}, "gfx_renderer");
+        choicePref(L.t("Compilar shaders (vk2)"), L.t("O vk2 grava os shaders que o jogo usa e, nas próximas vezes, os compila nas threads auxiliares durante o carregamento (menos engasgo). 'Antes de entrar' espera acabar no primeiro quadro. A primeira execução só aprende."),
+                new String[]{L.t("Em segundo plano"), L.t("Antes de entrar no jogo"), L.t("Desligado")}, new String[]{"", "wait", "0"}, "gfx_precompile");
+        action(L.t("Apagar caches de shaders e texturas"), L.t("Apaga o cache de shaders/pipelines (DXVK e vk2), a lista de pré-compilação e o cache de texturas ETC2. Não toca no jogo nem nos saves. O próximo arranque recompila e demora mais."),
+                this::confirmClearCaches);
         disabledRow(L.t("OpenGL ES 3.x (RE5_GFX=gl)"),
                 L.t("Sem tradutor Direct3D 9 para GLES integrado. Para testar, informe RE5_D3D9_LIB em Avançado → re5_env.txt."));
         if (isAdreno()) {
@@ -270,6 +276,31 @@ public final class SettingsActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ linhas
+
+    private void confirmClearCaches() {
+        new AlertDialog.Builder(this)
+                .setTitle(L.t("Apagar caches?"))
+                .setMessage(L.t("Shaders, pipelines e texturas convertidas serão refeitos no próximo arranque (a primeira partida fica mais lenta). O jogo e os saves não são tocados."))
+                .setNegativeButton(L.t("Cancelar"), null)
+                .setPositiveButton(L.t("Apagar"), (d, w) -> {
+                    long freed = 0;
+                    for (String n : new String[]{"vk2", "dxvk", "mesa"}) {
+                        File f = new File(getCacheDir(), n);
+                        freed += treeSize(f);
+                        if (f.exists()) GameStorage.deleteTree(f);
+                    }
+                    Toast.makeText(this, L.t("Caches apagados: ") + (freed >> 20) + " MB", Toast.LENGTH_LONG).show();
+                }).show();
+    }
+
+    private static long treeSize(File f) {
+        if (f == null || !f.exists()) return 0;
+        if (f.isFile()) return f.length();
+        long t = 0;
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) t += treeSize(k);
+        return t;
+    }
 
     private void section(String title) {
         TextView t = text(title.toUpperCase(Locale.ROOT), 12, RED, true);

@@ -293,20 +293,6 @@ struct vk_device {
     VkImageView present_view;   /* o que o present_set aponta */
     VkImageLayout present_img_layout;
     VkPipeline present_pipe;
-    /* rampa de gama do jogo (SetGammaRamp), aplicada no Present por um passe com a tabela de 256 entradas */
-    int gamma_on, gamma_dirty;
-    uint16_t ramp[256][3];
-    VkImage lut_img;
-    vk2_alloc lut_mem;
-    VkImageView lut_view;
-    VkImageLayout lut_layout;
-    VkSampler lut_sampler;
-    VkDescriptorSetLayout gamma_dsl;
-    VkPipelineLayout gamma_layout;
-    VkDescriptorPool gamma_pool;
-    VkDescriptorSet gamma_set;
-    VkPipeline gamma_pipe;
-    VkImageView gamma_bb_view;
     VkSemaphore done[VK_MAX_IMAGES];
     VkSemaphore acquired[VK_SLOTS];
 

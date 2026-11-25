@@ -1052,6 +1052,103 @@ Faltando (270/270): nenhum. `re5 --census --missing` em 2026-10-21: `imports: 27
   é a intermitência de tempo que já existia: 15 de 15 execuções diretas passam, falha ~1 em 3 dentro do `ctest`); Android compila
   (`libre5.so` 76,9 MB) e empacota (`work/android/app-padrao.apk`); **não testado no aparelho**.
 
+- **Varredura de CPU no A54, `app-cpu-2` (2026-11-23, `work/sweep_cpu2_20261123`, `scripts/android_bench/sweep_total.py`).** Primeira cena do
+  benchmark, DXVK 192b, 360p, lean. Pico/média lidos no jogo pelo usuário: 31/25,9, 26/24,1, 31/24,7, 29,1/24,x (base: 35/26).
+  Achados medidos: (1) nenhuma thread satura: `re5-main` 32% de CPU, render (`g00457C60`) 15%, `mali-cmar-backend` 20%; no perfetto a
+  principal dorme 67% do tempo e a de render passa ~78% parada em `WaitForSingleObject` (0x00457C92, 20 sonos/s de 39 ms), esperando
+  a principal; a principal espera 29% em 0x0042755B (327 sonos/s de 0,9 ms) e os 8 workers `g004278D0` ficam 6-11% prontos sem
+  núcleo (8 workers + principal + render + dxvk-cs + driver em 4 núcleos grandes a ~1,7 GHz de 2,4). GPU: 58% de uso a 222 MHz.
+  (2) `memmove` da principal (29% dela) NÃO é o `memcpy` do CRT (histograma `RE5_MEMCPY_PROF`: ~1,4 s em toda a sessão): é a cópia
+  da sombra no `IDirect3DVertexBuffer9::Unlock` (73/s, 813 us, ~61 ms/s). (3) `@plt` 2,9% e `tlsdesc_resolver_dynamic` 1,4-4,5% por
+  thread; `re5_guest_unlock_as` 14,9% da thread de render. (4) `Sleep` ~950 chamadas/s de 3,1 ms (Sleep(n) = n ms + 1 ms de tique).
+  Sem ganho provado: `-Bsymbolic-functions` (`cpu-3`, 21,5 mil PLTs de `L_*` -> 0): pico 33, média 25,6, igual ao `cpu-2`.
+  Ferramentas novas: `RE5_API_PROF` (tempo exato por thunk), `RE5_MEMCPY_PROF`, ranking de `Sleep` e cópias de Unlock no `RE5_FPS_LOG`,
+  `sweep_total.py`, `ab_matrix.py` (A/B intercalado de chaves). Nada disto muda o fps por si; medir com `ab_matrix.py`.
+  A/B intercalado no A54 (`ab_matrix.py`, 2 rodadas, 60 s, `work/ab_cpu4b_20261124`, `work/ab_cpu6_20261124`): base 24,3; `RE5_SLEEP_TICK_US=0` 24,7 e
+  `RE5_WAIT_SPIN=0` 24,6 (dentro do ruído, espalhamento 0,4-0,6); `RE5_CPUS=4`/`6` 24,5/24,7 (1 rodada): **sem ganho**. Workers só nos núcleos pequenos
+  (`RE5_WORKER_LITTLE=1`, experimento já removido): 23,8 contra 25,4 e **a tela piscou nos vídeos** (relato do usuário; decodificação na CPU): descartado.
+  Unlock de buffers (`RE5_FPS_LOG`): VB 49/s, 4,9 MB médios (máx. 8 MB), 38 ms/s, na thread de render (que passa ~78% parada): fora do caminho crítico.
+  Linhas de cache próprias para `g_hle_held`/`g_hle_waiting`/`g_holder` (`cpu-6`): base 25,4 contra 24,3 do `cpu-4`, 1 rodada válida: indício, não prova.
+
+- **Backend Vulkan 1.1 nativo `vk2` (RE5_GFX=vk2), marco 1 (2026-11-24). PC FEITO; Android compila, NÃO testado no aparelho.**
+  Módulo novo em `runtime/src/gfx/vk2/`; a DXVK segue o padrão (o `vk2` só liga com `RE5_GFX=vk2`, e a DXVK continua respondendo as
+  consultas do adaptador, como no vkmali). **Novo, em C11 puro:** `vk2_ctx.c` (instância, escolha da GPU, device, swapchain, memória de
+  GPU em blocos com sub-alocador próprio `vk2_freelist.h`, cache de `VkRenderPass`/`VkFramebuffer`) no lugar do C++ com vk-bootstrap + VMA
+  (~3.300 linhas a menos de terceiros). Vulkan 1.1 puro: sem EDS, sem robustness2, sem dynamic rendering, sem importar memória do guest;
+  estado de rasterização/profundidade/stencil e stride na chave do pipeline; no máximo 1 conjunto de descritores. **Recuperado da tag
+  `base-lean-2026-11-23` (renomeado `vk2_*`, chaves `RE5VK2_*`):** tradutor SM3→SPIR-V (`vk2_dxso.c`), ETC2 em paralelo, cache de texturas,
+  layouts por sub-recurso, oráculo TBDR, recursos D3D9 (`vk2_res.c`), device/envio/Present (`vk2_dev.c`) e desenho (`vk2_draw.c`), estes
+  três já passados para o núcleo 1.0/1.1 (ramos de EDS apagados). **Ainda não reescrito do zero:** o núcleo de desenho (passes, descritores)
+  é o do vkmali enxugado; os princípios 1 (StretchRect sem fechar passe), 3 (pré-aquecimento de pipelines) e 4 (conjunto de descritores
+  persistente, UBO único) **não foram implementados**.
+  - Evidência (PC, RTX 4050, MinGW, `build/host-tests`): `ctest -R "vk2|etc2|d3d9"` 11/11 verde (parser `RE5_GFX=vk2` em `test_d3d9`,
+    DXSO ×3, layout, TBDR, ETC2, DXT→ETC2 e `vk2_freelist` novo). O jogo abre e renderiza o benchmark (capturas
+    `work/vk2run/vk2_3000.png`, `vk2_5000.png`: personagens, texto e HUD certos) a 71–96 fps; ~51 passes e 1,0 envio por quadro; 
+    `uploads_cb_sep` > 0 (os uploads de textura já saem do passe).
+  - **Memória (garantida pela conta, medir no aparelho):** anéis por envio de 8 slots × (8 MB UBO + 32 MB staging) = 320 MB passaram a
+    4 slots × (8 + 16) = 96 MB (`RE5VK2_UBO_MB`, `RE5VK2_STAGE_MB`); blocos de memória inteiramente livres voltam ao sistema (sobra um por
+    tipo). Linha nova no `RE5_FPS_LOG`: `vk2 por quadro: passes, envios, draws/passe, pipelines, memória de GPU`.
+  - **fps no A54: não medido.** A meta (superar 35/24,8 da DXVK, 360p) depende de teste no aparelho: `docs/PLANO_TESTE_VK2.md`.
+  - **Pré-compilação de shaders/pipelines e botão de apagar cache (2026-11-24). PC FEITO; Android compila, não testado no aparelho.**
+    `vk2_warm.c`: cada pipeline criado pelo jogo é gravado num manifesto (`vk2.shaders`: bytecode DXBC dos VS/PS, declaração de vértices e a
+    chave de estado, com cabeçalho GPU/driver/versão da chave). No arranque seguinte 1–4 threads criam os pipelines antes do jogo pedir
+    (`pipeline_create` passou a receber a declaração e a tabela de pipelines ganhou mutex; o shader é traduzido em objetos privados da
+    thread). `RE5VK2_PRECOMPILE=1` (padrão, segundo plano) | `wait` (o 1º Present espera acabar, prazo `RE5VK2_PRECOMPILE_TIMEOUT`=180 s) | `0`;
+    `RE5VK2_CACHE_CLEAR=1` apaga manifesto e `vk2.pcache`. **A primeira execução só aprende** (não há como saber os shaders sem o jogo
+    pedi-los). Medido no PC: rodada 1 gravou 131 pipelines (63 VS, 65 PS, 339 KB); rodada 2 criou os 131 em 4 threads antes do jogo e a
+    contagem de pipelines criados não subiu mais (131 estável nos logs seguintes).
+    App: Configurações > Gráficos ganhou "Renderizador" (DXVK/vk2), "Compilar shaders (vk2)" (segundo plano / antes de entrar / desligado) e o
+    botão "Apagar caches de shaders e texturas" (apaga `cache/vk2`, `dxvk`, `mesa` e diz quantos MB). O Java passa `RE5VK2_CACHE_DIR` e
+    `RE5VK2_TEX_CACHE_DIR` (pasta de cache do app: "Limpar cache" do Android também apaga).
+  - **Ligação VS→PS conferida.** O VS escreve e o PS lê pela mesma função `vk2_dxso_location(uso, índice)`; agora cada shader guarda a máscara de
+    locations (`vk2_shader.locs`) e o `pipeline_create` avisa (`ligação VS->PS: o PS ... lê locations ... que o VS ... não escreve`) se o PS lê
+    algo que o VS não escreve (valor indefinido). Nos 131 pipelines do benchmark no PC: nenhum aviso. Entradas do VS ligam por semântica da
+    declaração (`decl_elem_of`), UBOs e samplers pelos mesmos bindings (`RE5VK2_BIND_*`) em todo shader.
+  - **vk2 no A54: blit de apresentação em lote separado e passe sem dependência fragmento→vértice (2026-11-24). Medido pelo usuário: pico 45,5 / média 36.**
+    Antes (vk2-1, mesmas condições, `bench_android.py` 100 s): média 29,3, mediana 22,9, p10 15,7; DXVK do `app-padrao`: 33,8 / 23,6 / 15,8.
+    Achados nos logs do vk2-1: `gpu_ms` ≈ 1000 ms/s com 57% de uso no sysfs (o timestamp contava a espera), `thread_present_ms` ~900, `fence_ms` 250-320 nas
+    cenas leves. Causa: o envio único esperava o semáforo de aquisição da swapchain em `COLOR_ATTACHMENT_OUTPUT`, então o 1º passe de cena esperava o compositor (vsync).
+    Correção: o blit vai num 2º `VkSubmitInfo` do mesmo `vkQueueSubmit` (`RE5VK2_SPLIT_PRESENT`, padrão 1). Segunda mudança: a dependência de saída do `VkRenderPass`
+    deixou de ter `VERTEX_SHADER` como destino (bolha fragmento→vértice da Mali, guia da Arm; `RE5VK2_RP_VS_DEP=1` volta). As duas entraram juntas em `app-vk2-2.apk`:
+    **o ganho de cada uma isolada não foi medido.**
+  - `RE5VK2_SUBMIT_EVERY=<n>` (envio a cada n passes): **piorou** (n=8: mediana 16,4, p10 12,2; 7,3 envios/quadro) e a 1ª versão travou o driver (envio no meio do `prepare`). Fica desligado.
+  - PASS_TIMING (vk2-1, 360p): cena 640x360 450–580 ms/s com até 25 mil draws/s; sombra 1024x1024 85–130 ms/s com 1.300–4.300 draws/s; passes pequenos ~0,4–0,5 ms fixos.
+  - **Base de 35 fps ≠ árvore de trabalho:** `app-base35-vk2.apk` (commit `b98db313` limpo + só o vk2; worktree `work/base35`) deu **fps menor** que `app-vk2-2.apk`:
+    as edições de CPU sem commit (`thread.c`, `kernel32_sync.c`, `thunks.c`, `overrides.c`, `d3d9.c`) ajudam, e a DXVK da árvore atual (<33) é pior que a do `app-padrao`. Não medido com números.
+  - Rastro de passes (PC, `RE5VK2_PASS_TRACE`): ~65% dos fechamentos são `SetRT:rt0->outro`; o jogo alterna alvos A↔B↔A (A com 1 draw, B com 16-19) e 16% dos passes reabrem o mesmo alvo.
+    Passes de 0 draws são só ~3% em jogo. Próxima etapa estrutural: fila de passes com reordenação (estilo PPSSPP) para juntar as visitas ao mesmo alvo quando não há leitura cruzada.
+
+## Toque nativo dentro do jogo (2026-11-24) — PC: testes verdes; Android: APK gerado, **não testado no aparelho**
+
+- **Entrega ao jogo, decisão (evidência, não preferência).** Nesta sessão **não** foi feita engenharia reversa da estrutura de entrada do MT Framework
+  no Ghidra; `docs/AUDITORIA_GHIDRA.md` não registra nada sobre o gerenciador de entrada. O que está medido no código do runtime: o jogo só lê
+  teclado/mouse (`user32`/`dinput8`) e XInput (`xinput1_3.c`), e já funciona com o "controle de toque" somado ao usuário 0 (`re5_touch_merge`),
+  com os ícones do controle e sem "conectado/desconectado" falso. Escrever direto na estrutura do jogo exigiria localizá-la e mantê-la entre
+  builds, sem ganho de latência medido (a leitura do XInput é por chamada, sem fila). **Decisão: XInput como camada final** (permitido pelo
+  critério do prompt) + cursor/clique do mouse nos menus (`re5_touch_pointer` → `user32`), que o RE5 já usa nos menus (o toque direto já funcionava assim).
+  Se medirmos latência extra no aparelho, o próximo passo é achar o ponto de leitura no Ghidra.
+- **O que foi feito.** `runtime/src/win32/touch_ui.c` (lógica, geometria, arquivo de layout), `touch_ui_draw.c` (desenho no `Present` pelo `IDirect3DDevice9`,
+  para qualquer renderizador atrás da ponte; bloco de estado criado uma vez e só recapturado; vetor de vértices estático) e `re5/touch_ui.h`.
+  Os eventos `SDL_FINGER*` são tratados no `user32` (`re5_touch_ui_event`) e `SDL_HINT_TOUCH_MOUSE_EVENTS=0` evita o mouse falso. Portado da
+  `TouchControlsView`: multitoque por dedo, analógico flutuante, câmera por arrasto (sensibilidade, inverter Y), Correr/Mirar/Faca como interruptores,
+  tiro rápido, recarregar, inventário, menus por toque direto ou por botões (VOLTAR/OK), esconder com controle físico e voltar no 1º toque,
+  opacidade, escala, layout por controle. Vibração: 1 chamada JNI por toque a `GameActivity.vibrateTick()` (sem View).
+- **Chaves.** Android: ligado por padrão; `RE5_TOUCH_JAVA=1` volta à `TouchControlsView` (só na transição), `RE5_NO_TOUCH=1` desliga os dois.
+  PC: `RE5_TOUCH_NATIVE=1` (para testar com tela de toque). Configuração: o app grava `touch_layout.cfg` na pasta do jogo a cada abertura
+  (`TouchConfig.java`, a partir das prefs `re5_layout` e `re5_settings`); `RE5_TOUCH_CFG` aponta outro arquivo. O editor continua no app.
+- **Teste.** `tests/unit/test_touch_ui.c` (novo, no `ctest` como `touch_ui`): zonas e visibilidade, interruptores, tiro rápido e recarga com tempo,
+  multitoque (andar + mirar + atirar), zona morta, câmera e inverter Y, menus (clique, arrasto, navegação, VOLTAR), inventário e troca de contexto,
+  esconder com controle, arquivo de layout, geometria (limite de vértices). Resultado: `ok` (compilado com o mingw local no PC; o link do
+  executável precisou de um shim de `clock_gettime64`/`nanosleep64` porque o `build/ffmpeg` local é de outro toolchain; é do ambiente, não do código).
+  O `ctest` completo **não** foi rodado nesta sessão.
+- **Limite.** O desenho é no back buffer do jogo (360p no A54): borda macia, mas não nítido como a resolução da tela. Nitidez total = desenhar depois do upscale em cada renderizador.
+- **fps no A54: NÃO medido.** A meta (mesmo fps do lean, 35 de pico, com os controles visíveis) depende do usuário: `docs/PLANO_TESTE_TOQUE_NATIVO.md`.
+- **Teste no PC (2026-11-24, `RE5_TOUCH_NATIVE=1`, DXVK 3.1.1, `RE5_GFX=dxvk`).** O `re5.exe` completo compilou e abriu o jogo com o toque nativo. Captura do menu principal
+  (`RE5_D3D9_SHOT`): D-pad, TROCA, pausa e VOLTAR desenhados por cima do quadro, no mesmo `Present`. **Bug achado e corrigido:** o bloco de estado guardado entre quadros fazia o
+  `IDirect3DDevice9::Reset` (800x600 na abertura) falhar com `D3DERR_INVALIDCALL` e o jogo morria com `ERR09`; agora o `d_Reset` chama `re5_touch_ui_device_release` antes. No PC o mouse
+  vira um dedo (`SDL_HINT_MOUSE_TOUCH_EVENTS`). Com mouse em uso os botões somem (`hide_with_pad`); para ver, `hide_with_pad=0` num arquivo apontado por `RE5_TOUCH_CFG`.
+  **Não testado em partida** (controles de gameplay, câmera, multitoque): só o menu foi capturado.
+
 ## Teto de 120 fps do próprio jogo removido (2026-11-25)
 - **Causa:** o objeto de tempo do RE5 (ponteiro em 0x012340A4) guarda em `+0x3C` o teto de fps, gravado em
   0x00425F76 a partir da constante 120.0f (0x010BCDDC, compartilhada com outros usos). O laço de 0x00427039 espera
