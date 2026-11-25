@@ -1157,3 +1157,7 @@ Faltando (270/270): nenhum. `re5 --census --missing` em 2026-10-21: `imports: 27
   (só se ainda for 120.0f). `RE5_GAME_FPS_CAP=<fps>` escolhe o teto (120 = original). O `RE5_FPS_CAP` (limite do host/Android) é outro e não mudou.
 - **Evidência:** PC, `RE5_GFX=dxvk RE5_FPS_LOG=1`: o menu passou de 120 fps (teto) para 320-385 fps; `ctest -R "d3d9|perf"` 4/4.
   Não medido no aparelho Android (lá o `RE5_FPS_CAP=60` do launcher continua valendo).
+
+## Release vk2-1 (2026-11-25): IMMEDIATE no Android — pico 59,3 / média 35,6 (medido pelo usuário, 90 s, A54)
+- Teste A/B/C: A (réplica do `app-vk2-4`) 53,6/33; B (commit `2657eae6` + correção do `d3d9.c`) 54,6/32,7; **C (B + `VK_PRESENT_MODE_IMMEDIATE_KHR` com FIFO de reserva) 59,3/35,6**.
+- O `2657eae6` não compilava no Android (`game_fps_cap_lift` dentro de `query_lag`); corrigido. Detalhes e como refazer: `docs/RELEASE_VK2.md`.

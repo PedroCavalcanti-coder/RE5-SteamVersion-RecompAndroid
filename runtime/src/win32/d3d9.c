@@ -1027,10 +1027,6 @@ static uint64_t frame_cap(void)
  * lê): o lixo continuou igual e o fps do re5vk caiu muito, com uma thread a 99% (o jogo gira no
  * GetData até a GPU acabar o quadro; no re5vk cada volta pega o mutex e consulta as fences). Voltou. */
 
-static int query_lag(void)
-{
-    static int lag = -1;
-    if (lag < 0) {
 /* Limitador de quadro do PRÓPRIO jogo. O objeto de tempo (ponteiro global em 0x012340A4) guarda
  * em +0x3C o teto de fps como float, gravado uma vez em 0x00425F76 a partir da constante 120.0f
  * (0x010BCDDC, compartilhada com dezenas de outros usos: não dá para trocar a constante). O laço de
@@ -1061,6 +1057,10 @@ static void game_fps_cap_lift(void)
     RE5_INFO("d3d9", "teto de fps do jogo: %.0f -> %.0f (RE5_GAME_FPS_CAP=<fps>; 120 = original)", orig, want);
 }
 
+static int query_lag(void)
+{
+    static int lag = -1;
+    if (lag < 0) {
         const char *e = getenv("RE5_QUERY_LAG");
 #if defined(__ANDROID__)
         lag = e ? atoi(e) : 3;

@@ -918,14 +918,16 @@ static vk2_swap_req swap_req(const vk_device *d)
     const char *want = getenv("RE5VK2_PRESENT");
     if (want && !strcmp(want, "mailbox")) r.modes[0] = VK_PRESENT_MODE_MAILBOX_KHR;
     else if (want && !strcmp(want, "immediate")) r.modes[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
-#if defined(__ANDROID__)
-    /* Android: FIFO com 3 imagens mesmo com o jogo pedindo "sem vsync". O A54 ficava em MAILBOX com
-     * 5 imagens (o carregador do Android faz MAILBOX trocando o intervalo da BufferQueue), com o
-     * vkQueuePresentKHR preso até a GPU acabar o quadro. RE5VK2_PRESENT=mailbox volta ao anterior. */
-    else if (0) {
-#else
     else if (!(want && !strcmp(want, "fifo")) && d->pp.PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE) {
-#endif
+#if defined(__ANDROID__)
+        /* Android: IMMEDIATE se o driver expõe; senão FIFO (nunca MAILBOX: o carregador faz MAILBOX trocando o
+         * intervalo da BufferQueue e o vkQueuePresentKHR ficava preso até a GPU acabar o quadro, 5 imagens).
+         * RE5VK2_PRESENT=mailbox|fifo força. */
+        r.modes[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        r.modes[1] = VK_PRESENT_MODE_FIFO_KHR;
+    }
+    return r;
+#else
         /* PC: IMMEDIATE primeiro, MAILBOX de reserva. Em janela, no Windows, o MAILBOX passa pelo compositor (DWM) e o
          * vkAcquireNextImageKHR espera o ritmo do monitor: o benchmark ficava cravado em 120 fps (acquire ~300-600 ms/s,
          * GPU a 6-30%) e saltava para 130-190 ao dar alt-tab, quando o Windows troca o caminho da janela. Medido no PC
@@ -935,6 +937,7 @@ static vk2_swap_req swap_req(const vk_device *d)
         r.modes[1] = VK_PRESENT_MODE_MAILBOX_KHR;
     }
     return r;
+#endif
 }
 
 /* Swapchain feita pelo contexto (vk-bootstrap, transformação identidade como a DXVK). Sem
