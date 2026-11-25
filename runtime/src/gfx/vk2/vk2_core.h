@@ -1,0 +1,625 @@
+/*
+ * vk2_core.h - estado interno do backend re5vk (RE5_GFX=re5vk): device, envios, memória, recursos.
+ *
+ * Arquivos: re5vk.c (carregador, IDirect3D9, device, envios, memória, Present), vk_res.c
+ * (formatos, buffers, texturas, superfícies, declarações, shaders, consultas), vk_draw.c (estado,
+ * pipelines, descritores, passes, Draw/Clear/StretchRect), vk_dxso.c (SM3 -> SPIR-V).
+ *
+ * Modelo: VkRenderPass + extended dynamic state 1 e 2 (Vulkan 1.3 ou extensões). Instância,
+ * device, swapchain, memória e o cache de VkRenderPass/VkFramebuffer vêm dos renderizadores
+ * nativos pela ponte C (vk2_ctx.h: vk-bootstrap, VMA): nada de vkCreateInstance,
+ * vkCreateDevice, vkCreateSwapchainKHR, vkAllocateMemory nem vkBind*Memory aqui. Layouts por
+ * sub-recurso (vk2_layout.h); o passe não transiciona (layout inicial = final = o do anexo). Um mutex
+ * do device serializa os métodos (a ponte pode chamar de mais de uma thread do guest; o Present
+ * solta o lock do guest).
+ */
+#ifndef RE5VK2_CORE_H
+#define RE5VK2_CORE_H
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#define VK_USE_PLATFORM_WIN32_KHR
+#elif defined(__ANDROID__)
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
+#include <d3d9.h>
+
+#include "re5/log.h"
+#include "../../core/host_sync.h"
+#include "vk2_dxso.h"
+#include "vk2_tbdr.h"
+#include "vk2_layout.h"
+#include "vk2_ctx.h"
+
+#ifndef FOURCC
+#define FOURCC(a, b, c, d) ((D3DFORMAT)((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24))
+#endif
+
+/* ---- funções do Vulkan (carregadas em tempo de execução) ---- */
+
+/* Criação de instância, device, superfície e swapchain e alocação/ligação de memória NÃO estão
+ * nestas listas: são da ponte (vk2_ctx.h). */
+#define VK_INSTANCE_FNS(X)                                                                                         \
+    X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties)                                   \
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetDeviceProcAddr)                                            \
+    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFeatures)
+#define VK_DEVICE_FNS(X)                                                                                           \
+    X(vkDeviceWaitIdle) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) X(vkQueueSubmit)                             \
+    X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer)             \
+    X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdClearColorImage)                  \
+    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkGetFenceStatus)                     \
+    X(vkCreateSemaphore) X(vkDestroySemaphore)                                                                     \
+    X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler)                              \
+    X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdCopyImage) X(vkCmdClearDepthStencilImage)                   \
+    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout)                                \
+    X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)                           \
+    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreatePipelineCache) X(vkDestroyPipelineCache)           \
+    X(vkGetPipelineCacheData) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool)        \
+    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdExecuteCommands)              \
+    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer)             \
+    X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdClearAttachments)               \
+    X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference)                          \
+    X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants)                                                                 \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp)                       \
+    X(vkGetQueryPoolResults) X(vkCmdBeginQuery) X(vkCmdEndQuery)
+
+#define VK_DECL_EXTERN(name) extern PFN_##name name;
+extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
+VK_INSTANCE_FNS(VK_DECL_EXTERN)
+VK_DEVICE_FNS(VK_DECL_EXTERN)
+
+const char *vk2_result(VkResult r);
+#define VK_CHECK(call)                                                                                             \
+    do {                                                                                                           \
+        VkResult vr_ = (call);                                                                                     \
+        if (vr_ < 0) re5_fatal("vk2", "%s -> %s (%d)", #call, vk2_result(vr_), (int)vr_);                     \
+    } while (0)
+
+/* ---- memória (VMA pela ponte) ---- */
+
+#define RE5VK2_PW_MAX 16
+#define RE5VK2_PT_CAP 256       /* passes medidos por envio (RE5VK2_PASS_TIMING) */
+#define RE5VK2_PT_BUCKETS 24
+typedef struct { uint32_t w, h, n, draws; uint64_t ns; } vk2_pt_bucket;
+
+typedef struct {
+    vk2_alloc v;           /* alocação do VMA ou subdivisão de um bloco do guest */
+    uint8_t *map;              /* NULL se não for host-visible */
+    void *own_block;           /* bloco do guest só deste buffer (grande): sai junto */
+    uint32_t guest_va;         /* endereço do own_block no guest */
+} vk_alloc;
+
+
+/* ---- envios (um command buffer por envio; anel de VK_SLOTS) ---- */
+
+/* 4 envios no anel bastam: quadros em voo = LATENCY (2 no Android) + o que grava + o que apresenta. Eram 8
+ * slots com 8 MB de UBO e 32 MB de staging cada (320 MB de memória visível pela CPU, que no celular é a
+ * RAM do sistema); agora 4 x (8 + 16) = 96 MB. RE5VK2_UBO_MB e RE5VK2_STAGE_MB mudam os tamanhos. */
+#define VK_SLOTS 4
+#define VK_UBO_RING_DEFAULT_MB 8u
+#define VK_STAGE_RING_DEFAULT_MB 16u
+
+typedef struct {
+    int kind;   /* 1 buffer, 2 imagem, 3 view, 4 alocação */
+    union { VkBuffer buffer; VkImage image; VkImageView view; } h;
+    vk_alloc mem;
+} vk_garbage;
+
+typedef struct {
+    VkCommandBuffer cmd;
+    VkCommandBuffer ucmd;      /* uploads de texturas novas: roda antes de cmd, sem fechar o passe da cena */
+    int ucmd_open;
+    VkCommandBuffer *scb;      /* RE5VK2_PASS_QUEUE: command buffers secundários dos passes (reaproveitados a cada envio) */
+    uint32_t nscb, capscb, scb_used;
+    VkCommandBuffer pcmd;      /* blit de apresentação: 2º lote do envio, o único que espera a imagem da swapchain */
+    int pcmd_open;
+    VkFence fence;
+    uint64_t serial;           /* 0: livre */
+    VkDescriptorPool pools[8];
+    int npools, pool_cur;
+    VkBuffer ubo;
+    vk_alloc ubo_mem;
+    VkDeviceSize ubo_used;
+    VkBuffer stage;
+    vk_alloc stage_mem;
+    VkDeviceSize stage_used, stage_size;
+    vk_garbage *garbage;
+    int ngarbage, capgarbage;
+} vk_slot;
+
+/* ---- objetos COM do host ---- */
+
+typedef struct vk_device vk_device;
+
+enum { VKO_SURFACE = 1, VKO_TEXTURE, VKO_CUBE, VKO_VOLUME, VKO_VB, VKO_IB, VKO_DECL, VKO_VS, VKO_PS, VKO_QUERY };
+
+typedef struct {
+    const void *lpVtbl;
+    long refs;
+    vk_device *dev;
+    int kind;
+} vk_obj;
+
+typedef struct {
+    D3DFORMAT d3d;
+    VkFormat vk;
+    VkComponentMapping swz;
+    uint8_t bw, bh, bytes;       /* bloco em pixels e bytes por bloco */
+    uint8_t depth, stencil;      /* formato de profundidade (e stencil) */
+} vk_format;
+
+typedef struct vk_image vk_image;
+struct vk_image {             /* imagem de textura, alvo de render, profundidade ou back buffer */
+    VkImage image;
+    vk_alloc mem;
+    VkImageView view;          /* para amostrar (todos os níveis e faces) */
+    VkImageView *rt_views;     /* por (camada, nível): para render target / anexo */
+    uint8_t attach;            /* criada como alvo de render ou profundidade (não usa o cb de upload) */
+    const vk_format *fmt;
+    VkFormat vkf;              /* o formato escolhido (fmt->vk ou o substituto que a GPU aceita) */
+    uint32_t w, h, d, levels, layers;
+    VkImageType type;
+    uint64_t id;               /* ID único monotônico no device (para o oráculo TBDR) */
+    uint64_t last_use;
+    VkFormat srgb;             /* par sRGB do formato (D3DSAMP_SRGBTEXTURE), ou UNDEFINED */
+    VkImageView view_srgb;     /* criada no primeiro uso */
+    uint8_t srgb_dropped;      /* Android: render target com par sRGB criado sem MUTABLE (preserva AFBC/UBWC) */
+    VkImageLayout *sub_layouts;/* layout corrente por sub-recurso [layer * levels + level] */
+    uint8_t *sub_dirty;        /* 1 se o sub-recurso recebeu escrita pendente de barreira */
+    uint32_t *sub_stages;      /* estágios de leitura (VERTEX|FRAGMENT) acumulados desde a última barreira */
+    vk2_tbdr_sub *tbdr_subs; /* rastreamento TBDR por sub-recurso */
+};
+
+typedef struct {
+    vk_obj o;
+    vk_obj *container;         /* textura dona (com referência) ou NULL */
+    vk_image *img;             /* da textura dona ou própria */
+    int own_img;
+    uint32_t level, layer;
+    D3DSURFACE_DESC desc;
+    uint8_t *lock;             /* staging do LockRect (malloc) */
+    RECT lock_rect;
+    int locked;
+} vk_surface;
+
+typedef struct {
+    vk_obj o;
+    vk_image img;
+    D3DFORMAT format;
+    DWORD usage;
+    D3DPOOL pool;
+    vk_surface **surf;         /* layers * levels, criadas sob demanda */
+    struct { uint8_t *data; RECT r; D3DBOX box; int on; } *locks;   /* layers * levels */
+} vk_texture;
+
+typedef struct {
+    vk_obj o;
+    VkBuffer buf;
+    vk_alloc mem;
+    UINT size;
+    DWORD usage, fvf;
+    D3DFORMAT format;          /* índices: D3DFMT_INDEX16/32 */
+    D3DPOOL pool;
+    uint64_t last_use;
+    int locked;
+} vk_buffer;
+
+typedef struct {
+    vk_obj o;
+    D3DVERTEXELEMENT9 el[64];
+    uint32_t n;                /* sem o D3DDECL_END */
+} vk_decl;
+
+#define VK_MAX_VARIANTS 16   /* PS: profundidade x alpha test; VS: entradas inteiras (Adreno) */
+typedef struct {
+    vk_obj o;
+    uint32_t *code;
+    uint32_t ndw;
+    uint32_t hash;
+    struct { vk2_dxso_variant var; vk2_shader info; VkShaderModule mod; } v[VK_MAX_VARIANTS];
+    int nv;
+} vk_shader;
+
+typedef struct {
+    vk_obj o;
+    D3DQUERYTYPE type;
+    uint64_t serial;           /* envio que fecha a consulta (evento); 0 = não emitida */
+    /* Oclusão: um Issue(BEGIN)..Issue(END) pode atravessar vários passes; cada passe vira um trecho
+     * (slot do VkQueryPool) e o GetData soma os trechos. */
+    uint32_t *slots, nslots, cap;
+    int32_t open_slot;         /* trecho aberto no passe atual, ou -1 */
+    uint8_t active;            /* entre BEGIN e END */
+} vk_query;
+
+/* ---- device ---- */
+
+#define VK_MAX_IMAGES 8
+#define VK_MAX_SAMPLERS 20      /* 0-15 PS, 16-19 VS (D3DVERTEXTEXTURESAMPLER0 = 257) */
+
+typedef struct { uint64_t key[6]; VkPipeline pipe; } vk_pipe_entry;
+typedef struct { uint32_t key[16]; VkSampler s; } vk_sampler_entry;
+
+#define RE5VK2_OCC_SLOTS 16384u
+#define RE5VK2_OCC_ACTIVE 64
+
+struct vk_device {
+    const struct IDirect3DDevice9Vtbl *lpVtbl;
+    long refs;
+    struct vk_d3d9 *d3d;
+    re5_mutex mu;
+    re5_mutex qmu;             /* fila Vulkan: vkQueueSubmit x vkQueuePresentKHR da thread de present */
+    struct {                   /* RE5VK2_PRESENT_THREAD: vkQueuePresentKHR fora da thread do jogo */
+        re5_mutex mu;
+        re5_cond cv;
+        int on, pending, stale, started;
+        uint32_t idx;
+        VkSemaphore wait;
+        uint64_t ns;           /* tempo dentro do vkQueuePresentKHR na thread (RE5_FPS_LOG) */
+    } pq;
+    D3DDEVICE_CREATION_PARAMETERS cp;
+    D3DPRESENT_PARAMETERS pp;
+
+    VkInstance inst;
+    VkPhysicalDevice phys;
+    VkPhysicalDeviceProperties props;
+    VkPhysicalDeviceMemoryProperties memprops;
+    VkPhysicalDeviceFeatures features;
+    VkSurfaceKHR surface;
+    VkDevice dev;
+    uint32_t qfam;
+    VkQueue queue;
+
+    VkSwapchainKHR swap;
+    VkFormat swap_format;
+    VkExtent2D swap_extent;
+    uint32_t nimages;
+    VkImage images[VK_MAX_IMAGES];
+    VkImageView image_views[VK_MAX_IMAGES];
+    VkImageLayout swap_layouts[VK_MAX_IMAGES];
+    int swap_has_transfer_dst;
+    int can_blit_to_swap;
+    VkSampler present_sampler;
+    VkDescriptorSetLayout present_dsl;
+    VkPipelineLayout present_layout;
+    VkDescriptorPool present_pool;
+    VkDescriptorSet present_set;
+    VkImageView present_view;   /* o que o present_set aponta */
+    VkImageLayout present_img_layout;
+    VkPipeline present_pipe;
+    /* rampa de gama do jogo (SetGammaRamp), aplicada no Present por um passe com a tabela de 256 entradas */
+    int gamma_on, gamma_dirty;
+    uint16_t ramp[256][3];
+    VkImage lut_img;
+    vk2_alloc lut_mem;
+    VkImageView lut_view;
+    VkImageLayout lut_layout;
+    VkSampler lut_sampler;
+    VkDescriptorSetLayout gamma_dsl;
+    VkPipelineLayout gamma_layout;
+    VkDescriptorPool gamma_pool;
+    VkDescriptorSet gamma_set;
+    VkPipeline gamma_pipe;
+    VkImageView gamma_bb_view;
+    VkSemaphore done[VK_MAX_IMAGES];
+    VkSemaphore acquired[VK_SLOTS];
+
+    VkCommandPool pool;
+    vk_slot slots[VK_SLOTS];
+    int cur;                   /* envio sendo gravado */
+    uint64_t serial;           /* do envio sendo gravado (crescente a partir de 1) */
+    uint64_t done_serial;      /* último envio que a GPU terminou */
+
+
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkPipelineCache pcache;
+    uint32_t pcache_saved; /* npipes na última gravação do cache em disco */
+    vk_pipe_entry *pipes;
+    uint32_t npipes, cappipes;
+    vk_sampler_entry *samplers;
+    uint32_t nsamplers, capsamplers;
+
+    vk_surface *backbuffer, *auto_depth;
+    vk_image dummy2d, dummycube, dummy3d;   /* textura nula: (0, 0, 0, 1) */
+    VkBuffer zero_vb;
+    vk_alloc zero_vb_mem;
+
+    /* estado do D3D9 */
+    vk_surface *rt[4], *ds;
+    D3DVIEWPORT9 vp;
+    RECT scissor;
+    DWORD rs[256];
+    DWORD ss[VK_MAX_SAMPLERS][14];
+    vk_obj *tex[VK_MAX_SAMPLERS];
+    struct { vk_buffer *vb; UINT off, stride; } streams[16];
+    vk_buffer *ib;
+    vk_decl *decl;
+    vk_shader *vs, *ps;
+    float vsf[256][4], psf[224][4];
+    int32_t vsi[16][4], psi[16][4];
+    uint32_t vsb, psb;
+    int vs_dirty, ps_dirty;
+    /* o que a região atual do UBO tem (prepare copia só o que o shader lê): c[0..n-1], i[], b */
+    uint16_t vs_ubo_f, ps_ubo_f;
+    uint8_t vs_ubo_ib, ps_ubo_ib;
+    /* O que está ligado no command buffer atual (zerado a cada slot_begin): o draw só religa o
+     * que mudou. Compara o VkBuffer, não o objeto: o Lock com DISCARD troca a memória. */
+    VkBuffer bound_vb[16];
+    VkDeviceSize bound_vo[16], bound_vstride[16];
+    int vb_valid;
+    VkBuffer bound_ib;
+    VkIndexType bound_ibt;
+    /* Pipeline do draw anterior: refeito só quando muda algo que entra nele (pipe_gen sobe em
+     * todo SetRenderState com valor novo, shaders, declaração, alvos e textura que troca entre
+     * profundidade e cor) ou a classe de topologia. */
+    uint32_t pipe_gen, last_gen;
+    uint32_t last_topo;
+    VkPipeline last_pipe;
+    const vk2_shader *last_vsi, *last_psi;
+    vk2_dxso_variant last_psv;
+    VkDeviceSize vs_ubo_off, ps_ubo_off;
+    VkBuffer vs_ubo_buf, ps_ubo_buf;
+    int in_scene;
+
+    /* passe de render aberto */
+    int rendering;
+    vk_surface *pass_rt[4], *pass_ds;   /* alvos do passe aberto (com referência): podem diferir de rt/ds
+                                         * com RE5VK2_LAZY_RT até o próximo draw/Clear */
+    const char *deferred_why;           /* motivo da troca de alvo ainda não aplicada */
+    VkExtent2D render_area;
+    VkImageLayout render_rt_layouts[4];
+    VkImageLayout render_ds_layout;
+    VkPipeline bound_pipe;
+    int dyn_dirty, desc_dirty;
+    int dyn_valid;
+    struct {
+        VkPrimitiveTopology topo;
+        VkViewport vp;
+        VkRect2D scissor;
+        VkCullModeFlags cull;
+        VkBool32 depth_test, depth_write;
+        VkCompareOp depth_op;
+        VkBool32 stencil_test;
+        DWORD stencil_two_sided;
+        VkStencilOp sf_fail, sf_pass, sf_zfail, sb_fail, sb_pass, sb_zfail;
+        VkCompareOp sf_func, sb_func;
+        uint32_t stencil_cmp_mask, stencil_write_mask, stencil_ref;
+        VkBool32 bias_on;
+        float depth_bias, depth_slope;
+        float blend_const[4];
+    } bound_dyn;
+    VkBuffer bound_vs_buf, bound_ps_buf;
+    VkDescriptorSet bound_set;
+    uint32_t bound_vs_off, bound_ps_off;
+    uint64_t bound_samp_sig;
+    VkImage pad_img;           /* RE5VK2_GPU_PAD: alvo das limpezas de preenchimento */
+    vk2_alloc pad_alloc;
+    uint32_t surf_gen;         /* Android: re5_android_surface_gen() da superfície em uso */
+    void *anw;                 /* Android: ANativeWindow da janela (tamanho do buffer = back buffer) */
+    int has_fmt_list;          /* Android: VkImageFormatListCreateInfo válido (1.2 core ou VK_KHR_image_format_list) */
+    VkDescriptorSet set;
+    /* VkSampler do slot (sem e com comparação; sem e com múltiplos mips), válido até o próximo SetSamplerState nele:
+     * sampler_get é busca linear com memcmp em toda a lista. */
+    VkSampler smp_cache[VK_MAX_SAMPLERS][2][2][2];   /* [slot][compare][multimip][sem filtro linear] */
+    /* Sets já escritos neste envio (o pool zera a cada slot_begin): o mesmo conjunto de UBOs,
+     * views e samplers volta muito num quadro (material A, B, A...). Chave = os handles + layouts. */
+    struct vk_set_cache_entry {
+        uint64_t key[2 + 3 * RE5VK2_NBINDINGS];
+        uint32_t nkey;
+        uint64_t hash, gen;    /* gen != set_cache_gen: vaga */
+        VkDescriptorSet set;
+    } *set_cache;
+    uint32_t set_cache_n, set_cache_cap;
+    uint64_t set_cache_gen;   /* sobe a cada slot_begin (re5vk.c) */
+    uint32_t pipe_hash_cap;
+    struct { int on; float color[4][4]; float z; uint32_t stencil; DWORD flags; } pending_clear;
+
+    uint64_t next_img_id;
+    vk2_tbdr tbdr;
+    const char *split_why;    /* motivo da divisão no prepare (vai para tm.pw_*) */
+    /* Análise de passes juntáveis (só com RE5_FPS_LOG): o que cada passe do quadro leu e escreveu */
+    struct vk2_frpass { const void *rt, *ds; uint32_t sub; const void *reads[16]; uint8_t nreads; uint32_t draws; } fr[512];
+    uint32_t nfr;
+    const void *cur_reads[16];
+    uint8_t cur_nreads;
+    uint32_t mg_reopen, mg_ok;   /* passes que reabrem um alvo já usado no quadro / dos quais seria seguro juntar */
+    /* ---- fila de passes (RE5VK2_PASS_QUEUE=1) ----
+     * Cada passe grava seus draws num command buffer SECUNDÁRIO; o passe fechado fica "pendente" e só entra no
+     * primário no envio da fila. Se um passe novo abre no MESMO alvo de um pendente e nenhum pendente posterior
+     * conflita com ele (nem escrita nem leitura cruzada), os draws dele são anexados ao pendente: um passe só
+     * onde o jogo fez A, B, A. Qualquer dúvida envia a fila na ordem original. */
+    int pq_on;
+#define VK2_PQ_MAX 8
+#define VK2_PQ_SEC 24
+    struct vk2_pq {
+        VkRenderPass rp; VkFramebuffer fb; VkExtent2D area; uint32_t nclear; VkClearValue clears[5];
+        VkCommandBuffer sec[VK2_PQ_SEC]; uint32_t nsec;
+        const void *rt[4]; uint32_t rt_sub[4]; const void *ds; uint32_t ds_sub;
+        const void *rd[32]; uint8_t nrd;
+    } pqe[VK2_PQ_MAX];
+    int npq;
+    VkCommandBuffer pass_cb;          /* secundário do passe aberto (NULL = grava no primário) */
+    int pass_merge;                   /* índice do pendente que recebe os draws deste passe, ou -1 */
+    struct vk2_pq pass_ent;           /* o que o passe aberto vai virar na fila */
+    const void *prep_reads[24];       /* texturas lidas pelo draw em preparo */
+    uint8_t prep_nreads;
+    uint32_t pq_merged, pq_flush_conf;   /* diagnóstico: passes juntados / envios da fila por conflito */
+    uint32_t passes_since_submit;   /* RE5VK2_SUBMIT_EVERY */
+    int in_flush, flush_pending;
+    int split_present;
+    uint32_t pass_draws;      /* draws no passe aberto */
+    const void *last_pass_rt0, *last_pass_ds;   /* alvos do último passe fechado (contagem de reabertos) */
+    uint32_t last_pass_mrt, last_pass_sub0;   /* sub0: camada<<16 | nível do RT0 do último passe */   /* bits 1..3: RT1..3 presentes no último passe */
+    uint8_t pass_was_split;   /* 1 se vk2_end_rendering foi chamado por need_split */
+
+    uint64_t presents;
+    int warned_gamma, warned_clip;
+
+    /* RE5_FPS_LOG: onde a CPU fica parada no re5vk e quanto a GPU trabalhou, somado por segundo
+     * (vk2_timing_*). Os campos de tempo só mudam com o mutex do device na mão. */
+    struct {
+        int on;
+        uint64_t t0;                          /* início da janela de 1 s (ns) */
+        uint64_t acquire, fence, inflight;    /* ns bloqueados: vkAcquireNextImageKHR, fence de slot, limite de quadros em voo */
+        uint64_t pq_ns;                       /* ns dentro do vkQueuePresentKHR na thread de present */
+        uint64_t submit, qpresent, mutex;     /* ns: vkQueueSubmit, vkQueuePresentKHR, espera pelo mutex do re5vk */
+        uint64_t gpu;                         /* ns de GPU dos envios concluídos (timestamps) */
+        uint32_t submits, gpu_samples, presents;
+        uint64_t draws;                       /* draws nos passes fechados no segundo */
+        uint32_t up_fast, up_slow, passes;     /* uploads no cb separado / no cb principal; passes abertos */
+        /* Por que cada passe fechou (nome do chamador ou motivo da divisão), draws por passe
+         * (0, 1, 2-4, 5-19, 20+) e passes reabertos no mesmo alvo do anterior (divisão evitável). */
+        const char *pw_name[RE5VK2_PW_MAX];
+        uint32_t pw_n[RE5VK2_PW_MAX], pw_used;
+        uint32_t pd_hist[5], reopen, reopen_mrt, lazy_kept;   /* lazy_kept: trocas de alvo desfeitas antes de um draw (passe mantido) */   /* reopen_mrt: mesmo RT0+DS, só RT1..3 mudou */
+        VkQueryPool pool;                     /* 2 timestamps por slot: começo e fim do envio */
+        uint32_t valid_bits;
+        float period;                         /* ns por tique do timestamp */
+    } tm;
+    /* RE5VK2_PASS_TIMING=1 (com RE5_FPS_LOG): timestamp antes de cada vkCmdBeginRenderPass e depois de
+     * cada vkCmdEndRenderPass; lidos no fim do envio. Por segundo: GPU dentro dos passes, entre eles
+     * e antes/depois deles no envio, e tempo por tamanho de alvo. */
+    struct {
+        VkQueryPool pool;
+        int open;                              /* passe aberto com timestamp de início gravado */
+        uint32_t n[VK_SLOTS];                  /* passes medidos por envio */
+        uint16_t w[VK_SLOTS][RE5VK2_PT_CAP], h[VK_SLOTS][RE5VK2_PT_CAP], draws[VK_SLOTS][RE5VK2_PT_CAP];
+        uint64_t in_ns, gap_ns, edge_ns;       /* agregados do segundo */
+        uint32_t passes, dropped;
+        vk2_pt_bucket by[RE5VK2_PT_BUCKETS];
+        uint32_t nby;
+    } pt;
+    /* D3DQUERYTYPE_OCCLUSION: anel de slots num VkQueryPool; "ready" = slots já zerados (vkCmdResetQueryPool
+     * fora do passe) à frente de "head". Consultas ativas ganham um trecho em cada passe aberto. */
+    struct {
+        VkQueryPool pool;
+        uint64_t head, ready;
+        vk_query *active[RE5VK2_OCC_ACTIVE];
+        int nactive;
+        int precise;
+    } occ;
+};
+
+typedef struct vk_d3d9 {
+    const struct IDirect3D9Vtbl *lpVtbl;
+    IDirect3D9 *inner;
+    long refs;
+} vk_d3d9;
+
+/* re5vk.c */
+HRESULT vk2_device_create(vk_d3d9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags,
+                            D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out);
+HRESULT STDMETHODCALLTYPE vk2_nyi(void *self);
+void vk2_lock(vk_device *d);
+void vk2_unlock(vk_device *d);
+/* Buffer pelo VMA. host: HOST_VISIBLE|COHERENT mapeado (a->map); senão DEVICE_LOCAL. */
+VkBuffer vk2_buffer_new(vk_device *d, VkDeviceSize size, VkBufferUsageFlags usage, int host, const char *name,
+                          vk_alloc *a);
+/* Imediato (a GPU já terminou: o lixo do envio garante). */
+void vk2_buffer_free(vk_device *d, VkBuffer b, vk_alloc *a);
+void vk2_destroy_later(vk_device *d, int kind, uint64_t handle, vk_alloc mem);
+VkCommandBuffer vk2_cmd(vk_device *d);
+VkCommandBuffer vk2_upload_cmd(vk_device *d);
+VkCommandBuffer vk2_present_cmd(vk_device *d);
+VkCommandBuffer vk2_cmd_nf(vk_device *d);   /* primário SEM enviar a fila de passes (só o prepare, que checa conflito antes) */
+void vk2_pq_flush(vk_device *d);
+VkCommandBuffer vk2_sec_cmd(vk_device *d);
+void vk2_occ_before_pass(vk_device *d, VkCommandBuffer cb);   /* fora do passe: zera slots à frente */
+void vk2_occ_pass_begin(vk_device *d, VkCommandBuffer cb);    /* logo depois do vkCmdBeginRenderPass */
+void vk2_occ_pass_end(vk_device *d, VkCommandBuffer cb);      /* logo antes do vkCmdEndRenderPass */
+void vk2_flush(vk_device *d, int wait);          /* envia o que foi gravado; wait: espera a GPU */
+void vk2_wait_serial(vk_device *d, uint64_t s);  /* espera a GPU terminar o envio s */
+void vk2_poll(vk_device *d);                     /* atualiza done_serial sem esperar */
+/* staging do envio atual: bytes host-visible copiáveis por vkCmdCopy*; NULL buffer = esgotado */
+uint8_t *vk2_stage(vk_device *d, VkDeviceSize size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);
+uint8_t *vk2_ubo(vk_device *d, VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off);
+VkDescriptorSet vk2_alloc_set(vk_device *d);
+void vk2_barrier_all(VkCommandBuffer cb);
+
+/* vk_res.c */
+int vk2_layout_general(void);
+VkImageAspectFlags vk2_img_aspect(const vk_format *f, int for_view);
+VkImageLayout vk2_img_sub_layout(const vk_image *im, uint32_t layer, uint32_t level);
+int vk2_img_needs_barrier(const vk_image *im, uint32_t base_level, uint32_t level_count,
+                            uint32_t base_layer, uint32_t layer_count, VkImageLayout want_layout);
+void vk2_img_transition(vk_device *d, VkCommandBuffer cb, vk_image *im, uint32_t base_level, uint32_t level_count,
+                          uint32_t base_layer, uint32_t layer_count, VkImageLayout new_layout,
+                          VkPipelineStageFlags shader_stages);
+void vk2_img_mark_written(vk_image *im, uint32_t base_level, uint32_t level_count,
+                            uint32_t base_layer, uint32_t layer_count);
+const vk_format *vk2_format(D3DFORMAT f);
+int vk2_image_create(vk_device *d, vk_image *im, VkImageType type, const vk_format *fmt, uint32_t w, uint32_t h,
+                       uint32_t depth, uint32_t levels, uint32_t layers, int cube, int rt, int ds);
+void vk2_image_destroy(vk_device *d, vk_image *im);
+VkImageView vk2_image_rt_view(vk_device *d, vk_image *im, uint32_t layer, uint32_t level);
+/* Vista para amostrar: a sRGB (sRGB -> linear na leitura) se srgb e o formato tem par. */
+VkImageView vk2_image_sampled_view(vk_device *d, vk_image *im, int srgb);
+vk_surface *vk2_surface_new(vk_device *d, vk_obj *container, vk_image *img, int own, uint32_t layer, uint32_t level,
+                              D3DFORMAT format, DWORD usage, D3DPOOL pool);
+void vk2_res_vtables(vk_device *d);
+void vk2_init_dummies(vk_device *d);
+vk_shader *vk2_shader_raw(vk_device *d, const uint32_t *code, uint32_t ndw, int pixel);
+void vk2_shader_raw_free(vk_device *d, vk_shader *s);
+HRESULT vk2_shader_variant_try(vk_device *d, vk_shader *s, const vk2_dxso_variant *var, VkShaderModule *mod,
+                               const vk2_shader **info, char *err, size_t errsz);
+void vk2_draw_init(void);
+void vk2_frame_analyze(vk_device *d);   /* fim do quadro: conta passes juntáveis (RE5_FPS_LOG) */
+size_t vk2_pipe_key_size(void);
+const char *vk2_cache_dir(void);   /* RE5VK2_CACHE_DIR, ou a pasta interna do app, ou "." */
+void vk2_cache_init(void);         /* RE5VK2_CACHE_CLEAR=1 apaga manifesto e cache de pipelines */
+/* Pré-aquecimento de pipelines (vk2_warm.c e vk2_draw.c). */
+void vk2_warm_start(vk_device *d);
+void vk2_warm_wait_first_present(vk_device *d);
+void vk2_warm_record(vk_device *d, const void *key, uint32_t keysz, const vk_shader *vs, const vk_shader *ps,
+                     const vk_decl *decl);
+void vk2_draw_warm_one(vk_device *d, const void *key, uint32_t keysz, const uint32_t *vs, uint32_t nvs,
+                       const uint32_t *ps, uint32_t nps, const D3DVERTEXELEMENT9 *el, uint32_t nel);
+HRESULT vk2_shader_variant(vk_device *d, vk_shader *s, const vk2_dxso_variant *var, VkShaderModule *mod,
+                             const vk2_shader **info);
+
+/* métodos de criação do device implementados em vk_res.c */
+HRESULT STDMETHODCALLTYPE vk2_CreateTexture(IDirect3DDevice9 *, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                              IDirect3DTexture9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateCubeTexture(IDirect3DDevice9 *, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                                  IDirect3DCubeTexture9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateVolumeTexture(IDirect3DDevice9 *, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT,
+                                                    D3DPOOL, IDirect3DVolumeTexture9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateVertexBuffer(IDirect3DDevice9 *, UINT, DWORD, DWORD, D3DPOOL,
+                                                   IDirect3DVertexBuffer9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateIndexBuffer(IDirect3DDevice9 *, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                                  IDirect3DIndexBuffer9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateRenderTarget(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE,
+                                                   DWORD, BOOL, IDirect3DSurface9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateDepthStencilSurface(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT,
+                                                          D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **,
+                                                          HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_CreateVertexDeclaration(IDirect3DDevice9 *, const D3DVERTEXELEMENT9 *,
+                                                        IDirect3DVertexDeclaration9 **);
+HRESULT STDMETHODCALLTYPE vk2_CreateVertexShader(IDirect3DDevice9 *, const DWORD *, IDirect3DVertexShader9 **);
+HRESULT STDMETHODCALLTYPE vk2_CreatePixelShader(IDirect3DDevice9 *, const DWORD *, IDirect3DPixelShader9 **);
+HRESULT STDMETHODCALLTYPE vk2_CreateOffscreenPlainSurface(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DPOOL,
+                                                            IDirect3DSurface9 **, HANDLE *);
+HRESULT STDMETHODCALLTYPE vk2_GetRenderTargetData(IDirect3DDevice9 *, IDirect3DSurface9 *, IDirect3DSurface9 *);
+HRESULT STDMETHODCALLTYPE vk2_CreateQuery(IDirect3DDevice9 *, D3DQUERYTYPE, IDirect3DQuery9 **);
+
+/* vk_draw.c */
+void vk2_draw_vtable(struct IDirect3DDevice9Vtbl *vt);
+void vk2_state_reset(vk_device *d);          /* estado padrão do D3D9 (CreateDevice, Reset) */
+void vk2_end_rendering_why(vk_device *d, const char *why);
+void vk2_pt_begin(vk_device *d, VkCommandBuffer cb, uint32_t w, uint32_t h);   /* re5vk.c */
+void vk2_pt_end(vk_device *d, VkCommandBuffer cb, uint32_t draws);
+#define vk2_end_rendering(d) vk2_end_rendering_why((d), __func__)
+void vk2_draw_destroy(vk_device *d);
+
+/* Referências como no D3D9: a superfície de uma textura conta na textura. NULL é aceito. */
+void vk2_addref(vk_obj *o);    /* vk_res.c */
+void vk2_release(vk_obj *o);   /* vk_res.c: Release genérico (destrói na última) */
+
+#endif /* RE5VK2_CORE_H */
