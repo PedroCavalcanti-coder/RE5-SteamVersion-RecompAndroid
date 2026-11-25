@@ -1031,6 +1031,36 @@ static int query_lag(void)
 {
     static int lag = -1;
     if (lag < 0) {
+/* Limitador de quadro do PRÓPRIO jogo. O objeto de tempo (ponteiro global em 0x012340A4) guarda
+ * em +0x3C o teto de fps como float, gravado uma vez em 0x00425F76 a partir da constante 120.0f
+ * (0x010BCDDC, compartilhada com dezenas de outros usos: não dá para trocar a constante). O laço de
+ * 0x00427039 espera até (1000 / teto) ms por quadro, daí o limite de 120 fps mesmo sem vsync
+ * (config.ini com VSYNC=OFF e FrameRate=VARIABLE). Mudar o teto não mexe no passo de tempo: o jogo
+ * continua medindo o delta pelo relógio, só deixa de dormir/girar esperando.
+ * RE5_GAME_FPS_CAP=<fps> escolhe o teto (120 = comportamento original); padrão: sem teto. */
+#define RE5_GAME_TIMER_PTR 0x012340A4u
+#define RE5_GAME_TIMER_CAP 0x3Cu
+static void game_fps_cap_lift(void)
+{
+    static int done;
+    if (done) return;
+    uint32_t t = re5_mem_is_mapped(RE5_GAME_TIMER_PTR, 4) ? rd32(RE5_GAME_TIMER_PTR) : 0;
+    if (!t || !re5_mem_is_mapped(t + RE5_GAME_TIMER_CAP, 4)) return;   /* o jogo ainda não criou o objeto */
+    done = 1;
+    float orig, want = 100000.0f;
+    uint32_t b = rd32(t + RE5_GAME_TIMER_CAP);
+    memcpy(&orig, &b, 4);
+    const char *e = getenv("RE5_GAME_FPS_CAP");
+    if (e && *e) {
+        long fps = strtol(e, NULL, 10);
+        if (fps > 0) want = (float)fps;
+    }
+    if (orig != 120.0f) return;   /* já mexido (outro caminho) ou build diferente: não toca */
+    memcpy(&b, &want, 4);
+    wr32(t + RE5_GAME_TIMER_CAP, b);
+    RE5_INFO("d3d9", "teto de fps do jogo: %.0f -> %.0f (RE5_GAME_FPS_CAP=<fps>; 120 = original)", orig, want);
+}
+
         const char *e = getenv("RE5_QUERY_LAG");
 #if defined(__ANDROID__)
         lag = e ? atoi(e) : 3;
@@ -1098,6 +1128,7 @@ static void d_Present(CPU *c)
         uint64_t t0 = re5_stat_now_ns();   /* sempre: o ADPF recebe a espera no Present como GPU */
         hr = dev->lpVtbl->Present(dev, src, dst, over, dirty);
         present_ns = re5_stat_now_ns() - t0;
+    game_fps_cap_lift();
 #if defined(__ANDROID__)
         re5_android_present_leave();
 #endif

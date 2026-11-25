@@ -1051,3 +1051,12 @@ Faltando (270/270): nenhum. `re5 --census --missing` em 2026-10-21: `imports: 27
   `build/ffmpeg-android`, `RE5_LEAN=1`. Docs do Vulkan nativo em `docs/arquivo/`. Build do PC e `ctest` verdes (33 de 34; `kernel32`
   é a intermitência de tempo que já existia: 15 de 15 execuções diretas passam, falha ~1 em 3 dentro do `ctest`); Android compila
   (`libre5.so` 76,9 MB) e empacota (`work/android/app-padrao.apk`); **não testado no aparelho**.
+
+## Teto de 120 fps do próprio jogo removido (2026-11-25)
+- **Causa:** o objeto de tempo do RE5 (ponteiro em 0x012340A4) guarda em `+0x3C` o teto de fps, gravado em
+  0x00425F76 a partir da constante 120.0f (0x010BCDDC, compartilhada com outros usos). O laço de 0x00427039 espera
+  `1000/teto` ms por quadro, mesmo com `VSYNC=OFF` e `FrameRate=VARIABLE`.
+- **Mudança:** `game_fps_cap_lift()` em `runtime/src/win32/d3d9.c` troca o valor por 100000 no primeiro Present
+  (só se ainda for 120.0f). `RE5_GAME_FPS_CAP=<fps>` escolhe o teto (120 = original). O `RE5_FPS_CAP` (limite do host/Android) é outro e não mudou.
+- **Evidência:** PC, `RE5_GFX=dxvk RE5_FPS_LOG=1`: o menu passou de 120 fps (teto) para 320-385 fps; `ctest -R "d3d9|perf"` 4/4.
+  Não medido no aparelho Android (lá o `RE5_FPS_CAP=60` do launcher continua valendo).
