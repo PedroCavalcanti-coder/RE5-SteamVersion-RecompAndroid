@@ -132,6 +132,17 @@ typedef struct {
 
 void        steam_lan_get_status(re5_lan_status *st);
 
+/* 1 quando ha 2 jogadores na sala (o runtime limita o fps e mostra o ping). */
+int         steam_lan_coop_active(void);
+
+/* Host: pedido de entrada esperando resposta (preenche "Nome #ID"); answer: 1 aceita, 0 recusa. */
+int         steam_lan_get_pending(char *name, size_t cap, uint64_t *id);
+void        steam_lan_answer_pending(int accept);
+
+/* Aviso atual para mostrar na tela (quem quer entrar, quem entrou, falhas), vivo por
+ * alguns segundos. 1 = ha aviso; kind: 1 pedido, 2 entrou, 3 problema. */
+int         steam_lan_get_notice(char *out, size_t cap, int *kind);
+
 /* Consumo de eventos na thread principal para disparo de callbacks */
 int         steam_lan_pop_event(re5_lan_event *evt);
 

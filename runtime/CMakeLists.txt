@@ -151,6 +151,7 @@ add_library(re5_runtime STATIC
     src/win32/user32.c
     src/win32/winmm.c
     src/win32/wmvcore.c
+    src/win32/bt_link.c
     src/win32/ws2_32.c
     src/win32/ws2_32_sock.c
     src/win32/xinput1_3.c
@@ -172,7 +173,7 @@ set_source_files_properties(
     src/gfx/vk2/vk2_ctx.c src/gfx/vk2/vk2_dev.c src/gfx/vk2/vk2_draw.c src/gfx/vk2/vk2_res.c src/gfx/vk2/vk2_layout.c src/gfx/vk2/vk2_warm.c
     PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")
 if(WIN32)
-    target_link_libraries(re5_runtime PUBLIC ws2_32 winmm)   # sockets do Winsock; timeBeginPeriod do host
+    target_link_libraries(re5_runtime PUBLIC ws2_32 iphlpapi winmm)   # sockets do Winsock; timeBeginPeriod do host
 endif()
 
 # FFmpeg mínimo (asf + vc1/wmapro) para o wmvcore (etapa 4.5), compilado por

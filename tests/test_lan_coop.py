@@ -17,6 +17,7 @@ def main():
         return 1
 
     env_host = os.environ.copy()
+    env_host['RE5_LAN_AUTO_ACCEPT'] = '1'  # o teste nao tem quem aperte F10
     env_host['RE5_PLAYER_NAME'] = 'Chris'
     env_host['RE5_LAN_PORT'] = '27020'
     env_host['RE5_STEAM_ID'] = '101'

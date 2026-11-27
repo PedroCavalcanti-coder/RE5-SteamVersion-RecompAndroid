@@ -31,6 +31,7 @@
 #include "re5/coldebug.h"
 #include "re5/guest_base.h"
 #include "re5/lan_menu.h"
+#include "re5/steam_lan.h"
 #include "re5/perf_hint.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/stats.h"
@@ -994,17 +995,24 @@ uint64_t re5_frame_cap_next(uint64_t now, uint64_t prev, uint64_t period)
 /* Devolve quanto dormiu (ns), para o ADPF não contar a espera como trabalho. */
 static uint64_t frame_cap(void)
 {
-    static int64_t period = -1;
+    static int64_t period = -1, coop_period = -1;
     static uint64_t deadline;
     if (period < 0) {
         const char *e = getenv("RE5_FPS_CAP");
         long fps = e ? strtol(e, NULL, 10) : 0;
         period = fps > 0 && fps <= 1000 ? (int64_t)(1000000000LL / fps) : 0;
         if (period) RE5_INFO("d3d9", "limite de FPS: %ld (RE5_FPS_CAP)", fps);
+        /* Co-op: cada quadro manda pacotes ao parceiro. Sem teto o PC passa de 600 fps, inunda o Wi-Fi e o
+         * celular le estados com segundos de atraso (personagem desliza e teleporta). RE5_COOP_FPS=0 desliga. */
+        const char *c = getenv("RE5_COOP_FPS");
+        long cf = c && *c ? strtol(c, NULL, 10) : 60;
+        coop_period = cf > 0 && cf <= 1000 ? (int64_t)(1000000000LL / cf) : 0;
     }
-    if (!period) return 0;
+    int64_t period_now = period;
+    if (coop_period && steam_lan_coop_active() && (!period || coop_period > period)) period_now = coop_period;
+    if (!period_now) return 0;
     uint64_t start = re5_stat_now_ns();
-    deadline = re5_frame_cap_next(start, deadline, (uint64_t)period);
+    deadline = re5_frame_cap_next(start, deadline, (uint64_t)period_now);
     for (;;) {
         uint64_t now = re5_stat_now_ns();
         if (now >= deadline) break;

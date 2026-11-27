@@ -5,6 +5,7 @@
  */
 #include <ctype.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -13,11 +14,13 @@
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <direct.h>
 typedef SOCKET hsock_t;
 #define HBAD_SOCK INVALID_SOCKET
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -32,6 +35,8 @@ typedef int hsock_t;
 #endif
 
 #include "re5/runtime.h"
+#include "re5/bt_link.h"
+#include "re5/lan_menu.h"
 #include "re5/steam_lan.h"
 #include "re5/thread.h"
 #include "re5/vfs.h"
@@ -50,6 +55,9 @@ enum {
     PKT_KEEPALIVE        = 0x08,   /* entre membros da sala: queda do parceiro e ping */
     PKT_P2P_DATA         = 0x10,
     PKT_P2P_ACK          = 0x11,
+    PKT_SRV_HELLO        = 0x20,   /* servidor de retransmissao (tools/re5_server): registro do cliente */
+    PKT_SRV_ACK          = 0x21,
+    PKT_RELAY            = 0x22,   /* cabecalho + u64 destino + pacote interno; destino 0 = o proprio servidor */
 };
 
 #pragma pack(push, 1)
@@ -121,6 +129,20 @@ typedef struct {
     char val[RE5_LAN_MAX_VAL_LEN];
 } lan_kv;
 
+/* Canal confiavel sobre UDP (send_type >= 2): sequencia, ACK acumulativo e reenvio.
+ * Sem isso o runtime tratava "reliable" como UDP puro: um pacote perdido ou fora de
+ * ordem virava dessincronia (personagem deslizando, teleporte). */
+#define REL_WIN     64
+#define UNREL_DEPTH 24    /* nao confiaveis na fila por canal: o jogo le o mais novo, nao um atraso de segundos */
+typedef struct { uint32_t seq, sent_ms; uint16_t len; uint8_t pkt[RE5_LAN_MAX_PACKET_SIZE]; } rel_out;
+typedef struct { int used; uint16_t channel, len; uint8_t data[RE5_LAN_MAX_PACKET_SIZE]; } rel_in;
+typedef struct {
+    uint32_t tx_seq, rx_next, unrel_tx, unrel_last;
+    int      have_unrel, n_out;
+    rel_out  out[REL_WIN];
+    rel_in   in[REL_WIN];
+} lan_rel;
+
 typedef struct {
     uint64_t           steam_id;
     char               name[32];
@@ -131,6 +153,8 @@ typedef struct {
     int32_t            rtt_ms;          /* -1: ainda sem medida */
     uint32_t           ka_their_t;      /* último t_send recebido dele (0: nenhum) */
     uint32_t           ka_their_at;     /* quando chegou, no nosso relógio */
+    uint32_t           nonce;           /* processo do par: mudou = reiniciou, zera o canal confiavel */
+    lan_rel           *rel;
 } lan_peer;
 
 typedef struct {
@@ -150,11 +174,13 @@ typedef struct {
     uint32_t           last_seen_ms;
     int                is_local;
     int                joinable;
+    uint64_t           relay_id;      /* != 0: a sala so e alcancavel pelo servidor (id do host) */
 } lan_lobby;
 
 typedef struct lan_p2p_msg {
     uint64_t            remote_id;
     uint16_t            channel;
+    int                 reliable;
     uint32_t            len;
     uint8_t             data[RE5_LAN_MAX_PACKET_SIZE];
     struct lan_p2p_msg *next;
@@ -177,6 +203,22 @@ typedef struct lan_p2p_msg {
 #define ENTER_NOT_ALLOWED  3u
 #define ENTER_FULL         4u
 #define ENTER_ERROR        5u
+#define ENTER_PENDING      100u   /* so no nosso protocolo: o host ainda decide */
+
+/* Aprovacao do host: o pedido de entrada espera uma resposta do jogador (F10 aceita, F11 recusa,
+ * ou toque no aviso) como na Steam, em vez de entrar sozinho. O cliente continua reenviando o
+ * pedido a cada 300 ms; a decisao vale na proxima repeticao. RE5_LAN_AUTO_ACCEPT=1 entra direto. */
+#define PEND_QUIET_MS   4000u    /* sem repeticao do cliente por este tempo = ele desistiu */
+#define PEND_MAX_MS     30000u
+#define JOIN_PENDING_MS 35000u
+static struct {
+    int                active;
+    int                decision;   /* 0 espera, 1 aceito, -1 recusado */
+    uint64_t           id;
+    char               name[32];
+    uint32_t           started, last_req;
+} g_pend;
+static int g_auto_accept;
 
 /* O pedido de entrada é UDP: repete até a resposta do host, desiste no prazo. */
 #define JOIN_RESEND_MS  300u
@@ -214,9 +256,12 @@ static lan_p2p_msg *g_p2p_queue;
 static re5_lan_event g_events[MAX_EVENTS];
 static int           g_evt_head, g_evt_tail, g_evt_count;
 
+#define SEARCH_WINDOW_MS 1200u
+static uint32_t g_search_start, g_search_next_ping;
 static uint64_t g_pending_search_call;
 static uint32_t g_pending_search_expire;
 
+static uint32_t g_st_tx, g_st_txb, g_st_rx, g_st_rxb, g_st_retx, g_st_stale, g_st_qdrop, g_st_at;
 static uint32_t g_nonce;
 static int      g_id_clash_warned;
 
@@ -224,6 +269,7 @@ static uint32_t g_member_timeout_ms = MEMBER_TIMEOUT_MS;
 static uint32_t g_file_id;                  /* ID gravado no arquivo (sem o deslocamento da instância) */
 static char     g_local_country[4] = "US";
 static char     g_identity_path[1024];
+static uint32_t g_file_maq;               /* chave da maquina que gravou o arquivo (0: arquivo antigo) */
 
 /* Endereços de broadcast de cada interface (Wi-Fi, hotspot do celular...): no
  * Android o 255.255.255.255 muitas vezes sai pela interface errada ou nem sai. */
@@ -310,6 +356,17 @@ static void sock_fix_connreset(hsock_t s)
 
 static void sanitize_name(const char *in, char *out, size_t cap);
 static lan_peer *peer_find(uint64_t steam_id);
+static void write_identity(const char *path);
+static uint32_t lan_random(void);
+
+/* Avisos para o jogador (toast desenhado por lan_menu.c): quem quer entrar, quem
+ * entrou, quem saiu, falha de entrada. Os mais novos ficam; somem sozinhos. */
+#define NOTICE_MAX     4
+#define NOTICE_LIFE_MS 6000u
+static struct { char text[96]; uint32_t at; int kind; } g_notices[NOTICE_MAX];
+static int g_notice_n;
+
+static void notice_push(int kind, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 static void fill_hdr(lan_hdr *h, uint8_t type)
 {
@@ -319,6 +376,39 @@ static void fill_hdr(lan_hdr *h, uint8_t type)
     h->port = g_p2p_port;
     h->sender_steam_id = g_local_steam_id;
     h->nonce = g_nonce;
+}
+
+static void notice_push(int kind, const char *fmt, ...)
+{
+    if (g_notice_n == NOTICE_MAX) {
+        memmove(&g_notices[0], &g_notices[1], sizeof g_notices[0] * (NOTICE_MAX - 1));
+        g_notice_n--;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_notices[g_notice_n].text, sizeof g_notices[g_notice_n].text, fmt, ap);
+    va_end(ap);
+    g_notices[g_notice_n].at = get_ticks_ms();
+    g_notices[g_notice_n].kind = kind;
+    g_notice_n++;
+    re5_lan_notice_show(g_notices[g_notice_n - 1].text, kind);
+}
+
+int steam_lan_get_notice(char *out, size_t cap, int *kind)
+{
+    int found = 0;
+    re5_mutex_lock(&g_mu);
+    uint32_t now = get_ticks_ms();
+    for (int i = g_notice_n - 1; i >= 0; i--) {
+        if (now - g_notices[i].at < NOTICE_LIFE_MS) {
+            snprintf(out, cap, "%s", g_notices[i].text);
+            if (kind) *kind = g_notices[i].kind;
+            found = 1;
+            break;
+        }
+    }
+    re5_mutex_unlock(&g_mu);
+    return found;
 }
 
 static void push_event(re5_lan_event_type type, uint64_t call_id, uint64_t lobby_id, uint64_t user_id, uint32_t p1, uint32_t p2)
@@ -364,6 +454,8 @@ static void peer_update(uint64_t steam_id, const char *name, const struct sockad
         p->p2p_session_requested = 0;
         p->rtt_ms = -1;
         p->ka_their_t = 0;
+        p->nonce = 0;
+        p->rel = NULL;
     }
 }
 
@@ -382,13 +474,72 @@ static lan_peer *peer_find(uint64_t steam_id)
     return NULL;
 }
 
+/* Servidor de retransmissao (RE5_LAN_SERVER=IP:PORTA ou "servidor=" no re5_lan.ini). Um par alcancavel
+ * so por ele tem o endereco do servidor e o ID dele escondido no sin_zero (8 bytes que o sockaddr_in
+ * carrega e o sendto ignora): send_raw_udp embrulha em RELAY, e o parse_packet desembrulha. */
+static struct sockaddr_in g_srv;
+static int                g_have_srv;
+static int                g_relay_only;
+static uint32_t           g_srv_ack_ms;
+static int                g_srv_up;
+static char               g_srv_text[96];
+static char               g_srv_file[96];
+#define RE5_LAN_SERVER_PORT 27040
+
+/* Enlace Bluetooth (re5/bt_link.h): um unico par, alcancado por um endereco-marcador (127.255.255.254:1)
+ * com o ID dele no sin_zero, como o servidor. send_raw_udp entrega o quadro ao enlace. */
+static struct sockaddr_in g_link;
+static int                g_have_bt;
+static char               g_bt_text[96];
+static char               g_bt_file[96];
+
+static uint64_t relay_id_of(const struct sockaddr_in *a)
+{
+    uint64_t v;
+    memcpy(&v, a->sin_zero, 8);
+    return v;
+}
+
+static void relay_id_set(struct sockaddr_in *a, uint64_t id)
+{
+    memcpy(a->sin_zero, &id, 8);
+}
+
+/* Porta do par no pacote: so vale em endereco direto (via servidor o endereco e sempre o do servidor). */
+static void addr_set_port(struct sockaddr_in *a, uint16_t port)
+{
+    if (!relay_id_of(a)) a->sin_port = htons(port);
+}
+
+static void send_relay(hsock_t sock, uint64_t dest_id, const void *data, size_t len)
+{
+    uint8_t buf[RE5_LAN_MAX_PACKET_SIZE + 64];
+    if (!g_have_srv || len > RE5_LAN_MAX_PACKET_SIZE) return;
+    fill_hdr((lan_hdr *)buf, PKT_RELAY);
+    memcpy(buf + sizeof(lan_hdr), &dest_id, 8);
+    memcpy(buf + sizeof(lan_hdr) + 8, data, len);
+    sendto(sock, (const char *)buf, (int)(sizeof(lan_hdr) + 8 + len), 0, (const struct sockaddr *)&g_srv, sizeof g_srv);
+}
+
 static void send_raw_udp(hsock_t sock, const struct sockaddr_in *dest, const void *data, size_t len)
 {
+    if (g_have_bt && dest->sin_addr.s_addr == g_link.sin_addr.s_addr && dest->sin_port == g_link.sin_port) {
+        re5_bt_send(data, len);
+        return;
+    }
+    uint64_t rid = g_have_srv ? relay_id_of(dest) : 0;
+    if (rid && dest->sin_addr.s_addr == g_srv.sin_addr.s_addr && dest->sin_port == g_srv.sin_port) {
+        send_relay(sock, rid, data, len);
+        return;
+    }
     sendto(sock, (const char *)data, (int)len, 0, (const struct sockaddr *)dest, sizeof *dest);
 }
 
 static void send_broadcast(const void *data, size_t len)
 {
+    if (g_have_srv) send_relay(g_p2p_sock, 0, data, len);   /* beacon/PING para o servidor guardar e responder */
+    if (g_have_bt) re5_bt_send(data, len);                  /* e para o outro aparelho, pelo Bluetooth */
+    if (g_relay_only) return;
     struct sockaddr_in bcast;
     memset(&bcast, 0, sizeof bcast);
     bcast.sin_family = AF_INET;
@@ -474,7 +625,7 @@ static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, 
     const lan_beacon_body *b = (const lan_beacon_body *)payload;
 
     struct sockaddr_in peer_p2p = *from;
-    peer_p2p.sin_port = htons(h->port);
+    addr_set_port(&peer_p2p, h->port);
     char owner_name[RE5_LAN_MAX_NAME_LEN + 1], raw[sizeof b->owner_name + 1];
     memcpy(raw, b->owner_name, sizeof b->owner_name);
     raw[sizeof b->owner_name] = 0;
@@ -502,6 +653,7 @@ static void handle_beacon(const lan_hdr *h, const uint8_t *payload, size_t len, 
     snprintf(lb->owner_name, sizeof lb->owner_name, "%s", owner_name);
     lb->host_port = h->port;
     lb->host_ip = from->sin_addr;
+    lb->relay_id = relay_id_of(from);
     lb->member_count = b->member_count;
     lb->max_members = b->max_members;
     lb->members[0] = b->owner_id;
@@ -533,7 +685,7 @@ static void handle_ping(const lan_hdr *h, const struct sockaddr_in *from)
             send_raw_udp(g_p2p_sock, from, buf, len);
             if (h->port) {
                 struct sockaddr_in to_p2p = *from;
-                to_p2p.sin_port = htons(h->port);
+                addr_set_port(&to_p2p, h->port);
                 send_raw_udp(g_p2p_sock, &to_p2p, buf, len);
             }
         }
@@ -584,13 +736,23 @@ static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len
     sanitize_name(raw, name, sizeof name);
 
     struct sockaddr_in client_addr = *from;
-    client_addr.sin_port = htons(h->port);
+    addr_set_port(&client_addr, h->port);
+    int first_contact = peer_find(h->sender_steam_id) == NULL ||
+                        member_index(&g_active_lobby, h->sender_steam_id) < 0;
     peer_update(h->sender_steam_id, name, &client_addr);
     char cc[3] = {req->client_country[0], req->client_country[1], 0};
     peer_set_country(h->sender_steam_id, cc);
 
     uint32_t resp_code = ENTER_SUCCESS;
     int is_new = 0;
+    static uint64_t s_last_req_id;
+    static uint32_t s_last_req_at;
+    if (g_auto_accept && g_has_active_lobby && g_active_lobby.owner_id == g_local_steam_id && first_contact &&
+        (s_last_req_id != h->sender_steam_id || get_ticks_ms() - s_last_req_at > 4000u)) {
+        notice_push(1, "%s #%u quer entrar na sua sessao", name, (uint32_t)h->sender_steam_id);
+        s_last_req_id = h->sender_steam_id;
+        s_last_req_at = get_ticks_ms();
+    }
     if (!g_has_active_lobby || g_active_lobby.lobby_id != req->lobby_id || g_active_lobby.owner_id != g_local_steam_id) {
         resp_code = ENTER_DOESNT_EXIST;
     } else if (member_index(&g_active_lobby, h->sender_steam_id) >= 0) {
@@ -599,7 +761,28 @@ static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len
         resp_code = ENTER_NOT_ALLOWED;
     } else if (g_active_lobby.member_count >= g_active_lobby.max_members) {
         resp_code = ENTER_FULL;
+    } else if (!g_auto_accept && !(g_pend.active && g_pend.id == h->sender_steam_id && g_pend.decision == 1)) {
+        uint32_t now_ms = get_ticks_ms();
+        if (g_pend.active && g_pend.id != h->sender_steam_id) {
+            resp_code = ENTER_NOT_ALLOWED;   /* ja ha outro pedido esperando resposta */
+        } else if (g_pend.active && g_pend.decision < 0) {
+            resp_code = ENTER_NOT_ALLOWED;
+            g_pend.active = 0;
+        } else {
+            if (!g_pend.active) {
+                memset(&g_pend, 0, sizeof g_pend);
+                g_pend.active = 1;
+                g_pend.id = h->sender_steam_id;
+                snprintf(g_pend.name, sizeof g_pend.name, "%s", name);
+                g_pend.started = now_ms;
+                RE5_INFO("steam_lan", "'%s #%u' pede para entrar: aguardando o host aceitar (F10) ou recusar (F11)", name,
+                         (uint32_t)h->sender_steam_id);
+            }
+            g_pend.last_req = now_ms;
+            resp_code = ENTER_PENDING;
+        }
     } else {
+        g_pend.active = 0;
         int idx = g_active_lobby.member_count++;
         g_active_lobby.members[idx] = h->sender_steam_id;
         snprintf(g_active_lobby.member_names[idx], sizeof g_active_lobby.member_names[idx], "%s", name);
@@ -615,7 +798,10 @@ static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len
     rb->member_count = g_has_active_lobby ? g_active_lobby.member_count : 0;
     send_raw_udp(g_p2p_sock, &client_addr, resp_buf, sizeof resp_buf);
 
+    if (resp_code == ENTER_PENDING) return;   /* o aviso do pedido ja esta na tela (prompt do host) */
     if (resp_code != ENTER_SUCCESS) {
+        notice_push(3, "%s #%u foi recusado (%s)", name, (uint32_t)h->sender_steam_id,
+                    resp_code == ENTER_FULL ? "sala cheia" : "sala fechada");
         RE5_INFO("steam_lan", "Pedido de entrada de '%s #%u' recusado (codigo %u)", name, (uint32_t)h->sender_steam_id,
                  resp_code);
         return;
@@ -638,6 +824,8 @@ static void handle_join_req(const lan_hdr *h, const uint8_t *payload, size_t len
         p->p2p_session_requested = 1;
         push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
     }
+    notice_push(2, "%s #%u entrou na sua sessao (%u/%u)", name, (uint32_t)h->sender_steam_id,
+                g_active_lobby.member_count, g_active_lobby.max_members);
     RE5_INFO("steam_lan", "Jogador '%s #%u' entrou no lobby (%u/%u)", name, (uint32_t)h->sender_steam_id,
              g_active_lobby.member_count, g_active_lobby.max_members);
 }
@@ -650,6 +838,16 @@ static void handle_join_resp(const lan_hdr *h, const uint8_t *payload, size_t le
 
     /* Respostas repetidas (um por pedido reenviado) depois da primeira: ignora. */
     if (!g_join.active || g_join.lobby_id != resp->lobby_id || h->sender_steam_id != g_active_lobby.owner_id) return;
+    if (resp->response_code == ENTER_PENDING) {
+        static uint32_t s_pending_note;
+        uint32_t now_ms = get_ticks_ms();
+        g_join.deadline_ms = now_ms + JOIN_PENDING_MS;   /* o host esta decidindo: espera */
+        if (now_ms - s_pending_note > 10000u) {
+            s_pending_note = now_ms;
+            notice_push(1, "Aguardando o host aceitar a sua entrada...");
+        }
+        return;
+    }
     g_join.active = 0;
 
     if (resp->response_code == ENTER_SUCCESS) {
@@ -667,12 +865,14 @@ static void handle_join_resp(const lan_hdr *h, const uint8_t *payload, size_t le
             p->p2p_session_requested = 1;
             push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
         }
+        notice_push(2, "Entrou na sessao de %s #%u", g_active_lobby.owner_name, (uint32_t)g_active_lobby.owner_id);
         RE5_INFO("steam_lan", "Conectado ao lobby de '%s #%u'", g_active_lobby.owner_name,
                  (uint32_t)g_active_lobby.owner_id);
     } else {
         push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join.call_id, g_active_lobby.lobby_id, g_local_steam_id,
                    resp->response_code, 0);
         g_has_active_lobby = 0;
+        notice_push(3, "O host recusou a entrada (%s)", resp->response_code == ENTER_FULL ? "sala cheia" : "sala fechada");
         RE5_INFO("steam_lan", "Host recusou a entrada no lobby: codigo %u", resp->response_code);
     }
 }
@@ -686,6 +886,7 @@ static void join_tick(uint32_t now)
         g_join.active = 0;
         g_has_active_lobby = 0;
         push_event(RE5_LAN_EVT_LOBBY_ENTERED, g_join.call_id, g_join.lobby_id, g_local_steam_id, ENTER_ERROR, 0);
+        notice_push(3, "O host nao respondeu (firewall do host?)");
         RE5_WARN("steam_lan", "O host %s:%u nao respondeu ao pedido de entrada em %u ms "
                  "(firewall bloqueando UDP de entrada no host?)",
                  inet_ntoa(g_join.host.sin_addr), ntohs(g_join.host.sin_port), JOIN_TIMEOUT_MS);
@@ -778,6 +979,74 @@ static void handle_data_update(const lan_hdr *h, const uint8_t *payload, size_t 
     }
 }
 
+static lan_rel *rel_of(lan_peer *p)
+{
+    if (!p->rel) p->rel = calloc(1, sizeof *p->rel);
+    return p->rel;
+}
+
+static void rel_reset(lan_peer *p)
+{
+    if (p->rel) memset(p->rel, 0, sizeof *p->rel);
+}
+
+/* Fila de leitura do jogo. Nao confiavel: no maximo UNREL_DEPTH por canal (o mais velho cai). */
+static void p2p_enqueue(uint64_t from_id, uint16_t ch, const uint8_t *d, uint32_t len, int reliable)
+{
+    lan_p2p_msg *msg = malloc(sizeof(lan_p2p_msg));
+    if (!msg) return;
+    msg->remote_id = from_id;
+    msg->channel = ch;
+    msg->reliable = reliable;
+    msg->len = len;
+    memcpy(msg->data, d, len);
+    msg->next = NULL;
+    if (!reliable) {
+        for (;;) {
+            int n = 0;
+            lan_p2p_msg **oldest = NULL;
+            for (lan_p2p_msg **q = &g_p2p_queue; *q; q = &(*q)->next)
+                if (!(*q)->reliable && (*q)->channel == ch) {
+                    if (!oldest) oldest = q;
+                    n++;
+                }
+            if (n < UNREL_DEPTH || !oldest) break;
+            lan_p2p_msg *old = *oldest;
+            *oldest = old->next;
+            free(old);
+            g_st_qdrop++;
+        }
+    }
+    lan_p2p_msg **q = &g_p2p_queue;
+    while (*q) q = &(*q)->next;
+    *q = msg;
+}
+
+static void send_p2p_ack(const lan_peer *p, uint32_t next)
+{
+    uint8_t buf[sizeof(lan_hdr) + 4];
+    fill_hdr((lan_hdr *)buf, PKT_P2P_ACK);
+    memcpy(buf + sizeof(lan_hdr), &next, 4);
+    send_raw_udp(g_p2p_sock, &p->addr, buf, sizeof buf);
+}
+
+static void handle_p2p_ack(const lan_hdr *h, const uint8_t *payload, size_t len)
+{
+    if (len < 4) return;
+    lan_peer *p = peer_find(h->sender_steam_id);
+    if (!p || !p->rel) return;
+    uint32_t next;
+    memcpy(&next, payload, 4);
+    lan_rel *r = p->rel;
+    int k = 0;
+    for (int i = 0; i < r->n_out; i++)
+        if ((int32_t)(r->out[i].seq - next) >= 0) {
+            if (k != i) r->out[k] = r->out[i];
+            k++;
+        }
+    r->n_out = k;
+}
+
 static void handle_p2p_data(const lan_hdr *h, const uint8_t *payload, size_t len, const struct sockaddr_in *from)
 {
     peer_update(h->sender_steam_id, NULL, from);
@@ -786,35 +1055,125 @@ static void handle_p2p_data(const lan_hdr *h, const uint8_t *payload, size_t len
         p->p2p_session_requested = 1;
         push_event(RE5_LAN_EVT_P2P_SESSION_REQUEST, 0, 0, h->sender_steam_id, 0, 0);
     }
-
-    if (len < sizeof(lan_p2p_hdr)) return;
+    if (!p || len < sizeof(lan_p2p_hdr)) return;
 
     const lan_p2p_hdr *ph = (const lan_p2p_hdr *)payload;
-    if (len < sizeof(lan_p2p_hdr) + ph->payload_len) return;
-    if (ph->payload_len > RE5_LAN_MAX_PACKET_SIZE) return;
+    if (ph->payload_len > RE5_LAN_MAX_PACKET_SIZE || len < sizeof(lan_p2p_hdr) + ph->payload_len) return;
+    const uint8_t *data = payload + sizeof(lan_p2p_hdr);
+    g_st_rx++;
+    g_st_rxb += (uint32_t)len;
 
-    lan_p2p_msg *msg = malloc(sizeof(lan_p2p_msg));
-    if (!msg) return;
-    msg->remote_id = h->sender_steam_id;
-    msg->channel = ph->channel;
-    msg->len = ph->payload_len;
-    memcpy(msg->data, payload + sizeof(lan_p2p_hdr), ph->payload_len);
-    msg->next = NULL;
+    lan_rel *r = rel_of(p);
+    if (!r) return;
+    if (ph->send_type < 2) {
+        /* Nao confiavel: o que chega atrasado ou fora de ordem e descartado; entregar um
+         * estado velho depois de um novo faz o personagem voltar atras. */
+        if (r->have_unrel && (int32_t)(ph->seq - r->unrel_last) <= 0) {
+            g_st_stale++;
+            return;
+        }
+        r->have_unrel = 1;
+        r->unrel_last = ph->seq;
+        p2p_enqueue(h->sender_steam_id, ph->channel, data, ph->payload_len, 0);
+        return;
+    }
 
-    int qcount = 0;
-    lan_p2p_msg **q = &g_p2p_queue;
-    while (*q) {
-        qcount++;
-        q = &(*q)->next;
+    if (r->rx_next == 0) r->rx_next = 1;
+    uint32_t d = ph->seq - r->rx_next;
+    if ((int32_t)d < 0) {
+        /* repetido (o ACK se perdeu): so confirma de novo */
+    } else if (d == 0) {
+        p2p_enqueue(h->sender_steam_id, ph->channel, data, ph->payload_len, 1);
+        r->rx_next++;
+        for (;;) {   /* solta o que estava esperando fora de ordem */
+            rel_in *b = &r->in[r->rx_next % REL_WIN];
+            if (!b->used) break;
+            p2p_enqueue(h->sender_steam_id, b->channel, b->data, b->len, 1);
+            b->used = 0;
+            r->rx_next++;
+        }
+    } else if (d < REL_WIN) {
+        rel_in *b = &r->in[ph->seq % REL_WIN];
+        if (!b->used) {
+            b->used = 1;
+            b->channel = ph->channel;
+            b->len = (uint16_t)ph->payload_len;
+            memcpy(b->data, data, ph->payload_len);
+        }
     }
-    if (qcount >= 256) {
-        lan_p2p_msg *old = g_p2p_queue;
-        g_p2p_queue = old->next;
-        free(old);
-        q = &g_p2p_queue;
-        while (*q) q = &(*q)->next;
+    send_p2p_ack(p, r->rx_next);
+}
+
+/* Reenvia o que o par ainda nao confirmou. */
+static void rel_tick(uint32_t now)
+{
+    for (int i = 0; i < g_num_peers; i++) {
+        lan_rel *r = g_peers[i].rel;
+        if (!r || !r->n_out) continue;
+        uint32_t rto = g_peers[i].rtt_ms > 0 ? (uint32_t)g_peers[i].rtt_ms * 2u + 20u : 120u;
+        if (rto < 50u) rto = 50u;
+        if (rto > 500u) rto = 500u;
+        for (int k = 0; k < r->n_out; k++) {
+            if (now - r->out[k].sent_ms < rto) continue;
+            send_raw_udp(g_p2p_sock, &g_peers[i].addr, r->out[k].pkt, r->out[k].len);
+            r->out[k].sent_ms = now;
+            g_st_retx++;
+        }
     }
-    *q = msg;
+}
+
+/* Uma linha no log a cada 5 s em co-op: e o que se olha quando o jogo "laga". */
+static void stats_tick(uint32_t now)
+{
+    if (now - g_st_at < 5000u) return;
+    int coop = g_has_active_lobby && g_active_lobby.member_count >= 2;
+    if (coop && g_st_at) {
+        int qn = 0;
+        for (lan_p2p_msg *m = g_p2p_queue; m; m = m->next) qn++;
+        uint32_t dt = (now - g_st_at) / 1000u;
+        if (!dt) dt = 1;
+        int32_t rtt = -1;
+        for (int i = 0; i < g_num_peers; i++)
+            if (g_peers[i].rtt_ms >= 0 && member_index(&g_active_lobby, g_peers[i].steam_id) >= 0) rtt = g_peers[i].rtt_ms;
+        RE5_INFO("steam_lan", "P2P: enviados %u pkt/s (%u B/s), recebidos %u pkt/s (%u B/s), reenvios %u, velhos %u, "
+                 "descartes de fila %u, fila %d, ping %d ms",
+                 g_st_tx / dt, g_st_txb / dt, g_st_rx / dt, g_st_rxb / dt, g_st_retx, g_st_stale, g_st_qdrop, qn, (int)rtt);
+    }
+    g_st_tx = g_st_txb = g_st_rx = g_st_rxb = g_st_retx = g_st_stale = g_st_qdrop = 0;
+    g_st_at = now;
+}
+
+/* Pedido de entrada esperando o host: 1 e preenche o nome. */
+int steam_lan_get_pending(char *name, size_t cap, uint64_t *id)
+{
+    re5_mutex_lock(&g_mu);
+    int r = g_pend.active && g_pend.decision == 0;
+    if (r) {
+        if (name && cap) snprintf(name, cap, "%s #%u", g_pend.name, (uint32_t)g_pend.id);
+        if (id) *id = g_pend.id;
+    }
+    re5_mutex_unlock(&g_mu);
+    return r;
+}
+
+void steam_lan_answer_pending(int accept)
+{
+    re5_mutex_lock(&g_mu);
+    if (g_pend.active && g_pend.decision == 0) {
+        g_pend.decision = accept ? 1 : -1;
+        g_pend.last_req = get_ticks_ms();   /* da tempo ao proximo reenvio do cliente */
+        RE5_INFO("steam_lan", "Host %s o pedido de '%s #%u'", accept ? "aceitou" : "recusou", g_pend.name,
+                 (uint32_t)g_pend.id);
+    }
+    re5_mutex_unlock(&g_mu);
+}
+
+int steam_lan_coop_active(void)
+{
+    re5_mutex_lock(&g_mu);
+    int r = g_has_active_lobby && g_active_lobby.member_count >= 2 && !g_join.active;
+    re5_mutex_unlock(&g_mu);
+    return r;
 }
 
 /* Um membro da sala mudou de nome ou país no menu LAN. */
@@ -847,7 +1206,7 @@ static void handle_keepalive(const lan_hdr *h, const uint8_t *payload, size_t le
     if (!g_has_active_lobby || g_active_lobby.lobby_id != ka->lobby_id) return;
     if (member_index(&g_active_lobby, h->sender_steam_id) < 0) return;
     struct sockaddr_in addr = *from;
-    addr.sin_port = htons(h->port);
+    addr_set_port(&addr, h->port);
     peer_update(h->sender_steam_id, NULL, &addr);   /* também segue o parceiro que trocou de IP (DHCP do Wi-Fi) */
     lan_peer *p = peer_find(h->sender_steam_id);
     if (!p) return;
@@ -911,7 +1270,27 @@ static void check_member_timeouts(uint32_t now)
 }
 
 /* Interfaces IPv4 ativas: o IP para mostrar ao jogador e o broadcast de cada rede. */
+static void refresh_interfaces_impl(void);
+
+/* Registra no log quando o IP ou os broadcasts mudam (DHCP, Wi-Fi novo): é o primeiro
+ * lugar a olhar quando um aparelho nao enxerga o outro. */
 static void refresh_interfaces(void)
+{
+    char old_ip[16];
+    int old_n = g_n_iface;
+    snprintf(old_ip, sizeof old_ip, "%s", g_local_ip);
+    refresh_interfaces_impl();
+    if (old_n != g_n_iface || strcmp(old_ip, g_local_ip) != 0) {
+        char list[160] = "";
+        for (int i = 0; i < g_n_iface; i++) {
+            size_t n = strlen(list);
+            snprintf(list + n, sizeof list - n, "%s%s", i ? ", " : "", inet_ntoa(g_iface_bcast[i]));
+        }
+        RE5_INFO("steam_lan", "Rede: IP %s, broadcast em [%s]", g_local_ip, list);
+    }
+}
+
+static void refresh_interfaces_impl(void)
 {
     g_n_iface = 0;
     snprintf(g_local_ip, sizeof g_local_ip, "?");
@@ -928,29 +1307,96 @@ static void refresh_interfaces(void)
     }
     freeifaddrs(ifs);
 #else
-    /* Sem getifaddrs: o IP que a rota padrão usaria (connect UDP não envia nada). */
-    hsock_t t = socket(AF_INET, SOCK_DGRAM, 0);
-    if (t == HBAD_SOCK) return;
-    struct sockaddr_in probe;
-    memset(&probe, 0, sizeof probe);
-    probe.sin_family = AF_INET;
-    probe.sin_port = htons(9);
-    probe.sin_addr.s_addr = inet_addr("192.0.2.1");
-    int len = sizeof probe;
-    if (connect(t, (struct sockaddr *)&probe, sizeof probe) == 0 && getsockname(t, (struct sockaddr *)&probe, &len) == 0)
-        snprintf(g_local_ip, sizeof g_local_ip, "%s", inet_ntoa(probe.sin_addr));
-    sock_close(t);
+    /* Windows: broadcast dirigido de cada adaptador ativo (Ethernet, Wi-Fi, hotspot).
+     * O 255.255.255.255 sai só pelo adaptador de menor métrica, que com VPN, Hyper-V,
+     * WSL ou VirtualBox costuma ser um virtual: a LAN real nunca via o beacon. */
+    ULONG sz = 0;
+    GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, NULL, &sz);
+    IP_ADAPTER_ADDRESSES *aa = sz ? (IP_ADAPTER_ADDRESSES *)malloc(sz) : NULL;
+    if (aa && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                   NULL, aa, &sz) == NO_ERROR) {
+        int have_gw = 0;
+        for (IP_ADAPTER_ADDRESSES *a = aa; a; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
+                if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+                struct in_addr ip = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr;
+                uint32_t hip = ntohl(ip.s_addr);
+                if ((hip >> 16) == 0xA9FE) continue;                    /* 169.254/16: sem DHCP */
+                ULONG plen = u->OnLinkPrefixLength;
+                if (plen == 0 || plen > 30) plen = 24;
+                uint32_t mask = plen ? (0xFFFFFFFFu << (32 - plen)) : 0;
+                struct in_addr b;
+                b.s_addr = htonl((hip & mask) | ~mask);
+                /* IP mostrado: o do adaptador com gateway (o da rede real) vence os virtuais. */
+                int gw = a->FirstGatewayAddress != NULL;
+                if (strcmp(g_local_ip, "?") == 0 || (gw && !have_gw)) {
+                    snprintf(g_local_ip, sizeof g_local_ip, "%s", inet_ntoa(ip));
+                    if (gw) have_gw = 1;
+                }
+                if (g_n_iface < MAX_IFACES) g_iface_bcast[g_n_iface++] = b;
+            }
+        }
+    }
+    free(aa);
+    if (strcmp(g_local_ip, "?") == 0) {
+        hsock_t t = socket(AF_INET, SOCK_DGRAM, 0);
+        if (t == HBAD_SOCK) return;
+        struct sockaddr_in probe;
+        memset(&probe, 0, sizeof probe);
+        probe.sin_family = AF_INET;
+        probe.sin_port = htons(9);
+        probe.sin_addr.s_addr = inet_addr("192.0.2.1");
+        int len = sizeof probe;
+        if (connect(t, (struct sockaddr *)&probe, sizeof probe) == 0 && getsockname(t, (struct sockaddr *)&probe, &len) == 0)
+            snprintf(g_local_ip, sizeof g_local_ip, "%s", inet_ntoa(probe.sin_addr));
+        sock_close(t);
+    }
 #endif
 }
 
+static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_in *from);
 static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_in *from)
 {
     if (len < sizeof(lan_hdr)) return;
     const lan_hdr *h = (const lan_hdr *)buf;
     if (h->magic != RE5_LAN_MAGIC) return;
+    if (h->type == PKT_SRV_ACK) {
+        g_srv_ack_ms = get_ticks_ms();
+        if (!g_srv_up) {
+            g_srv_up = 1;
+            RE5_INFO("steam_lan", "Servidor %s conectado", g_srv_text);
+            notice_push(2, "Servidor %s conectado", g_srv_text);
+        }
+        return;
+    }
+    if (h->type == PKT_RELAY) {   /* veio pelo servidor: abre e trata o pacote interno como se fosse do par */
+        if (len < sizeof(lan_hdr) + 8 + sizeof(lan_hdr)) return;
+        uint64_t dest;
+        memcpy(&dest, buf + sizeof(lan_hdr), 8);
+        if (dest && dest != g_local_steam_id) return;
+        const uint8_t *in = buf + sizeof(lan_hdr) + 8;
+        const lan_hdr *ih = (const lan_hdr *)in;
+        if (ih->magic != RE5_LAN_MAGIC || ih->type == PKT_RELAY) return;
+        struct sockaddr_in via = *from;
+        relay_id_set(&via, ih->sender_steam_id);
+        parse_packet(in, len - sizeof(lan_hdr) - 8, &via);
+        return;
+    }
     if (h->sender_steam_id == g_local_steam_id) {
         /* Mesmo nonce: eco do nosso broadcast. Outro nonce: outro jogador com o
          * nosso ID, e os dois se confundiriam em tudo (sala, P2P). */
+        if (h->nonce != g_nonce && !g_has_active_lobby && !g_join.active) {
+            /* Ninguem ainda depende do nosso ID (sem sala, sem entrada): troca por um novo.
+             * Caso tipico: a pasta do jogo (com re5_lan.ini) copiada para outro PC. */
+            uint32_t old = (uint32_t)g_local_steam_id;
+            g_file_id = RE5_LAN_ID_MIN + lan_random() % RE5_LAN_ID_SPAN;
+            g_local_steam_id = ((uint64_t)RE5_LAN_STEAMID_USER_HI << 32) | g_file_id;
+            if (g_identity_path[0]) write_identity(g_identity_path);
+            RE5_WARN("steam_lan", "ID #%u repetido por outro jogador em %s: novo ID #%u", old,
+                     inet_ntoa(from->sin_addr), g_file_id);
+            return;
+        }
         if (h->nonce != g_nonce && !g_id_clash_warned) {
             g_id_clash_warned = 1;
             RE5_WARN("steam_lan", "Outro jogador em %s usa o mesmo ID #%u: apague o arquivo de identidade "
@@ -963,7 +1409,11 @@ static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_i
     const uint8_t *payload = buf + sizeof(lan_hdr);
     size_t payload_len = len - sizeof(lan_hdr);
     lan_peer *known = peer_find(h->sender_steam_id);
-    if (known) known->last_seen_ms = get_ticks_ms();
+    if (known) {
+        known->last_seen_ms = get_ticks_ms();
+        if (known->nonce && known->nonce != h->nonce) rel_reset(known);   /* o par reiniciou */
+        known->nonce = h->nonce;
+    }
 
     switch (h->type) {
     case PKT_BEACON:
@@ -993,6 +1443,9 @@ static void parse_packet(const uint8_t *buf, size_t len, const struct sockaddr_i
     case PKT_P2P_DATA:
         handle_p2p_data(h, payload, payload_len, from);
         break;
+    case PKT_P2P_ACK:
+        handle_p2p_ack(h, payload, payload_len);
+        break;
     default:
         break;
     }
@@ -1002,7 +1455,15 @@ static void check_pending_search(void)
 {
     if (g_pending_search_call == 0) return;
     uint32_t now = get_ticks_ms();
-    if (now < g_pending_search_expire) return;
+    if (now < g_pending_search_expire) {
+        if ((int32_t)(now - g_search_next_ping) >= 0) {
+            lan_hdr ping;
+            fill_hdr(&ping, PKT_PING);
+            send_broadcast(&ping, sizeof ping);
+            g_search_next_ping = now + 300u;
+        }
+        return;
+    }
 
     /* Remove lobbies inativos (sem beacon ha mais de 5 segundos) */
     int active = 0;
@@ -1063,6 +1524,21 @@ static void poll_sockets_once(void)
         parse_packet(buf, (size_t)n, &from);
         re5_mutex_unlock(&g_mu);
     }
+
+    /* Quadros do enlace Bluetooth: tratados como pacotes do par (endereco-marcador + ID no sin_zero). */
+    if (g_have_bt) {
+        uint8_t fb[RE5_BT_MAX_FRAME];
+        size_t bn;
+        while ((bn = re5_bt_recv(fb, sizeof fb)) >= sizeof(lan_hdr)) {
+            const lan_hdr *ih = (const lan_hdr *)fb;
+            if (ih->magic != RE5_LAN_MAGIC || ih->type == PKT_RELAY) continue;
+            struct sockaddr_in via = g_link;
+            relay_id_set(&via, ih->sender_steam_id);
+            re5_mutex_lock(&g_mu);
+            parse_packet(fb, bn, &via);
+            re5_mutex_unlock(&g_mu);
+        }
+    }
 }
 
 static void lan_worker(void *arg)
@@ -1085,9 +1561,34 @@ static void lan_worker(void *arg)
         if (now - last_beacon_ms >= KEEPALIVE_MS) {
             broadcast_beacon();
             send_keepalives(now);
+            if (g_have_srv) {
+                lan_hdr hello;
+                fill_hdr(&hello, PKT_SRV_HELLO);
+                sendto(g_p2p_sock, (const char *)&hello, (int)sizeof hello, 0, (const struct sockaddr *)&g_srv, sizeof g_srv);
+                if (g_srv_up && now - g_srv_ack_ms > 5000u) {
+                    g_srv_up = 0;
+                    RE5_WARN("steam_lan", "Servidor %s sem resposta", g_srv_text);
+                    notice_push(3, "Servidor sem resposta");
+                }
+            }
             last_beacon_ms = now;
         }
         check_member_timeouts(now);
+        rel_tick(now);
+        stats_tick(now);
+        if (g_have_bt) {
+            static int bt_was;
+            int up = re5_bt_connected();
+            if (up != bt_was) {
+                bt_was = up;
+                notice_push(up ? 2 : 3, up ? "Bluetooth conectado" : "Bluetooth desconectado");
+            }
+        }
+        if (g_pend.active && g_pend.decision == 0 &&
+            (now - g_pend.last_req > PEND_QUIET_MS || now - g_pend.started > PEND_MAX_MS)) {
+            RE5_INFO("steam_lan", "Pedido de '%s #%u' expirou sem resposta", g_pend.name, (uint32_t)g_pend.id);
+            g_pend.active = 0;
+        }
         re5_mutex_unlock(&g_mu);
 
         re5_host_sleep_ms(5);
@@ -1146,6 +1647,17 @@ static void sanitize_name(const char *in, char *out, size_t cap)
     }
     while (n && out[n - 1] == ' ') n--;
     out[n] = 0;
+}
+
+/* Chave da máquina: o arquivo de identidade copiado junto com a pasta do jogo para
+ * outro PC traria o mesmo ID, e os dois jogadores ignorariam um ao outro. */
+static uint32_t machine_key(void)
+{
+    char h[256] = "";
+    gethostname(h, sizeof h - 1);
+    uint32_t k = 0x811C9DC5u;
+    for (const char *c = h; *c; c++) k = (k ^ (unsigned char)tolower((unsigned char)*c)) * 16777619u;
+    return mix32(k) | 1u;
 }
 
 static int identity_path(char *out, size_t cap)
@@ -1227,6 +1739,14 @@ static int read_identity(const char *path, uint32_t *id, char *name, size_t cap,
             sanitize_name(val, name, cap);
         } else if (strcmp(key, "pais") == 0 || strcmp(key, "country") == 0) {
             sanitize_country(val, country);
+        } else if (strcmp(key, "servidor") == 0 || strcmp(key, "server") == 0) {
+            snprintf(g_srv_file, sizeof g_srv_file, "%s", val);
+            for (char *e = g_srv_file + strlen(g_srv_file); e > g_srv_file && isspace((unsigned char)e[-1]); e--) e[-1] = 0;
+        } else if (strcmp(key, "bluetooth") == 0) {
+            snprintf(g_bt_file, sizeof g_bt_file, "%s", val);
+            for (char *e = g_bt_file + strlen(g_bt_file); e > g_bt_file && isspace((unsigned char)e[-1]); e--) e[-1] = 0;
+        } else if (strcmp(key, "maq") == 0) {
+            g_file_maq = (uint32_t)strtoul(val, NULL, 16);
         } else if (strcmp(key, "hosts") == 0) {
             snprintf(hosts, hosts_cap, "%s", val);
             for (char *e = hosts + strlen(hosts); e > hosts && isspace((unsigned char)e[-1]); e--) e[-1] = 0;
@@ -1258,14 +1778,19 @@ static void write_identity(const char *path)
                "# Tambem editavel %s.\n"
                "# nome:  o que os outros jogadores veem (ate %d caracteres, sem '#').\n"
                "# pais:  codigo de duas letras da bandeira (BR, PT, US...).\n"
+               "# bluetooth: \"host\" (espera o outro) ou o nome/MAC do aparelho pareado (conecta); vazio = desligado.\n"
+               "# servidor: IP:PORTA de um re5_server (retransmissao; vazio = so a rede local).\n"
                "# hosts: IPs de hosts para procurar direto, separados por virgula (rede sem broadcast).\n"
                "# id:    seu codigo unico na rede; nao copie este arquivo para outro aparelho.\n"
                "#        Apague a linha para gerar um novo.\n"
                "nome=%s\n"
                "pais=%s\n"
                "hosts=%s\n"
-               "id=%u\n",
-            LAN_EDIT_WHERE, RE5_LAN_MAX_NAME_LEN, g_local_name, g_local_country, hosts, g_file_id);
+               "servidor=%s\n"
+               "bluetooth=%s\n"
+               "id=%u\n"
+               "maq=%08x\n",
+            LAN_EDIT_WHERE, RE5_LAN_MAX_NAME_LEN, g_local_name, g_local_country, hosts, g_srv_file, g_bt_file, g_file_id, machine_key());
     fclose(f);
 }
 
@@ -1303,6 +1828,12 @@ static void load_identity(uint16_t base_p2p)
     int have_path = identity_path(g_identity_path, sizeof g_identity_path) == 0;
     if (!have_path) g_identity_path[0] = 0;
     int read_ok = have_path && read_identity(g_identity_path, &id, name, sizeof name, country, hosts, sizeof hosts);
+    /* Arquivo sem "maq" (versao antiga): fica como esta; o aviso de ID repetido em
+     * tempo de execucao cobre o caso de ele ter sido copiado de outro PC. */
+    if (read_ok && id && g_file_maq && g_file_maq != machine_key()) {
+        RE5_INFO("steam_lan", "Arquivo de identidade veio de outra maquina: gerando ID novo");
+        id = 0;   /* o nome e o pais ficam, o ID muda */
+    }
     int need_write = have_path && (!read_ok || !id || !name[0] || !country[0]);
     if (!id) id = RE5_LAN_ID_MIN + lan_random() % RE5_LAN_ID_SPAN;
     if (!name[0]) snprintf(name, sizeof name, "%s", LAN_DEFAULT_NAME);
@@ -1329,6 +1860,52 @@ static void load_identity(uint16_t base_p2p)
     if (g_local_name[0] == 0) snprintf(g_local_name, sizeof g_local_name, "%s", LAN_DEFAULT_NAME);
     sanitize_country(getenv("RE5_COUNTRY"), g_local_country);
     if (getenv("RE5_LAN_HOSTS")) parse_manual_hosts(getenv("RE5_LAN_HOSTS"));
+    {
+        const char *es = getenv("RE5_LAN_SERVER");
+        snprintf(g_srv_text, sizeof g_srv_text, "%s", es && *es ? es : g_srv_file);
+        {
+            const char *eb = getenv("RE5_LAN_BT");
+            snprintf(g_bt_text, sizeof g_bt_text, "%s", eb && *eb ? eb : g_bt_file);
+            memset(&g_link, 0, sizeof g_link);
+            g_link.sin_family = AF_INET;
+            g_link.sin_addr.s_addr = inet_addr("127.255.255.254");
+            g_link.sin_port = htons(1);
+            if (g_bt_text[0] && re5_bt_start(g_bt_text) == 0) {
+                g_have_bt = 1;
+                RE5_INFO("steam_lan", "Enlace Bluetooth: %s", g_bt_text);
+            }
+        }
+        const char *ro = getenv("RE5_LAN_RELAY_ONLY");
+        g_relay_only = ro && *ro && *ro != '0';
+        g_have_srv = 0;
+        if (g_srv_text[0]) {
+            char host[80];
+            snprintf(host, sizeof host, "%s", g_srv_text);
+            int port = RE5_LAN_SERVER_PORT;
+            char *colon = strrchr(host, ':');
+            if (colon) {
+                *colon = 0;
+                if (atoi(colon + 1) > 0) port = atoi(colon + 1);
+            }
+            struct addrinfo hints, *res = NULL;
+            memset(&hints, 0, sizeof hints);
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+            if (getaddrinfo(host, NULL, &hints, &res) == 0 && res) {
+                memset(&g_srv, 0, sizeof g_srv);
+                g_srv.sin_family = AF_INET;
+                g_srv.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+                g_srv.sin_port = htons((uint16_t)port);
+                g_have_srv = 1;
+                snprintf(g_srv_text, sizeof g_srv_text, "%s:%d", inet_ntoa(g_srv.sin_addr), port);
+                RE5_INFO("steam_lan", "Servidor de retransmissao: %s%s", g_srv_text,
+                         g_relay_only ? " (so por ele: sem broadcast)" : "");
+            } else {
+                RE5_WARN("steam_lan", "RE5_LAN_SERVER '%s' nao foi resolvido: jogando so na rede local", g_srv_text);
+            }
+            if (res) freeaddrinfo(res);
+        }
+    }
 
     g_local_steam_id = ((uint64_t)RE5_LAN_STEAMID_USER_HI << 32) | id;
     g_nonce = lan_random();
@@ -1403,6 +1980,14 @@ int steam_lan_init(void)
         return -1;
     }
     g_p2p_port = bound_port;
+    {
+        const char *aa = getenv("RE5_LAN_AUTO_ACCEPT");
+        g_auto_accept = aa && *aa && *aa != '0';
+    }
+    {   /* DSCP EF: o Wi-Fi (WMM) poe o jogo na fila de voz, menos espera no ponto de acesso */
+        int tos = 0xB8;
+        setsockopt(g_p2p_sock, IPPROTO_IP, IP_TOS, (const char *)&tos, sizeof tos);
+    }
 
     load_identity(base_p2p);
     const char *env_to = getenv("RE5_LAN_TIMEOUT_MS");
@@ -1435,6 +2020,10 @@ void steam_lan_shutdown(void)
         steam_lan_leave_lobby(g_active_lobby.lobby_id);
     }
 
+    if (g_have_bt) {
+        re5_bt_stop();
+        g_have_bt = 0;
+    }
     sock_close(g_disc_sock);
     sock_close(g_p2p_sock);
     g_disc_sock = HBAD_SOCK;
@@ -1538,7 +2127,11 @@ uint64_t steam_lan_request_lobby_list(uint64_t call_id)
     send_broadcast(&ping, sizeof ping);
 
     g_pending_search_call = call_id;
-    g_pending_search_expire = get_ticks_ms() + 200; /* Janela de 200ms para resposta de pings */
+    /* Wi-Fi (e celular poupando energia) perde ou atrasa broadcast: janela de 1,2 s
+     * com o PING repetido a cada 300 ms, em vez de um disparo e 200 ms de espera. */
+    g_search_start = get_ticks_ms();
+    g_search_next_ping = g_search_start + 300u;
+    g_pending_search_expire = g_search_start + SEARCH_WINDOW_MS;
 
     re5_mutex_unlock(&g_mu);
     return 1;
@@ -1795,6 +2388,13 @@ int steam_lan_join_lobby(uint64_t lobby_id, uint64_t call_id)
     g_join.host.sin_family = AF_INET;
     g_join.host.sin_port = htons(lb->host_port);
     g_join.host.sin_addr = lb->host_ip;
+    if (g_have_bt && lb->relay_id && lb->host_ip.s_addr == g_link.sin_addr.s_addr) {   /* sala do par do Bluetooth */
+        g_join.host = g_link;
+        relay_id_set(&g_join.host, lb->relay_id);
+    } else if (lb->relay_id && g_have_srv) {   /* sala so alcancavel pelo servidor */
+        g_join.host = g_srv;
+        relay_id_set(&g_join.host, lb->relay_id);
+    }
     peer_update(lb->owner_id, lb->owner_name, &g_join.host);
 
     uint32_t now = get_ticks_ms();
@@ -1853,7 +2453,13 @@ int steam_lan_send_p2p(uint64_t remote_id, const void *data, uint32_t len, int s
 
     re5_mutex_lock(&g_mu);
     lan_peer *p = peer_find(remote_id);
-    if (!p) {
+    lan_rel *r = p ? rel_of(p) : NULL;
+    if (!p || !r) {
+        re5_mutex_unlock(&g_mu);
+        return 0;
+    }
+    int reliable = send_type >= 2;   /* k_EP2PSendReliable, k_EP2PSendReliableWithBuffering */
+    if (reliable && r->n_out >= REL_WIN) {
         re5_mutex_unlock(&g_mu);
         return 0;
     }
@@ -1866,13 +2472,26 @@ int steam_lan_send_p2p(uint64_t remote_id, const void *data, uint32_t len, int s
     ph->channel = (uint16_t)channel;
     ph->send_type = (uint8_t)send_type;
     ph->_pad = 0;
-    static uint32_t s_seq = 0;
-    ph->seq = ++s_seq;
+    if (reliable) {
+        if (r->tx_seq == 0) r->tx_seq = 1;
+        ph->seq = r->tx_seq++;
+    } else {
+        ph->seq = ++r->unrel_tx;
+    }
     ph->payload_len = len;
 
     memcpy(buf + sizeof(lan_hdr) + sizeof(lan_p2p_hdr), data, len);
     size_t total_len = sizeof(lan_hdr) + sizeof(lan_p2p_hdr) + len;
 
+    if (reliable) {
+        rel_out *o = &r->out[r->n_out++];
+        o->seq = ph->seq;
+        o->sent_ms = get_ticks_ms();
+        o->len = (uint16_t)total_len;
+        memcpy(o->pkt, buf, total_len);
+    }
+    g_st_tx++;
+    g_st_txb += (uint32_t)total_len;
     send_raw_udp(g_p2p_sock, &p->addr, buf, total_len);
     re5_mutex_unlock(&g_mu);
     return 1;

@@ -26,6 +26,7 @@
 #include "vk2_blit_spv.h"
 #include "re5/d3d9_bridge.h"
 #include "re5/vk_loader.h"
+#include "re5/lan_menu.h"
 #include "re5/thunks.h"
 #include "re5/guest_base.h"
 #include "re5/guest_memory.h"
@@ -1352,6 +1353,92 @@ static void surface_follow(vk_device *d)
 }
 #endif
 
+/* HUD de co-op (ping, pedido de entrada, avisos): o runtime monta retangulos opacos (re5_lan_hud_rects), aqui
+ * viram pixels na CPU, num staging do envio atual, e sao copiados por cima da imagem da swapchain depois do blit
+ * do quadro. Sem shader nem pipeline: nao depende do pipeline fixo que o vk2 nao tem. */
+#define HUD_MAX_RECTS 192
+#define HUD_PANELS    4
+static void vk2_hud_record(vk_device *d, VkCommandBuffer pcb, VkImage img)
+{
+    const VkFormat f = d->swap_format;
+    const int bgra = f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB;
+    const int rgba = f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB;
+    if (!bgra && !rgba) return;
+    const int W = (int)d->swap_extent.width, H = (int)d->swap_extent.height;
+    static re5_lan_rect rects[HUD_MAX_RECTS];
+    uint32_t n = re5_lan_hud_rects((float)W, (float)H, rects, HUD_MAX_RECTS);
+    if (!n) return;
+
+    int did_barrier = 0;
+    for (int pn = 0; pn < HUD_PANELS; pn++) {
+        int bx0 = W, by0 = H, bx1 = 0, by1 = 0, any = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (rects[i].panel != pn) continue;
+            int x0 = (int)(rects[i].x0 + 0.5f), y0 = (int)(rects[i].y0 + 0.5f);
+            int x1 = (int)(rects[i].x1 + 0.5f), y1 = (int)(rects[i].y1 + 0.5f);
+            if (x0 < bx0) bx0 = x0;
+            if (y0 < by0) by0 = y0;
+            if (x1 > bx1) bx1 = x1;
+            if (y1 > by1) by1 = y1;
+            any = 1;
+        }
+        if (!any) continue;
+        if (bx0 < 0) bx0 = 0;
+        if (by0 < 0) by0 = 0;
+        if (bx1 > W) bx1 = W;
+        if (by1 > H) by1 = H;
+        const int pw = bx1 - bx0, ph = by1 - by0;
+        if (pw <= 0 || ph <= 0 || (long)pw * ph > 1600 * 260) continue;
+
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceSize off = 0;
+        uint8_t *px = vk2_stage(d, (VkDeviceSize)pw * ph * 4, 16, &buf, &off);
+        if (!px || !buf) continue;
+        memset(px, 0, (size_t)pw * ph * 4);
+        for (uint32_t i = 0; i < n; i++) {
+            if (rects[i].panel != pn) continue;
+            int x0 = (int)(rects[i].x0 + 0.5f), y0 = (int)(rects[i].y0 + 0.5f);
+            int x1 = (int)(rects[i].x1 + 0.5f), y1 = (int)(rects[i].y1 + 0.5f);
+            if (x0 < bx0) x0 = bx0;
+            if (y0 < by0) y0 = by0;
+            if (x1 > bx1) x1 = bx1;
+            if (y1 > by1) y1 = by1;
+            const uint32_t c = rects[i].color, a = c >> 24;
+            const uint32_t R = (c >> 16) & 255u, G = (c >> 8) & 255u, B = c & 255u;
+            for (int y = y0; y < y1; y++) {
+                uint8_t *row = px + ((size_t)(y - by0) * pw + (size_t)(x0 - bx0)) * 4;
+                for (int x = x0; x < x1; x++, row += 4) {
+                    uint32_t r = R, g = G, b = B;
+                    if (a != 255u) {   /* mistura sobre o que ja esta no painel (o fundo opaco) */
+                        const uint32_t dr = bgra ? row[2] : row[0], dg = row[1], db = bgra ? row[0] : row[2];
+                        r = (R * a + dr * (255u - a)) / 255u;
+                        g = (G * a + dg * (255u - a)) / 255u;
+                        b = (B * a + db * (255u - a)) / 255u;
+                    }
+                    row[0] = (uint8_t)(bgra ? b : r);
+                    row[1] = (uint8_t)g;
+                    row[2] = (uint8_t)(bgra ? r : b);
+                    row[3] = 255;
+                }
+            }
+        }
+        if (!did_barrier) {   /* o blit do quadro ja escreveu na imagem: escrita depois de escrita */
+            VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+            vkCmdPipelineBarrier(pcb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL,
+                                 0, NULL);
+            did_barrier = 1;
+        }
+        VkBufferImageCopy reg = {
+            .bufferOffset = off,
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageOffset = {bx0, by0, 0},
+            .imageExtent = {(uint32_t)pw, (uint32_t)ph, 1},
+        };
+        vkCmdCopyBufferToImage(pcb, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *src, const RECT *dst, HWND over,
                                            const RGNDATA *dirty)
 {
@@ -1429,6 +1516,7 @@ static HRESULT STDMETHODCALLTYPE v_Present(IDirect3DDevice9 *self, const RECT *s
         };
         vkCmdBlitImage(pcb, bb->image, bb_src, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        VK_FILTER_LINEAR);
+        vk2_hud_record(d, pcb, img);
         image_barrier(pcb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                       VK_ACCESS_TRANSFER_WRITE_BIT, 0);

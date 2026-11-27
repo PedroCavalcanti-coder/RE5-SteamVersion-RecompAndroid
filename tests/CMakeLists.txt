@@ -137,6 +137,8 @@ add_test(NAME python_pipeline
          COMMAND Python3::Interpreter -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/python" -v)
 set_tests_properties(python_pipeline PROPERTIES ENVIRONMENT "RE5_TEST_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}")
 
+add_test(NAME lan_relay COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_lan_relay.py" "$<TARGET_FILE:test_steam_lan>" "$<TARGET_FILE:re5_server>")
+add_test(NAME lan_bt COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_lan_bt.py" "$<TARGET_FILE:test_steam_lan>")
 # vk2 (RE5_GFX=vk2): módulos recuperados da tag base-lean-2026-11-23 e os novos (runtime/src/gfx/vk2).
 set(RE5_VK2_DIR "${CMAKE_SOURCE_DIR}/runtime/src/gfx/vk2")
 set(RE5_VK_INC "${CMAKE_SOURCE_DIR}/third_party/dxvk-2.6.2/include/vulkan/include")

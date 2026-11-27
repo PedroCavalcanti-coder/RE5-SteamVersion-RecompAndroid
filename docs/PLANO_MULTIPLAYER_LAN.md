@@ -183,3 +183,44 @@ Atualmente, `runtime/src/win32/steam_api.c` implementa o Steamworks de forma 100
 | **M-LAN 3** | Entrada no Lobby e Sincronização de Metadados | Cliente conecta ao lobby, ambos aparecem na tela de seleção de personagens e inventário. |
 | **M-LAN 4** | `ISteamNetworking005` P2P e Gameplay Co-op | Partida inicia com Chris e Sheva controlados por instâncias diferentes com sincronia em tempo real. |
 | **M-LAN 5** | Testes automatizados e suporte Android | `test_steam_lan` verde no `ctest` e suporte compilado para Android ARM64. |
+
+---
+
+## 4. Servidor de retransmissão (`re5_server`)
+
+Para jogar sem broadcast (redes diferentes, Wi-Fi com isolamento de clientes, VPN) existe um servidor
+que roda num prompt de comando no PC e não precisa do jogo: `servidor_re5.bat [porta]` (ou
+`re5_server --port 27040`). Fechar a janela derruba o servidor.
+
+- **Nos jogadores** (PC e Android): `RE5_LAN_SERVER=IP:PORTA` no `re5_env.txt` da pasta do jogo (ou no
+  ambiente, ou `servidor=` no `re5_lan.ini`). Sem porta, 27040. `RE5_LAN_RELAY_ONLY=1` desliga o
+  broadcast e a varredura local e usa só o servidor. Sem a variável, tudo igual a antes (só rede local).
+- **Como funciona**: cada cliente manda um HELLO por segundo (o servidor aprende o endereço público
+  dele). Beacons e PING de sala vão em `RELAY` com destino 0 (o servidor guarda os beacons e responde aos
+  PING); pacotes para um par vão em `RELAY` com o ID do destino e o servidor repassa. O cliente guarda o
+  par alcançado pelo servidor como endereço do servidor + ID no `sin_zero` do `sockaddr_in`, e
+  `send_raw_udp` embrulha sozinho: o resto do `steam_lan.c` não muda.
+- **Só uma porta UDP** precisa estar alcançável (a do servidor). O jogo continua P2P na lógica: o servidor
+  só repassa, adiciona uma ida e volta ao PC (o ping mostrado já inclui isso).
+- Teste: `ctest -R lan_relay` (host e cliente só pelo servidor, sem broadcast).
+
+---
+
+## 5. Enlace Bluetooth (sem Wi-Fi nem internet)
+
+Os dois aparelhos conversam direto por Bluetooth clássico (RFCOMM), sem roteador. Fonte:
+`runtime/src/win32/bt_link.c` (+ `BtLink.java` e os métodos `bt*` da `GameActivity` no Android).
+
+- **Pareie os dois aparelhos** antes, nas configurações do sistema (Windows e Android).
+- **Configuração** (`re5_env.txt`, ambiente ou `bluetooth=` no `re5_lan.ini`):
+  - no aparelho que **cria a sala**: `RE5_LAN_BT=host`;
+  - no outro: `RE5_LAN_BT=<nome do aparelho pareado>` (parte do nome serve) ou o endereço `AA:BB:CC:DD:EE:FF`.
+  O enlace reconecta sozinho a cada 2 s se cair. No Android 12+ o app pede a permissão "Dispositivos
+  próximos" na primeira vez.
+- **Como funciona**: cada pacote do `steam_lan` vira um quadro (`u16` de tamanho + dados) no stream RFCOMM.
+  O par fica como endereço-marcador (`127.255.255.254:1` + ID no `sin_zero`), igual ao servidor; busca de sala,
+  entrada com aprovação, P2P confiável e ping funcionam sem mudança. Pode usar junto com a LAN e o servidor.
+- **Teste**: `ctest -R lan_bt` roda o mesmo código sobre TCP de loopback (`RE5_LAN_BT=tcp-host:PORTA` /
+  `tcp:IP:PORTA`). O RFCOMM de verdade (Winsock `AF_BTH` / `BluetoothSocket`) precisa de dois aparelhos.
+- **Limites**: Bluetooth clássico dá ~20-60 ms de ida e volta e poucas centenas de KB/s: o teto de 60 fps e
+  a fila curta do co-op ajudam; um parceiro longe ou com Wi-Fi 2,4 GHz saturado piora.

@@ -22,6 +22,7 @@
 #endif
 #include <d3d9.h>
 
+#include "re5/d3d9_bridge.h"
 #include "re5/lan_menu.h"
 #include "re5/log.h"
 #include "re5/steam_lan.h"
@@ -265,10 +266,17 @@ int re5_lan_menu_is_open(void)
     return o;
 }
 
+static int pending_event(const SDL_Event *e);
+
 int re5_lan_menu_event(const SDL_Event *e)
 {
     int used = 0;
+    int pend = steam_lan_get_pending(NULL, 0, NULL);
     lock();
+    if (pend && !g_open && pending_event(e)) {
+        unlock();
+        return 1;
+    }
     switch (e->type) {
     case SDL_KEYDOWN:
         if (e->key.keysym.scancode == SDL_SCANCODE_F12) {
@@ -373,11 +381,18 @@ static void build_glyph_rects(void)
 }
 
 static re5_lan_vtx *g_out;
+static re5_lan_rect *g_rr;      /* modo retangulos (re5_lan_hud_rects): quad() grava aqui em vez de triangulos */
+static uint32_t g_nr, g_maxr;
+static int g_panel;
 static uint32_t g_nv, g_maxv;
 static float g_w, g_h, g_clip;   /* g_clip: texto não passa da borda direita do painel */
 
 static void quad(float x0, float y0, float x1, float y1, uint32_t color)
 {
+    if (g_rr) {
+        if (g_nr < g_maxr) g_rr[g_nr++] = (re5_lan_rect){x0, y0, x1, y1, color, g_panel};
+        return;
+    }
     if (!g_out) {
         g_nv += 6;
         return;
@@ -565,13 +580,221 @@ uint32_t re5_lan_menu_build(float w, float h, re5_lan_vtx *out, uint32_t max)
     return out ? g_nv : 0;
 }
 
+/* ---- HUD de co-op: ping no canto, pedido de entrada (aceitar/recusar) e avisos ----
+ *
+ * Montado uma vez como retangulos coloridos em pixels do quadro; cada renderizador desenha do seu jeito:
+ * D3D9 (DXVK) vira triangulos no Present (re5_lan_menu_draw) e o vk2, que nao tem pipeline fixo, rasteriza
+ * os retangulos na CPU e copia para a imagem da swapchain (re5_lan_hud_rects). Os paineis sao opacos de
+ * proposito: o vk2 copia pixels, nao mistura com o quadro. */
+static float g_phit[2][4];   /* aceitar, recusar: x0, y0, x1, y1 normalizados (0 = sem pedido na tela) */
+
+#ifdef __ANDROID__
+#define BTN_ACCEPT "Aceitar"
+#define BTN_REFUSE "Recusar"
+#else
+#define BTN_ACCEPT "Aceitar [F10]"
+#define BTN_REFUSE "Recusar [F11]"
+#endif
+
+static int hud_active(void)
+{
+    char tmp[8];
+    int kind;
+    return steam_lan_coop_active() || steam_lan_get_pending(NULL, 0, NULL) || steam_lan_get_notice(tmp, sizeof tmp, &kind);
+}
+
+static void hud_build(float w, float h)
+{
+    if (!g_grects_ready) build_glyph_rects();
+    g_w = w;
+    g_h = h;
+    int s = (int)(h / 540.0f);
+    if (s < 1) s = 1;
+    const float sc = (float)s, cw = LAN_FONT_W * sc, fh = LAN_FONT_H * sc, pad = 4.0f * sc;
+    g_clip = w;
+    memset(g_phit, 0, sizeof g_phit);
+    float y_top = 6.0f * sc;
+
+    /* ping: pequeno, canto superior direito, so com duas pessoas na sala */
+    g_panel = 0;
+    if (steam_lan_coop_active()) {
+        re5_lan_status st;
+        steam_lan_get_status(&st);
+        const re5_lan_member_info *rm = NULL;
+        for (int i = 0; i < st.member_count && i < RE5_LAN_MAX_LOBBY_MEMBERS; i++)
+            if (!st.members[i].is_local) rm = &st.members[i];
+        char t[32];
+        uint32_t col = C_TEXT;
+        if (!rm || rm->rtt_ms < 0) {
+            snprintf(t, sizeof t, "ping --");
+            col = C_DIM;
+        } else if (rm->silent_ms > 3000) {
+            snprintf(t, sizeof t, "sem sinal %us", rm->silent_ms / 1000u);
+            col = C_BAD;
+        } else {
+            snprintf(t, sizeof t, "ping %d ms", (int)rm->rtt_ms);
+            col = rm->rtt_ms < 60 ? C_OK : rm->rtt_ms < 150 ? C_WARN : C_BAD;
+        }
+        const float bw = (float)(text_len(t) + 2) * cw, bh = fh + 2 * pad;
+        const float x1 = w - 6.0f * sc, x0 = x1 - bw;
+        quad(x0, y_top, x1, y_top + bh, 0xFF101418u);
+        text(x0 + cw, y_top + pad, sc, t, col);
+        y_top += bh + 4.0f * sc;
+    }
+
+    /* pedido de entrada (o host decide) ou, sem pedido, o aviso mais novo */
+    g_panel = 1;
+    char who[64], note[96];
+    int kind = 0;
+    if (steam_lan_get_pending(who, sizeof who, NULL)) {
+        char l1[120];
+        snprintf(l1, sizeof l1, "%s quer entrar na sua sessao", who);
+        const int na = text_len(BTN_ACCEPT), nr = text_len(BTN_REFUSE), n1 = text_len(l1);
+        int cols = n1 > na + nr + 8 ? n1 : na + nr + 8;
+        const float pw = (float)(cols + 4) * cw, ph = pad * 4 + fh * 2 + 6 * sc;
+        const float x0 = (w - pw) * 0.5f, y0 = y_top > 6.0f * sc ? 6.0f * sc : y_top;
+        quad(x0 - 2 * sc, y0 - 2 * sc, x0 + pw + 2 * sc, y0 + ph + 2 * sc, C_WARN);
+        quad(x0, y0, x0 + pw, y0 + ph, 0xFF101418u);
+        text(x0 + 2 * cw, y0 + pad, sc, l1, C_TEXT);
+        const float by = y0 + pad * 2 + fh + 2 * sc, bh = fh + 2 * pad;
+        float bx = x0 + 2 * cw;
+        const char *lab[2] = {BTN_ACCEPT, BTN_REFUSE};
+        const uint32_t bc[2] = {0xFF2E7D32u, 0xFF9A2A2Au};
+        for (int b = 0; b < 2; b++) {
+            const float bw = (float)(text_len(lab[b]) + 2) * cw;
+            quad(bx, by, bx + bw, by + bh, bc[b]);
+            text(bx + cw, by + pad, sc, lab[b], C_TEXT);
+            g_phit[b][0] = bx / w;
+            g_phit[b][1] = by / h;
+            g_phit[b][2] = (bx + bw) / w;
+            g_phit[b][3] = (by + bh) / h;
+            bx += bw + 2 * cw;
+        }
+    } else if (steam_lan_get_notice(note, sizeof note, &kind)) {
+        const uint32_t accent = kind == 1 ? C_WARN : kind == 2 ? C_OK : C_BAD;
+        const float bw = (float)(text_len(note) + 4) * cw, bh = fh + 2 * pad;
+        const float x0 = (w - bw) * 0.5f, y0 = 6.0f * sc;
+        quad(x0 - 2 * sc, y0 - 2 * sc, x0 + bw + 2 * sc, y0 + bh + 2 * sc, accent);
+        quad(x0, y0, x0 + bw, y0 + bh, 0xFF101418u);
+        text(x0 + 2 * cw, y0 + pad, sc, note, C_TEXT);
+    }
+}
+
+uint32_t re5_lan_hud_rects(float w, float h, re5_lan_rect *out, uint32_t max)
+{
+    if (!out || !max || !hud_active()) return 0;
+    lock();
+    g_out = NULL;
+    g_rr = out;
+    g_nr = 0;
+    g_maxr = max;
+    hud_build(w, h);
+    g_rr = NULL;
+    uint32_t n = g_nr;
+    unlock();
+    return n;
+}
+
+/* F10 aceita, F11 recusa; toque ou clique no botao tambem. 1 = o evento era do pedido. */
+static int pending_event(const SDL_Event *e)
+{
+    int accept = -1;
+    float x = -1.0f, y = -1.0f;
+    switch (e->type) {
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:
+        if (e->key.keysym.scancode == SDL_SCANCODE_F10 || e->key.keysym.scancode == SDL_SCANCODE_F11) {
+            if (e->type == SDL_KEYDOWN && !e->key.repeat) accept = e->key.keysym.scancode == SDL_SCANCODE_F10;
+            return 1;
+        }
+        return 0;
+    case SDL_FINGERDOWN:
+        x = e->tfinger.x;
+        y = e->tfinger.y;
+        break;
+    case SDL_MOUSEBUTTONDOWN:
+        if (e->button.which == SDL_TOUCH_MOUSEID || e->button.button != SDL_BUTTON_LEFT) return 0;
+        {
+            SDL_Window *w = SDL_GetWindowFromID(e->button.windowID);
+            int ww = 0, wh = 0;
+            if (w) SDL_GetWindowSize(w, &ww, &wh);
+            if (ww <= 0 || wh <= 0) return 0;
+            x = (float)e->button.x / (float)ww;
+            y = (float)e->button.y / (float)wh;
+        }
+        break;
+    default: return 0;
+    }
+    if (accept < 0 && x >= 0.0f) {
+        for (int b = 0; b < 2; b++)
+            if (g_phit[b][2] > 0.0f && x >= g_phit[b][0] && x < g_phit[b][2] && y >= g_phit[b][1] && y < g_phit[b][3])
+                accept = b == 0;
+        if (accept < 0) return 0;
+    }
+    if (accept >= 0) steam_lan_answer_pending(accept);
+    return 1;
+}
+
+/* HUD em triangulos (D3DFVF_XYZRHW | D3DFVF_DIFFUSE), para o D3D9 do host (DXVK). */
+static uint32_t hud_tris(float w, float h, re5_lan_vtx *out, uint32_t max)
+{
+    g_rr = NULL;
+    g_out = out;
+    g_nv = 0;
+    g_maxv = max;
+    hud_build(w, h);
+    g_out = NULL;
+    return g_nv;
+}
+
+/* Aviso fora do D3D9 (vale para qualquer renderizador, inclusive o vk2, que nao tem o
+ * pipeline fixo que o desenho acima usa): toast no Android, titulo da janela no PC. */
+#if defined(__ANDROID__)
+#include <jni.h>
+void re5_lan_notice_show(const char *text, int kind)
+{
+    (void)kind;
+    static jmethodID mid;
+    static int tried;
+    JNIEnv *env = SDL_AndroidGetJNIEnv();
+    jobject act = env ? SDL_AndroidGetActivity() : NULL;
+    if (!act) return;
+    if (!tried) {
+        tried = 1;
+        jclass k = (*env)->GetObjectClass(env, act);
+        mid = k ? (*env)->GetMethodID(env, k, "showNotice", "(Ljava/lang/String;)V") : NULL;
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (k) (*env)->DeleteLocalRef(env, k);
+    }
+    if (mid) {
+        jstring js = (*env)->NewStringUTF(env, text);
+        (*env)->CallVoidMethod(env, act, mid, js);
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, js);
+    }
+    (*env)->DeleteLocalRef(env, act);
+}
+#else
+void re5_lan_notice_show(const char *text, int kind)
+{
+    (void)text;
+    (void)kind;
+#if defined(_WIN32)
+    MessageBeep(MB_ICONASTERISK);   /* o texto sai no HUD (re5_lan_hud_rects / D3D9) */
+#endif
+}
+#endif
+
 #define MAX_VTX 240000u
 
 void re5_lan_menu_draw(IDirect3DDevice9 *dev)
 {
     if (!dev) return;
+    /* vk2 nao tem SetFVF / SetTextureStageState / DrawPrimitiveUP: desenhar aqui derruba o jogo. */
+    if (re5_gfx_mode() == RE5_GFX_VK2) return;
+    int hud = !re5_lan_menu_is_open() && hud_active();
     lock();
-    if (!g_open) {
+    if (!g_open && !hud) {
         unlock();
         return;
     }
@@ -584,7 +807,8 @@ void re5_lan_menu_draw(IDirect3DDevice9 *dev)
         return;
     }
     bb->lpVtbl->GetDesc(bb, &desc);
-    uint32_t nv = re5_lan_menu_build((float)desc.Width, (float)desc.Height, vtx, MAX_VTX);
+    uint32_t nv = g_open ? re5_lan_menu_build((float)desc.Width, (float)desc.Height, vtx, MAX_VTX)
+                         : hud_tris((float)desc.Width, (float)desc.Height, vtx, MAX_VTX);
     unlock();
 
     IDirect3DStateBlock9 *sb = NULL;

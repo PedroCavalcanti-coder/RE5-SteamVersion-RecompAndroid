@@ -28,4 +28,12 @@ void re5_lan_menu_draw(struct IDirect3DDevice9 *dev);
 typedef struct { float x, y, z, rhw; uint32_t color; } re5_lan_vtx;
 uint32_t re5_lan_menu_build(float w, float h, re5_lan_vtx *out, uint32_t max);
 
+/* HUD de co-op (ping, pedido de entrada, avisos) como retangulos ARGB em pixels de um quadro w x h, para
+ * renderizadores sem pipeline fixo (vk2). `panel` agrupa os retangulos de um painel opaco. 0 = nada a mostrar. */
+typedef struct { float x0, y0, x1, y1; uint32_t color; int panel; } re5_lan_rect;
+uint32_t re5_lan_hud_rects(float w, float h, re5_lan_rect *out, uint32_t max);
+
+/* Aviso independente do renderizador (toast no Android, titulo da janela no PC). */
+void re5_lan_notice_show(const char *text, int kind);
+
 #endif

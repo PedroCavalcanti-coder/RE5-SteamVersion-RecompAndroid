@@ -49,6 +49,14 @@ else()
     target_link_libraries(re5 PRIVATE re5_runtime re5_generated)
 endif()
 
+# Servidor de retransmissao do multiplayer (nao precisa do jogo): re5_server --port 27040
+if(NOT ANDROID)
+    add_executable(re5_server tools/re5_server/re5_server.c)
+    if(WIN32)
+        target_link_libraries(re5_server PRIVATE ws2_32)
+    endif()
+endif()
+
 # Vulkan no Windows: os d3d9.dll x64 da DXVK (scripts/build_dxvk.sh <versão>) vão
 # para dxvk/<versão>/ ao lado do re5.exe; o runtime carrega a mais nova que a
 # GPU aceita (runtime/src/gfx/d3d9_host.c; RE5_D3D9_DLL=d3d9.dll usa o do sistema).

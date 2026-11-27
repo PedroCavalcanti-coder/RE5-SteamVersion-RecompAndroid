@@ -437,6 +437,49 @@ public class GameActivity extends SDLActivity {
         if (already.length() > 0) startupNotice = L.t("Conectado: ") + already;
     }
 
+    // ---- enlace Bluetooth do multiplayer LAN (runtime/src/win32/bt_link.c chama por JNI) ----
+    private BtLink btLink;
+    private boolean btAsked;
+
+    /** Conecta ou aceita (host). false = ainda nao: o runtime tenta de novo a cada 2 s. */
+    @SuppressWarnings("unused")
+    public boolean btOpen(String cfg) {
+        if (Build.VERSION.SDK_INT >= 31
+                && checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (!btAsked) {
+                btAsked = true;
+                runOnUiThread(() -> requestPermissions(new String[]{android.Manifest.permission.BLUETOOTH_CONNECT}, 4711));
+            }
+            return false;
+        }
+        if (btLink == null) btLink = new BtLink();
+        return btLink.open(this, cfg);
+    }
+
+    @SuppressWarnings("unused")
+    public byte[] btRead() {
+        BtLink l = btLink;
+        return l != null ? l.read() : null;
+    }
+
+    @SuppressWarnings("unused")
+    public boolean btWrite(byte[] d) {
+        BtLink l = btLink;
+        return l != null && l.write(d);
+    }
+
+    @SuppressWarnings("unused")
+    public void btClose() {
+        BtLink l = btLink;
+        if (l != null) l.close();
+    }
+
+    /** Chamado pelo runtime (JNI) pelo multiplayer LAN: quem quer entrar, quem entrou, falhas. */
+    @SuppressWarnings("unused")
+    public void showNotice(final String text) {
+        runOnUiThread(() -> android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_LONG).show());
+    }
+
     private void notice(String text) {
         Log.i(TAG, text);
         if (touchView != null) touchView.showNotice(text);
